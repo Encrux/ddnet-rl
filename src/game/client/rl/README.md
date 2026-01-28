@@ -126,7 +126,12 @@ Based on `CNetObj_PlayerInput`:
 ## Building
 
 ```bash
-# Build headless client for training
+# Build client (regular)
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+
+# Build headless client for training (no graphics window)
 mkdir build-rl && cd build-rl
 cmake -DHEADLESS_CLIENT=ON -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
@@ -135,6 +140,76 @@ make -j$(nproc)
 ---
 
 ## Usage
+
+### Quick Start
+
+```bash
+# Terminal 1: Start server
+./build/DDNet-Server
+
+# Terminal 2: Start client with RL-friendly settings
+./build/DDNet "connect localhost:8303; cl_overlay_entities 100; cl_showquads 0; cl_showhud 0; cl_showchat 0"
+
+# In DDNet console (F1), enable RL mode:
+rl_enable
+
+# Terminal 3: Run Python client
+cd src/game/client/rl/python
+pip install -r requirements.txt
+python teeworlds_env.py --display
+```
+
+### Console Commands
+
+| Command | Description |
+|---------|-------------|
+| `rl_enable [env_id] [width] [height]` | Enable RL mode (default: env_id=0, 640x360 frames) |
+| `rl_disable` | Disable RL mode |
+| `rl_status` | Show RL status and current action |
+
+### Recommended Client Settings
+
+For a clean observation without UI clutter:
+
+```
+cl_overlay_entities 100   # Show game tiles (freeze, teleport, etc.)
+cl_showquads 0            # Hide decorative backgrounds
+cl_showhud 0              # Hide HUD
+cl_showchat 0             # Hide chat
+cl_show_others 0          # Hide other players (optional)
+```
+
+### Python Display/Stream
+
+```bash
+# Display frames locally
+python teeworlds_env.py --display
+
+# Stream frames over network (port 5555)
+python teeworlds_env.py --stream
+
+# View stream from another machine
+python stream_viewer.py --host <ip>
+```
+
+---
+
+## Headless Training
+
+For training, run `rl_enable` after connection is established. You can use an autoexec config:
+
+```bash
+# Create autoexec file
+echo "connect localhost:8303" > ~/.teeworlds/autoexec_rl.cfg
+echo "cl_overlay_entities 100" >> ~/.teeworlds/autoexec_rl.cfg
+echo "cl_showquads 0" >> ~/.teeworlds/autoexec_rl.cfg
+echo "cl_showhud 0" >> ~/.teeworlds/autoexec_rl.cfg
+
+# Run with autoexec
+./build/DDNet -f autoexec_rl.cfg
+```
+
+Then enable RL mode via the Python client or manually.
 
 ### Start training server
 ```bash
