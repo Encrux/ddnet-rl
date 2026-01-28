@@ -70,6 +70,13 @@ void CRLBot::OnReset()
 
 void CRLBot::OnRender()
 {
+	// Handle deferred enable (when rl_enable was called before graphics was ready)
+	if(m_PendingEnable && !m_Enabled)
+	{
+		DoEnable(m_PendingEnvId, m_PendingWidth, m_PendingHeight);
+		m_PendingEnable = false;
+	}
+	
 	if(!m_Enabled || !m_pComm)
 		return;
 	
@@ -322,6 +329,41 @@ int CRLBot::GetActionFire() const { return m_ActionFire; }
 int CRLBot::GetActionAimX() const { return m_ActionAimX; }
 int CRLBot::GetActionAimY() const { return m_ActionAimY; }
 
+void CRLBot::DoEnable(int EnvId, int Width, int Height)
+{
+	if(m_Enabled)
+	{
+		dbg_msg("rl", "RL mode already enabled");
+		return;
+	}
+	
+	m_EnvId = EnvId;
+	m_FrameWidth = Width;
+	m_FrameHeight = Height;
+	m_FrameChannels = 3; // RGB
+	
+	// Create shared memory communication
+	m_pComm = std::make_unique<rl::CShmComm>();
+	if(!m_pComm->Init(EnvId, Width, Height, 3))
+	{
+		dbg_msg("rl", "Failed to initialize shared memory");
+		m_pComm.reset();
+		return;
+	}
+	
+	// Register the post-render callback for frame capture from graphics thread
+	Graphics()->SetPostRenderCallback([this](TGLBackendReadPresentedImageData &ReadFunc) {
+		if(m_Enabled)
+			OnGraphicsThreadCapture(ReadFunc);
+	});
+	
+	m_Enabled = true;
+	m_FrameCount = 0;
+	
+	dbg_msg("rl", "RL mode enabled (env_id=%d, frame=%dx%d)", EnvId, Width, Height);
+	dbg_msg("rl", "Shared memory path: /dev/shm/teeworlds_rl_%d", EnvId);
+}
+
 // Console commands
 void CRLBot::ConRLEnable(IConsole::IResult *pResult, void *pUserData)
 {
@@ -337,36 +379,20 @@ void CRLBot::ConRLEnable(IConsole::IResult *pResult, void *pUserData)
 		return;
 	}
 	
-	pSelf->m_EnvId = EnvId;
-	pSelf->m_FrameWidth = Width;
-	pSelf->m_FrameHeight = Height;
-	pSelf->m_FrameChannels = 3; // RGB
+	// Defer enable to OnRender when graphics is guaranteed to be ready
+	pSelf->m_PendingEnable = true;
+	pSelf->m_PendingEnvId = EnvId;
+	pSelf->m_PendingWidth = Width;
+	pSelf->m_PendingHeight = Height;
 	
-	// Create shared memory communication
-	pSelf->m_pComm = std::make_unique<rl::CShmComm>();
-	if(!pSelf->m_pComm->Init(EnvId, Width, Height, 3))
-	{
-		dbg_msg("rl", "Failed to initialize shared memory");
-		pSelf->m_pComm.reset();
-		return;
-	}
-	
-	// Register the post-render callback for frame capture from graphics thread
-	pSelf->Graphics()->SetPostRenderCallback([pSelf](TGLBackendReadPresentedImageData &ReadFunc) {
-		if(pSelf->m_Enabled)
-			pSelf->OnGraphicsThreadCapture(ReadFunc);
-	});
-	
-	pSelf->m_Enabled = true;
-	pSelf->m_FrameCount = 0;
-	
-	dbg_msg("rl", "RL mode enabled (env_id=%d, frame=%dx%d)", EnvId, Width, Height);
-	dbg_msg("rl", "Shared memory path: /dev/shm/teeworlds_rl_%d", EnvId);
+	dbg_msg("rl", "RL mode will be enabled on next render (env_id=%d, frame=%dx%d)", EnvId, Width, Height);
 }
 
 void CRLBot::ConRLDisable(IConsole::IResult *pResult, void *pUserData)
 {
 	CRLBot *pSelf = static_cast<CRLBot *>(pUserData);
+	
+	pSelf->m_PendingEnable = false;
 	
 	if(!pSelf->m_Enabled)
 	{

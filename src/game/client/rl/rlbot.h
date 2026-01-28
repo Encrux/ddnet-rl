@@ -86,6 +86,15 @@ private:
 	// Stats
 	uint64_t m_FrameCount;
 	int64_t m_LastFrameTime;
+	
+	// Deferred enable (for startup)
+	bool m_PendingEnable{false};
+	int m_PendingEnvId{0};
+	int m_PendingWidth{84};
+	int m_PendingHeight{84};
+	
+	// Actually enable RL mode (called when graphics is ready)
+	void DoEnable(int EnvId, int Width, int Height);
 };
 
 #endif // GAME_CLIENT_RL_RLBOT_H
