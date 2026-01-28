@@ -581,6 +581,7 @@ class TeeWorldsShmClient:
             return
         
         # Write action fields (starting at offset 28 in the header)
+        # print(f"[RL DEBUG] send_action: direction={direction}, jump={jump}, hook={hook}, fire={fire}, aim_x={aim_x}, aim_y={aim_y}, weapon={weapon}")
         action_offset = 28
         self.shm_mmap.seek(action_offset)
         self.shm_mmap.write(struct.pack('<bBBBhhB',

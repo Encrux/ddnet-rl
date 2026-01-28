@@ -285,14 +285,36 @@ void CRLBot::SendFrame()
 	}
 	
 	// Update header
-	rl::SSharedMemoryHeader *pHeader = m_pComm->GetHeader();
-	if(pHeader)
-	{
-		pHeader->m_Tick = Client()->GameTick(g_Config.m_ClDummy);
-		pHeader->m_Reward = 0.0f; // TODO: Calculate reward
-		pHeader->m_Done = 0;      // TODO: Detect episode end
-		pHeader->m_Truncated = 0;
-	}
+	       // --- Reward calculation for rendered mode (simple: just speed) ---
+	       float reward = 0.0f;
+	       bool done = false;
+	       bool truncated = false;
+	       CGameClient *pGameClient = static_cast<CGameClient *>(GameClient());
+	       int tick = Client()->GameTick(g_Config.m_ClDummy);
+	       // Try to get local player state from snap
+	       int localId = pGameClient->m_Snap.m_LocalClientId;
+	       if(localId >= 0 && localId < MAX_CLIENTS && pGameClient->m_Snap.m_aCharacters[localId].m_Active)
+	       {
+		       const CNetObj_Character &Char = pGameClient->m_Snap.m_aCharacters[localId].m_Cur;
+		       float velx = (float)Char.m_VelX / 256.0f;
+		       float vely = (float)Char.m_VelY / 256.0f;
+		       float speed = std::sqrt(velx * velx + vely * vely);
+		       reward += speed * 0.05f;
+		       if(Char.m_Health == 0)
+		       {
+			       reward -= 5.0f;
+			       done = true;
+		       }
+	       }
+
+	       rl::SSharedMemoryHeader *pHeader = m_pComm->GetHeader();
+	       if(pHeader)
+	       {
+		       pHeader->m_Tick = tick;
+		       pHeader->m_Reward = reward;
+		       pHeader->m_Done = done ? 1 : 0;
+		       pHeader->m_Truncated = truncated ? 1 : 0;
+	       }
 	
 	// Signal frame is ready
 	m_pComm->SignalFrameReady();
@@ -314,15 +336,96 @@ void CRLBot::SendStructuredObservation()
 	// Extract game state
 	ExtractGameState(pObs);
 	
-	// Update header
-	rl::SSharedMemoryHeader *pHeader = m_pComm->GetHeader();
-	if(pHeader)
-	{
-		pHeader->m_Tick = pObs->m_Tick;
-		pHeader->m_Reward = 0.0f; // TODO: Calculate reward
-		pHeader->m_Done = 0;      // TODO: Detect episode end
-		pHeader->m_Truncated = 0;
-	}
+		// --- Reward calculation ---
+		float reward = 0.0f;
+		float reward_speed = 0.0f;
+		float reward_checkpoint = 0.0f;
+		float reward_finish = 0.0f;
+		float reward_race_bonus = 0.0f;
+		float reward_death = 0.0f;
+		bool done = false;
+		bool truncated = false;
+
+	       // Get game client for gamemode info
+	       CGameClient *pGameClient = static_cast<CGameClient *>(GameClient());
+	       const rl::SPlayerObs &local = pObs->m_LocalPlayer;
+	       int tick = pObs->m_Tick;
+
+
+		       // Speed reward (only if faster than normal walking)
+               float speed = std::abs(local.m_VelX); // Only horizontal speed
+               const float normal_walk_speed = 10.0f; // tweak as needed for DDNet
+               if(speed > normal_walk_speed) {
+                   reward_speed = (speed - normal_walk_speed) * 0.05f; // only reward excess horizontal speed
+                   reward += reward_speed;
+               }
+
+	       // Checkpoint/finish detection (using tile grid)
+	       // Find current checkpoint and finish status
+	       int checkpoint = -1;
+	       bool finished = false;
+	       // Center tile in grid
+	       int center_x = rl::TILE_GRID_WIDTH / 2;
+	       int center_y = rl::TILE_GRID_HEIGHT / 2;
+	       int center_idx = center_y * rl::TILE_GRID_WIDTH + center_x;
+	       uint8_t center_tile = pObs->m_aTileGrid[center_idx];
+	       if(center_tile == (uint8_t)rl::ETileType::CHECKPOINT)
+		       checkpoint = tick; // Use tick as unique checkpoint id (could be improved)
+	       if(center_tile == (uint8_t)rl::ETileType::FINISH)
+		       finished = true;
+
+	       // Reward for reaching new checkpoint
+		       if(checkpoint != -1 && checkpoint != m_LastCheckpoint)
+		       {
+			       reward_checkpoint = 10.0f;
+			       reward += reward_checkpoint;
+			       m_LastCheckpoint = checkpoint;
+		       }
+
+	       // Reward for finishing
+		       if(finished && !m_LastFinished)
+		       {
+			       reward_finish = 100.0f;
+			       reward += reward_finish;
+			       done = true;
+			       m_LastFinished = true;
+		       }
+	       if(!finished)
+		       m_LastFinished = false;
+
+	       // Gamemode-dependent logic (example: more reward for finish in race mode)
+		       if(pGameClient->m_GameInfo.m_Race)
+		       {
+			       if(finished && done) {
+				       reward_race_bonus = 50.0f; // extra for race finish
+				       reward += reward_race_bonus;
+			       }
+		       }
+
+	       // Optionally: negative reward for death (if detected)
+		       if(local.m_Health == 0)
+		       {
+			       reward_death = -5.0f;
+			       reward += reward_death;
+			       done = true;
+		       }
+
+
+		// Debug print for reward components
+		//dbg_msg("rlbot", "Reward components: speed=%.3f, checkpoint=%.3f, finish=%.3f, race_bonus=%.3f, death=%.3f, total=%.3f", reward_speed, reward_checkpoint, reward_finish, reward_race_bonus, reward_death, reward);
+
+		// Accumulate reward (optional, for debugging)
+		m_AccumulatedReward += reward;
+
+	       // Update header
+	       rl::SSharedMemoryHeader *pHeader = m_pComm->GetHeader();
+	       if(pHeader)
+	       {
+		       pHeader->m_Tick = pObs->m_Tick;
+		       pHeader->m_Reward = reward;
+		       pHeader->m_Done = done ? 1 : 0;
+		       pHeader->m_Truncated = truncated ? 1 : 0;
+	       }
 	
 	// Signal observation is ready
 	m_pComm->SignalFrameReady();

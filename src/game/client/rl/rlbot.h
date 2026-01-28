@@ -1,3 +1,4 @@
+
 /* Teeworlds RL Bot - Main Component */
 #ifndef GAME_CLIENT_RL_RLBOT_H
 #define GAME_CLIENT_RL_RLBOT_H
@@ -42,6 +43,13 @@ public:
 	int GetActionAimY() const;
 
 private:
+	// RL reward state tracking
+	int m_LastCheckpoint;
+	bool m_LastFinished;
+	float m_LastPosX;
+	float m_LastPosY;
+	int m_LastTick;
+	float m_AccumulatedReward;
 	// Console commands
 	static void ConRLEnable(IConsole::IResult *pResult, void *pUserData);
 	static void ConRLDisable(IConsole::IResult *pResult, void *pUserData);
