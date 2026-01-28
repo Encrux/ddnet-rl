@@ -72,6 +72,9 @@ void CGraphicsBackend_Threaded::ThreadFunc(void *pUser)
 			pSelf->m_BufferInProcess.store(false, std::memory_order_relaxed);
 			pSelf->m_BufferSwapCond.notify_all();
 
+			// RL frame capture callback
+			pSelf->InvokePostRenderCallback();
+
 #if defined(CONF_VIDEORECORDER)
 			if(IVideo::Current())
 				IVideo::Current()->NextVideoFrameThread();
@@ -175,6 +178,16 @@ void CGraphicsBackend_Threaded::WaitForIdle()
 	std::unique_lock<std::mutex> Lock(m_BufferSwapMutex);
 	m_BufferSwapCond.wait(Lock, [this]() { return m_pBuffer == nullptr; });
 #endif
+}
+
+void CGraphicsBackend_Threaded::InvokePostRenderCallback()
+{
+	if(m_PostRenderCallback)
+	{
+		// Get the read function from the derived class (CGraphicsBackend_SDL_GL)
+		auto *pSdlBackend = static_cast<CGraphicsBackend_SDL_GL *>(this);
+		m_PostRenderCallback(pSdlBackend->GetReadPresentedImageDataFuncUnsafe());
+	}
 }
 
 void CGraphicsBackend_Threaded::ProcessError(const SGfxErrorContainer &Error)

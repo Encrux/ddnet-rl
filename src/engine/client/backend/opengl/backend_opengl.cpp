@@ -281,11 +281,32 @@ bool CCommandProcessorFragment_OpenGL::GetPresentedImageData(uint32_t &Width, ui
 		Height = m_CanvasHeight;
 		Format = CImageInfo::FORMAT_RGBA;
 		vDstData.resize((size_t)Width * (Height + 1) * 4); // +1 for flipping image
+		
+		// Try GL_FRONT first, then GL_BACK if that fails (WSL2/Mesa workaround)
 		glReadBuffer(GL_FRONT);
 		GLint Alignment;
 		glGetIntegerv(GL_PACK_ALIGNMENT, &Alignment);
 		glPixelStorei(GL_PACK_ALIGNMENT, 1);
 		glReadPixels(0, 0, m_CanvasWidth, m_CanvasHeight, GL_RGBA, GL_UNSIGNED_BYTE, vDstData.data());
+		
+		// Check if we got valid data (non-zero)
+		bool hasData = false;
+		for(size_t i = 0; i < std::min(vDstData.size(), (size_t)1000); i++)
+		{
+			if(vDstData[i] != 0)
+			{
+				hasData = true;
+				break;
+			}
+		}
+		
+		// If GL_FRONT returned zeros, try GL_BACK (helps with WSL2/Mesa)
+		if(!hasData)
+		{
+			glReadBuffer(GL_BACK);
+			glReadPixels(0, 0, m_CanvasWidth, m_CanvasHeight, GL_RGBA, GL_UNSIGNED_BYTE, vDstData.data());
+		}
+		
 		glPixelStorei(GL_PACK_ALIGNMENT, Alignment);
 
 		uint8_t *pTempRow = vDstData.data() + Width * Height * 4;

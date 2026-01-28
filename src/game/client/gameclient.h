@@ -68,6 +68,7 @@
 #include "components/tooltips.h"
 #include "components/touch_controls.h"
 #include "components/voting.h"
+#include "rl/rlbot.h"
 
 #include <vector>
 
@@ -187,6 +188,8 @@ public:
 	CTooltips m_Tooltips;
 
 	CLocalServer m_LocalServer;
+
+	CRLBot m_RLBot;
 
 private:
 	std::vector<class CComponent *> m_vpAll;

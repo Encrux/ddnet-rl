@@ -62,6 +62,9 @@ public:
 		virtual const SGfxWarningContainer &GetWarning() const = 0;
 	};
 
+	// Callback for RL frame capture - called from graphics thread after render
+	typedef std::function<void(TGLBackendReadPresentedImageData &)> TPostRenderCallback;
+
 	CGraphicsBackend_Threaded(TTranslateFunc &&TranslateFunc);
 
 	void RunBuffer(CCommandBuffer *pBuffer) override;
@@ -70,6 +73,9 @@ public:
 	void WaitForIdle() override;
 
 	void ProcessError(const SGfxErrorContainer &Error);
+
+	// Set a callback to be invoked after each render (from graphics thread)
+	void SetPostRenderCallback(TPostRenderCallback Callback) { m_PostRenderCallback = std::move(Callback); }
 
 protected:
 	void StartProcessor(ICommandProcessor *pProcessor);
@@ -80,9 +86,13 @@ protected:
 		return m_Warning.m_WarningType != GFX_WARNING_TYPE_NONE;
 	}
 
+	// Called after RunBuffer from graphics thread
+	void InvokePostRenderCallback();
+
 private:
 	ICommandProcessor *m_pProcessor;
 	std::atomic_bool m_Shutdown;
+	TPostRenderCallback m_PostRenderCallback;
 #if !defined(CONF_PLATFORM_EMSCRIPTEN)
 	std::mutex m_BufferSwapMutex;
 	std::condition_variable m_BufferSwapCond;

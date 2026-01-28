@@ -525,6 +525,11 @@ public:
 	// this function always returns the pixels in RGB
 	virtual TGLBackendReadPresentedImageData &GetReadPresentedImageDataFuncUnsafe() = 0;
 
+	// Set a callback to be invoked from the graphics thread after each render
+	// The callback receives the ReadPresentedImageData function for capturing frames
+	typedef std::function<void(TGLBackendReadPresentedImageData &)> TPostRenderCallback;
+	virtual void SetPostRenderCallback(TPostRenderCallback Callback) = 0;
+
 	virtual std::optional<SWarning> CurrentWarning() = 0;
 
 	/**

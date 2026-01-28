@@ -22,6 +22,7 @@
 #include <engine/shared/video.h>
 #endif
 
+#include "backend_sdl.h"
 #include "graphics_threaded.h"
 
 class CSemaphore;
@@ -2925,6 +2926,14 @@ const char *CGraphics_Threaded::GetRendererString()
 TGLBackendReadPresentedImageData &CGraphics_Threaded::GetReadPresentedImageDataFuncUnsafe()
 {
 	return m_pBackend->GetReadPresentedImageDataFuncUnsafe();
+}
+
+void CGraphics_Threaded::SetPostRenderCallback(TPostRenderCallback Callback)
+{
+	// Cast to the SDL backend which has the callback mechanism
+	auto *pSdlBackend = dynamic_cast<CGraphicsBackend_Threaded *>(m_pBackend);
+	if(pSdlBackend)
+		pSdlBackend->SetPostRenderCallback(std::move(Callback));
 }
 
 int CGraphics_Threaded::GetVideoModes(CVideoMode *pModes, int MaxModes, int Screen)

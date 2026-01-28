@@ -1270,6 +1270,7 @@ public:
 	const char *GetRendererString() override;
 
 	TGLBackendReadPresentedImageData &GetReadPresentedImageDataFuncUnsafe() override;
+	void SetPostRenderCallback(TPostRenderCallback Callback) override;
 };
 
 typedef std::function<const char *(const char *, const char *)> TTranslateFunc;

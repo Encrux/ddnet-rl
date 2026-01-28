@@ -277,8 +277,8 @@ bool CInput::MouseRelative(float *pX, float *pY)
 	ivec2 Relative;
 	SDL_GetRelativeMouseState(&Relative.x, &Relative.y);
 
-	*pX = Relative.x;
-	*pY = Relative.y;
+	*pX = -Relative.x;
+	*pY = -Relative.y;
 	return *pX != 0.0f || *pY != 0.0f;
 }
 
