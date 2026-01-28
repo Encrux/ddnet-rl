@@ -4,16 +4,97 @@
 
 This module implements a reinforcement learning interface for Teeworlds/DDNet, allowing AI agents to play the game by modifying only the client side.
 
+**Two observation modes are supported:**
+- **Structured** (default): Game state vectors - headless compatible, faster for training
+- **Rendered**: RGB pixel frames - requires display or Xvfb
+
 ---
 
 ## Architecture
 
 ```
-┌─────────────────┐     Shared Memory / ZMQ     ┌──────────────────┐
+┌─────────────────┐     Shared Memory (POSIX)   ┌──────────────────┐
 │   DDNet Client  │  ◄────────────────────────► │   Python Agent   │
 │   (C++ Game)    │   obs, reward, done, action │  (PyTorch/JAX)   │
 └─────────────────┘                             └──────────────────┘
 ```
+
+---
+
+## Quick Start
+
+### Structured Mode (Headless - Recommended for Training)
+
+```bash
+# Terminal 1: Start server
+./build/DDNet-Server
+
+# Terminal 2: Start client (works headless with -DHEADLESS_CLIENT=ON)
+./build/DDNet "connect localhost:8303; rl_enable"
+
+# Terminal 3: Run Python client
+cd src/game/client/rl/python
+python teeworlds_env.py --print
+```
+
+### Rendered Mode (Requires Display)
+
+```bash
+# Terminal 1: Start server
+./build/DDNet-Server
+
+# Terminal 2: Start client with display
+./build/DDNet "connect localhost:8303; cl_overlay_entities 100; cl_showquads 0; cl_showhud 0; rl_enable render"
+
+# OR with Xvfb for headless pixel capture:
+xvfb-run -a ./build/DDNet "connect localhost:8303; rl_enable render 0 640 360"
+
+# Terminal 3: View frames
+python teeworlds_env.py --display
+```
+
+---
+
+## Console Commands
+
+| Command | Description |
+|---------|-------------|
+| `rl_enable` | Enable RL mode with structured observations (headless compatible) |
+| `rl_enable state [env_id]` | Same as above, explicit structured mode |
+| `rl_enable render [env_id] [width] [height]` | Enable with pixel observations (default 640x360) |
+| `rl_disable` | Disable RL mode |
+| `rl_status` | Show RL status and current mode |
+
+---
+
+## Observation Modes
+
+### Structured Mode (Default)
+
+Extracts game state directly from `CGameClient::m_Snap`. Fast, compact, headless-compatible.
+
+**Size:** 1496 bytes per observation
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tick` | uint32 | Game tick |
+| `game_flags` | uint8 | Team game, CTF, etc. |
+| `local_player` | SPlayerObs (36B) | Local player state |
+| `other_players[15]` | SPlayerObs[] | Other visible players |
+| `projectiles[32]` | SProjectileObs[] | Active projectiles |
+| `flag_pos[2]` | vec2[] | CTF flag positions |
+
+**SPlayerObs (36 bytes):**
+- Position (x, y), Velocity (vx, vy)
+- Direction, Jumped, HookState, Weapon
+- Hook position, Hooked player ID
+- Active, IsFrozen, Health, Armor
+
+### Rendered Mode
+
+Captures RGB pixel frames from OpenGL. Requires display or Xvfb.
+
+**Size:** width × height × 3 bytes (e.g., 640×360×3 = 691,200 bytes)
 
 ---
 
@@ -24,57 +105,16 @@ src/game/client/rl/
 ├── README.md              # This file
 ├── rlbot.h                # Main RL bot component header
 ├── rlbot.cpp              # Main RL bot component implementation
-├── observation.h          # Observation space definition
-├── observation.cpp        # Observation extraction from game state
-├── action.h               # Action space definition  
-├── action.cpp             # Action injection into controls
-├── reward.h               # Reward function definitions
-├── reward.cpp             # Reward calculation logic
+├── observation.h          # Structured observation definitions
 ├── communication/
 │   ├── comm_interface.h   # Abstract communication interface
 │   ├── shm_comm.h         # Shared memory implementation
-│   ├── shm_comm.cpp
-│   ├── zmq_comm.h         # ZeroMQ implementation (optional)
-│   └── zmq_comm.cpp
+│   └── shm_comm.cpp
 └── python/
-    ├── teeworlds_env.py   # Gym environment wrapper
-    ├── observation.py     # Observation space helpers
-    ├── train.py           # Training script example
+    ├── teeworlds_env.py   # Python client (supports both modes)
+    ├── stream_viewer.py   # Remote frame viewer
     └── requirements.txt   # Python dependencies
 ```
-
----
-
-## Observation Space
-
-Extracted from `CGameClient::m_Snap`:
-
-| Feature | Type | Description |
-|---------|------|-------------|
-| `local_pos` | vec2 | Player position |
-| `local_vel` | vec2 | Player velocity |
-| `local_hook_state` | int | Hook state (idle, flying, grabbed) |
-| `local_hook_pos` | vec2 | Hook position |
-| `local_jumped` | int | Jump flags |
-| `local_weapon` | int | Current weapon |
-| `other_players[N]` | array | Other players' positions, velocities |
-| `nearby_tiles[M]` | array | Collision tiles around player |
-| `projectiles[K]` | array | Active projectiles |
-
----
-
-## Action Space
-
-Based on `CNetObj_PlayerInput`:
-
-| Action | Type | Values |
-|--------|------|--------|
-| `direction` | Discrete | -1 (left), 0 (none), 1 (right) |
-| `jump` | Binary | 0, 1 |
-| `hook` | Binary | 0, 1 |
-| `fire` | Binary | 0, 1 |
-| `aim_angle` | Discrete/Continuous | 0-15 (16 directions) or radians |
-| `weapon` | Discrete | 0-5 |
 
 ---
 
@@ -196,20 +236,65 @@ python stream_viewer.py --host <ip>
 
 ## Headless Training
 
-For training, run `rl_enable` after connection is established. You can use an autoexec config:
+The DDNet client requires a graphics context to render frames. For headless training (no physical display), use **Xvfb** (X Virtual Framebuffer) which creates a virtual display in memory.
 
+### Option 1: Xvfb (Recommended)
+
+Install Xvfb:
 ```bash
-# Create autoexec file
-echo "connect localhost:8303" > ~/.teeworlds/autoexec_rl.cfg
-echo "cl_overlay_entities 100" >> ~/.teeworlds/autoexec_rl.cfg
-echo "cl_showquads 0" >> ~/.teeworlds/autoexec_rl.cfg
-echo "cl_showhud 0" >> ~/.teeworlds/autoexec_rl.cfg
+# Ubuntu/Debian
+sudo apt install xvfb
 
-# Run with autoexec
-./build/DDNet -f autoexec_rl.cfg
+# Arch Linux
+sudo pacman -S xorg-server-xvfb
 ```
 
-Then enable RL mode via the Python client or manually.
+Run DDNet with virtual display:
+```bash
+# Single client
+xvfb-run -a -s "-screen 0 800x600x24" ./build/DDNet \
+    "connect localhost:8303; cl_overlay_entities 100; cl_showquads 0; cl_showhud 0; cl_showchat 0; rl_enable"
+
+# Or start Xvfb separately for multiple clients
+Xvfb :99 -screen 0 800x600x24 &
+export DISPLAY=:99
+
+# Now run multiple clients on the same virtual display
+./build/DDNet "connect localhost:8303; rl_enable 0" &
+./build/DDNet "connect localhost:8303; rl_enable 1" &
+./build/DDNet "connect localhost:8303; rl_enable 2" &
+```
+
+### Option 2: VirtualGL + Headless (GPU accelerated)
+
+For faster training with GPU acceleration:
+```bash
+# Install VirtualGL
+sudo apt install virtualgl
+
+# Run with GPU offscreen rendering
+vglrun -d :0 ./build/DDNet "connect localhost:8303; rl_enable"
+```
+
+### Autoexec Configuration
+
+Create an autoexec file for RL-optimized settings:
+```bash
+# Create autoexec file
+cat > ~/.teeworlds/autoexec_rl.cfg << 'EOF'
+cl_overlay_entities 100
+cl_showquads 0
+cl_showhud 0
+cl_showchat 0
+gfx_vsync 0
+gfx_refresh_rate 0
+EOF
+```
+
+Run with autoexec:
+```bash
+xvfb-run -a ./build/DDNet -f autoexec_rl.cfg "connect localhost:8303; rl_enable"
+```
 
 ### Start training server
 ```bash
@@ -221,6 +306,35 @@ Then enable RL mode via the Python client or manually.
 cd src/game/client/rl/python
 pip install -r requirements.txt
 python train.py --env teeworlds --algo ppo
+```
+
+### Parallel Training Script
+
+```bash
+#!/bin/bash
+# parallel_train.sh - Run N parallel training environments
+NUM_ENVS=${1:-4}
+SERVER_PORT=8303
+
+# Start server
+./build/DDNet-Server "sv_port $SERVER_PORT" &
+SERVER_PID=$!
+sleep 2
+
+# Start Xvfb
+Xvfb :99 -screen 0 800x600x24 &
+XVFB_PID=$!
+export DISPLAY=:99
+sleep 1
+
+# Launch clients
+for i in $(seq 0 $((NUM_ENVS-1))); do
+    ./build/DDNet "connect localhost:$SERVER_PORT; rl_enable $i" &
+done
+
+# Wait for Ctrl+C
+trap "kill $SERVER_PID $XVFB_PID; pkill -f DDNet" INT
+wait
 ```
 
 ---
@@ -266,5 +380,5 @@ python train.py --env teeworlds --algo ppo
 
 - Server modification is minimal: only simulation speed adjustment for faster training
 - Client handles all RL logic
-- Headless mode (`-DHEADLESS_CLIENT=ON`) removes graphics overhead
+- Use Xvfb for headless training with frame capture
 - Multiple clients can connect to same server for parallel training

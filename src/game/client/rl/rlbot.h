@@ -10,6 +10,8 @@
 #include <mutex>
 #include <atomic>
 
+#include "observation.h"
+
 namespace rl {
 class ICommInterface;
 }
@@ -45,13 +47,19 @@ private:
 	static void ConRLDisable(IConsole::IResult *pResult, void *pUserData);
 	static void ConRLStatus(IConsole::IResult *pResult, void *pUserData);
 	
-	// Called from graphics thread to capture frame
+	// Called from graphics thread to capture frame (rendered mode only)
 	void OnGraphicsThreadCapture(TGLBackendReadPresentedImageData &ReadFunc);
 	
 	// Frame processing (main thread)
 	void ProcessCapturedFrame();
 	void SendFrame();
+	void SendStructuredObservation();
 	void ReceiveAction();
+	
+	// Extract game state into structured observation
+	void ExtractGameState(rl::SStructuredObservation *pObs);
+	void ExtractPlayerState(rl::SPlayerObs *pPlayerObs, int ClientId, bool IsLocal);
+	void ExtractLocalTiles(rl::SStructuredObservation *pObs);
 	
 	// Downscale frame to target resolution
 	void DownscaleFrame(const uint8_t *pSrc, uint32_t SrcWidth, uint32_t SrcHeight,
@@ -63,6 +71,7 @@ private:
 	uint32_t m_FrameWidth;
 	uint32_t m_FrameHeight;
 	uint32_t m_FrameChannels;
+	rl::EObservationMode m_ObservationMode;
 	
 	// Communication
 	std::unique_ptr<rl::ICommInterface> m_pComm;
@@ -90,11 +99,12 @@ private:
 	// Deferred enable (for startup)
 	bool m_PendingEnable{false};
 	int m_PendingEnvId{0};
-	int m_PendingWidth{84};
-	int m_PendingHeight{84};
+	int m_PendingWidth{640};
+	int m_PendingHeight{360};
+	rl::EObservationMode m_PendingMode{rl::EObservationMode::STRUCTURED};
 	
 	// Actually enable RL mode (called when graphics is ready)
-	void DoEnable(int EnvId, int Width, int Height);
+	void DoEnable(int EnvId, int Width, int Height, rl::EObservationMode Mode);
 };
 
 #endif // GAME_CLIENT_RL_RLBOT_H

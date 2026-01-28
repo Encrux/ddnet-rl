@@ -16,10 +16,11 @@ CShmComm::CShmComm() :
 	m_ShmFd(-1),
 	m_pShmPtr(nullptr),
 	m_ShmSize(0),
-	m_FrameBufferSize(0),
+	m_DataBufferSize(0),
 	m_FrameWidth(0),
 	m_FrameHeight(0),
 	m_FrameChannels(0),
+	m_ObservationMode(EObservationMode::RENDERED),
 	m_Initialized(false)
 {
 	m_aShmPath[0] = '\0';
@@ -30,7 +31,7 @@ CShmComm::~CShmComm()
 	Shutdown();
 }
 
-bool CShmComm::Init(int EnvId, uint32_t FrameWidth, uint32_t FrameHeight, uint32_t FrameChannels)
+bool CShmComm::Init(int EnvId, uint32_t FrameWidth, uint32_t FrameHeight, uint32_t FrameChannels, EObservationMode Mode)
 {
 	if(m_Initialized)
 	{
@@ -38,13 +39,23 @@ bool CShmComm::Init(int EnvId, uint32_t FrameWidth, uint32_t FrameHeight, uint32
 		return false;
 	}
 	
+	m_ObservationMode = Mode;
 	m_FrameWidth = FrameWidth;
 	m_FrameHeight = FrameHeight;
 	m_FrameChannels = FrameChannels;
-	m_FrameBufferSize = (size_t)FrameWidth * FrameHeight * FrameChannels;
 	
-	// Total size: header + frame buffer
-	m_ShmSize = sizeof(SSharedMemoryHeader) + m_FrameBufferSize;
+	// Calculate data buffer size based on mode
+	if(Mode == EObservationMode::STRUCTURED)
+	{
+		m_DataBufferSize = sizeof(SStructuredObservation);
+	}
+	else
+	{
+		m_DataBufferSize = (size_t)FrameWidth * FrameHeight * FrameChannels;
+	}
+	
+	// Total size: header + data buffer
+	m_ShmSize = sizeof(SSharedMemoryHeader) + m_DataBufferSize;
 	
 	// Create shared memory name
 	str_format(m_aShmPath, sizeof(m_aShmPath), "/teeworlds_rl_%d", EnvId);
@@ -86,10 +97,15 @@ bool CShmComm::Init(int EnvId, uint32_t FrameWidth, uint32_t FrameHeight, uint32
 	pHeader->m_FrameWidth = FrameWidth;
 	pHeader->m_FrameHeight = FrameHeight;
 	pHeader->m_FrameChannels = FrameChannels;
+	pHeader->m_ObservationMode = static_cast<uint8_t>(Mode);
 	
 	m_Initialized = true;
-	dbg_msg("rl/shm", "Shared memory initialized: %s (size: %zu bytes, frame: %ux%ux%u)", 
-		m_aShmPath, m_ShmSize, FrameWidth, FrameHeight, FrameChannels);
+	
+	const char *pModeName = (Mode == EObservationMode::STRUCTURED) ? "structured" : "rendered";
+	dbg_msg("rl/shm", "Shared memory initialized: %s (size: %zu bytes, mode: %s)", 
+		m_aShmPath, m_ShmSize, pModeName);
+	if(Mode == EObservationMode::RENDERED)
+		dbg_msg("rl/shm", "  Frame: %ux%ux%u", FrameWidth, FrameHeight, FrameChannels);
 	
 	return true;
 }
@@ -142,9 +158,16 @@ uint8_t *CShmComm::GetFrameBuffer()
 	return static_cast<uint8_t *>(m_pShmPtr) + sizeof(SSharedMemoryHeader);
 }
 
+SStructuredObservation *CShmComm::GetStructuredObservation()
+{
+	if(!m_pShmPtr)
+		return nullptr;
+	return reinterpret_cast<SStructuredObservation *>(static_cast<uint8_t *>(m_pShmPtr) + sizeof(SSharedMemoryHeader));
+}
+
 size_t CShmComm::GetFrameBufferSize() const
 {
-	return m_FrameBufferSize;
+	return m_DataBufferSize;
 }
 
 void CShmComm::SignalFrameReady()

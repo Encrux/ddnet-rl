@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstddef>
 
+#include "../observation.h"
+
 namespace rl {
 
 // Shared memory layout header
@@ -16,12 +18,12 @@ struct SSharedMemoryHeader
 	uint8_t m_ClientReady;      // C++ signals frame is ready
 	uint8_t m_PythonReady;      // Python signals action is ready
 	uint8_t m_Shutdown;         // Signal to shutdown
-	uint8_t m_Padding1;
+	uint8_t m_ObservationMode;  // 0=rendered, 1=structured (EObservationMode)
 	
 	// Frame info (16 bytes)
 	uint32_t m_Tick;
-	uint32_t m_FrameWidth;
-	uint32_t m_FrameHeight;
+	uint32_t m_FrameWidth;      // For rendered mode
+	uint32_t m_FrameHeight;     // For rendered mode
 	uint32_t m_FrameChannels;   // 3 for RGB, 1 for grayscale
 	
 	// RL signals (8 bytes)
@@ -55,7 +57,9 @@ public:
 	virtual ~ICommInterface() = default;
 	
 	// Initialize the communication channel
-	virtual bool Init(int EnvId, uint32_t FrameWidth, uint32_t FrameHeight, uint32_t FrameChannels) = 0;
+	// For rendered mode: pass frame dimensions
+	// For structured mode: pass width=0, height=0 (uses SStructuredObservation size)
+	virtual bool Init(int EnvId, uint32_t FrameWidth, uint32_t FrameHeight, uint32_t FrameChannels, EObservationMode Mode = EObservationMode::RENDERED) = 0;
 	
 	// Shutdown the communication channel
 	virtual void Shutdown() = 0;
@@ -63,11 +67,17 @@ public:
 	// Get pointer to the header
 	virtual SSharedMemoryHeader *GetHeader() = 0;
 	
-	// Get pointer to frame data buffer
+	// Get pointer to frame data buffer (for rendered mode)
 	virtual uint8_t *GetFrameBuffer() = 0;
 	
-	// Get frame buffer size
+	// Get pointer to structured observation (for structured mode)
+	virtual SStructuredObservation *GetStructuredObservation() = 0;
+	
+	// Get data buffer size
 	virtual size_t GetFrameBufferSize() const = 0;
+	
+	// Get observation mode
+	virtual EObservationMode GetObservationMode() const = 0;
 	
 	// Signal that a new frame is ready
 	virtual void SignalFrameReady() = 0;

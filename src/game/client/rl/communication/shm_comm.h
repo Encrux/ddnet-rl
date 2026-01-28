@@ -13,12 +13,14 @@ public:
 	CShmComm();
 	~CShmComm() override;
 	
-	bool Init(int EnvId, uint32_t FrameWidth, uint32_t FrameHeight, uint32_t FrameChannels) override;
+	bool Init(int EnvId, uint32_t FrameWidth, uint32_t FrameHeight, uint32_t FrameChannels, EObservationMode Mode = EObservationMode::RENDERED) override;
 	void Shutdown() override;
 	
 	SSharedMemoryHeader *GetHeader() override;
 	uint8_t *GetFrameBuffer() override;
+	SStructuredObservation *GetStructuredObservation() override;
 	size_t GetFrameBufferSize() const override;
+	EObservationMode GetObservationMode() const override { return m_ObservationMode; }
 	
 	void SignalFrameReady() override;
 	bool IsActionReady() override;
@@ -33,11 +35,12 @@ private:
 	int m_ShmFd;
 	void *m_pShmPtr;
 	size_t m_ShmSize;
-	size_t m_FrameBufferSize;
+	size_t m_DataBufferSize;
 	
 	uint32_t m_FrameWidth;
 	uint32_t m_FrameHeight;
 	uint32_t m_FrameChannels;
+	EObservationMode m_ObservationMode;
 	
 	bool m_Initialized;
 };
