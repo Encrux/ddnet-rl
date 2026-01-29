@@ -24,7 +24,7 @@ from collections import deque
 from teeworlds_env import TeeWorldsShmClient
 
 NUM_ENVS = 16
-NUM_STEPS = 20000  # Steps per episode
+NUM_STEPS = 1000  # Steps per episode
 DDNET_PATH = os.environ.get('DDNET_PATH', '../../../../../build/DDNet')  # Adjust as needed
 SERVER_PORT = 8303
 
@@ -97,6 +97,7 @@ def env_worker(env_id, conn):
             break
         # If reset requested, send 'kill' keypress (bound to 'k')
         if action.get('reset', False):
+            client.send_action(reset=1)  # Send reset signal to C++
             client.reset()  # send keypress
             obs, info = client.wait_for_observation(timeout=5.0)
             if obs is None:
@@ -149,6 +150,17 @@ def main():
     episode_rewards = [0 for _ in range(NUM_ENVS)]
     dones = [False for _ in range(NUM_ENVS)]
     episode_steps = [0 for _ in range(NUM_ENVS)]
+    
+    # Initialize current actions for delta accumulation
+    current_actions = [{
+        'direction': 0,
+        'jump': 0,
+        'hook': 0,
+        'fire': 0,
+        'aim_x': 0,
+        'aim_y': 0,
+        'weapon': 0,
+    } for _ in range(NUM_ENVS)]
 
     episode_count = 0
     try:
@@ -164,9 +176,20 @@ def main():
                     episode_rewards[i] = 0
                     episode_steps[i] = 0
                     dones[i] = False
+                    # Reset current action
+                    current_actions[i] = {
+                        'direction': 0,
+                        'jump': 0,
+                        'hook': 0,
+                        'fire': 0,
+                        'aim_x': 0,
+                        'aim_y': 0,
+                        'weapon': 0,
+                    }
                     actions.append({'reset': True})
                     continue
                 if np.random.rand() < eps:
+                    # Random absolute actions for exploration
                     action = {
                         'direction': np.random.choice([-1, 0, 1]),
                         'jump': np.random.randint(0, 2),
@@ -176,19 +199,37 @@ def main():
                         'aim_y': np.random.randint(-180, 181),
                         'weapon': np.random.randint(0, 5),
                     }
+                    # Update current action
+                    for key in current_actions[i]:
+                        if key in action:
+                            current_actions[i][key] = action[key]
                 else:
                     with torch.no_grad():
                         state_t = torch.tensor(states[i]).unsqueeze(0).float()
                         qvals = policy_net(state_t)
                         action_idx = int(torch.argmax(qvals)) % 5
-                        # Map action_idx to a fixed action (expand as needed)
-                        action = [
-                            {'direction': 0, 'jump': 0, 'hook': 0, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},
-                            {'direction': -1, 'jump': 0, 'hook': 0, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},
-                            {'direction': 1, 'jump': 0, 'hook': 0, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},
-                            {'direction': 0, 'jump': 1, 'hook': 0, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},
-                            {'direction': 0, 'jump': 0, 'hook': 1, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},
+                        # Map action_idx to delta action
+                        delta_action = [
+                            {'direction': 0, 'jump': 0, 'hook': 0, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},  # no change
+                            {'direction': -1, 'jump': 0, 'hook': 0, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},  # turn left
+                            {'direction': 1, 'jump': 0, 'hook': 0, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},   # turn right
+                            {'direction': 0, 'jump': 1, 'hook': 0, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},  # jump
+                            {'direction': 0, 'jump': 0, 'hook': 1, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},  # hook
                         ][action_idx]
+                    # Accumulate deltas into current action
+                    for key in current_actions[i]:
+                        if key in delta_action:
+                            current_actions[i][key] += delta_action[key]
+                            # Clamp to valid ranges
+                            if key == 'direction':
+                                current_actions[i][key] = np.clip(current_actions[i][key], -1, 1)
+                            elif key in ['jump', 'hook', 'fire']:
+                                current_actions[i][key] = np.clip(current_actions[i][key], 0, 1)
+                            elif key in ['aim_x', 'aim_y']:
+                                current_actions[i][key] = np.clip(current_actions[i][key], -180, 180)
+                            elif key == 'weapon':
+                                current_actions[i][key] = np.clip(current_actions[i][key], 0, 4)
+                    action = current_actions[i].copy()
                 parent_conns[i].send(action)
                 actions.append(action)
             # Collect results
@@ -206,9 +247,9 @@ def main():
                 episode_steps[i] += 1
                 # End episode if done or max steps reached
                 if done or episode_steps[i] >= NUM_STEPS:
-                    if episode_steps[i] > 1:
-                        print(f"[Env {i}] Episode {episode_count} finished with reward {episode_rewards[i]} after {episode_steps[i]} steps")
+                    #print(f"[Env {i}] Episode {episode_count} finished with reward {episode_rewards[i]} after {episode_steps[i]} steps")
                     dones[i] = True
+                    
                 steps_done += 1
             # Learn
             if len(memory) > MIN_REPLAY_SIZE:
@@ -233,7 +274,8 @@ def main():
                 target_net.load_state_dict(policy_net.state_dict())
             # Increment episode count if all envs done
             if all(dones):
-                print(f"All environments finished episode {episode_count}. Rewards: {episode_rewards}")
+                print(f"All environments finished episode {episode_count}. Rewards: {[round(r, 3) for r in episode_rewards]}")
+                print(f"Max reward: {round(max(episode_rewards), 3)}, Avg reward: {round(sum(episode_rewards)/NUM_ENVS, 3)}")
                 episode_count += 1
     except KeyboardInterrupt:
         print("Training interrupted by user.")

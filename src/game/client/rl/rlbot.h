@@ -48,6 +48,9 @@ private:
 	bool m_LastFinished;
 	float m_LastPosX;
 	float m_LastPosY;
+	float m_SpawnPosX;
+	float m_SpawnPosY;
+	float m_MaxDistanceFromSpawn;
 	int m_LastTick;
 	float m_AccumulatedReward;
 	// Console commands

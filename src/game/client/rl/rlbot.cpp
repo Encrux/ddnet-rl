@@ -12,8 +12,18 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <cmath>
 
 CRLBot::CRLBot() :
+	m_LastCheckpoint(-1),
+	m_LastFinished(false),
+	m_LastPosX(0.0f),
+	m_LastPosY(0.0f),
+	m_SpawnPosX(0.0f),
+	m_SpawnPosY(0.0f),
+	m_MaxDistanceFromSpawn(0.0f),
+	m_LastTick(0),
+	m_AccumulatedReward(0.0f),
 	m_Enabled(false),
 	m_EnvId(0),
 	m_FrameWidth(640),
@@ -339,26 +349,38 @@ void CRLBot::SendStructuredObservation()
 		// --- Reward calculation ---
 		float reward = 0.0f;
 		float reward_speed = 0.0f;
+		float reward_distance = 0.0f;
 		float reward_checkpoint = 0.0f;
 		float reward_finish = 0.0f;
-		float reward_race_bonus = 0.0f;
-		float reward_death = 0.0f;
 		bool done = false;
 		bool truncated = false;
 
-	       // Get game client for gamemode info
-	       CGameClient *pGameClient = static_cast<CGameClient *>(GameClient());
 	       const rl::SPlayerObs &local = pObs->m_LocalPlayer;
 	       int tick = pObs->m_Tick;
 
 
 		       // Speed reward (only if faster than normal walking)
                float speed = std::abs(local.m_VelX); // Only horizontal speed
-               const float normal_walk_speed = 10.0f; // tweak as needed for DDNet
+               const float normal_walk_speed = 30.0f; // tweak as needed for DDNet
                if(speed > normal_walk_speed) {
-                   reward_speed = (speed - normal_walk_speed) * 0.05f; // only reward excess horizontal speed
+                   reward_speed = (speed - normal_walk_speed) * 0.005f; // only reward excess horizontal speed
                    reward += reward_speed;
                }
+
+		       // Distance from spawn reward (sparse: only when reaching new max distance)
+		       float dx = local.m_PosX - m_SpawnPosX;
+		       float dy = local.m_PosY - m_SpawnPosY;
+		       float distance = std::sqrt(dx * dx + dy * dy);
+		       if(distance > m_MaxDistanceFromSpawn)
+		       {
+		           reward_distance = 0.001f; // Reward for reaching new max distance
+		           m_MaxDistanceFromSpawn = distance;
+		       }
+		       else
+		       {
+		           reward_distance = 0.0f;
+		       }
+		       reward += reward_distance;
 
 	       // Checkpoint/finish detection (using tile grid)
 	       // Find current checkpoint and finish status
@@ -374,45 +396,27 @@ void CRLBot::SendStructuredObservation()
 	       if(center_tile == (uint8_t)rl::ETileType::FINISH)
 		       finished = true;
 
-	       // Reward for reaching new checkpoint
-		       if(checkpoint != -1 && checkpoint != m_LastCheckpoint)
-		       {
-			       reward_checkpoint = 10.0f;
-			       reward += reward_checkpoint;
-			       m_LastCheckpoint = checkpoint;
-		       }
+	       	// Reward for reaching new checkpoint
+			if(checkpoint != -1 && checkpoint != m_LastCheckpoint)
+			{
+				reward_checkpoint = 0.1f;
+				reward += reward_checkpoint;
+				m_LastCheckpoint = checkpoint;
+			}
 
-	       // Reward for finishing
-		       if(finished && !m_LastFinished)
-		       {
-			       reward_finish = 100.0f;
-			       reward += reward_finish;
-			       done = true;
-			       m_LastFinished = true;
-		       }
-	       if(!finished)
-		       m_LastFinished = false;
-
-	       // Gamemode-dependent logic (example: more reward for finish in race mode)
-		       if(pGameClient->m_GameInfo.m_Race)
-		       {
-			       if(finished && done) {
-				       reward_race_bonus = 50.0f; // extra for race finish
-				       reward += reward_race_bonus;
-			       }
-		       }
-
-	       // Optionally: negative reward for death (if detected)
-		       if(local.m_Health == 0)
-		       {
-			       reward_death = -5.0f;
-			       reward += reward_death;
-			       done = true;
-		       }
+			// Reward for finishing
+			if(finished && !m_LastFinished)
+			{
+				reward_finish = 1.0f;
+				reward += reward_finish;
+				done = true;
+				m_LastFinished = true;
+			}
+			if(!finished)
+				m_LastFinished = false;
 
 
-		// Debug print for reward components
-		//dbg_msg("rlbot", "Reward components: speed=%.3f, checkpoint=%.3f, finish=%.3f, race_bonus=%.3f, death=%.3f, total=%.3f", reward_speed, reward_checkpoint, reward_finish, reward_race_bonus, reward_death, reward);
+		//dbg_msg("rlbot", "Reward components: speed=%.3f, distance=%.3f, checkpoint=%.3f, finish=%.3f, total=%.3f", reward_speed, reward_distance, reward_checkpoint, reward_finish, reward);
 
 		// Accumulate reward (optional, for debugging)
 		m_AccumulatedReward += reward;
@@ -454,6 +458,13 @@ void CRLBot::ExtractGameState(rl::SStructuredObservation *pObs)
 	if(LocalClientId >= 0 && LocalClientId < MAX_CLIENTS)
 	{
 		ExtractPlayerState(&pObs->m_LocalPlayer, LocalClientId, true);
+		// Set spawn position if not set yet
+		if(m_SpawnPosX == 0.0f && m_SpawnPosY == 0.0f && pObs->m_LocalPlayer.m_Active)
+		{
+			m_SpawnPosX = pObs->m_LocalPlayer.m_PosX;
+			m_SpawnPosY = pObs->m_LocalPlayer.m_PosY;
+			m_MaxDistanceFromSpawn = 0.0f; // Reset max distance when spawn is set
+		}
 	}
 	
 	// Other players
@@ -719,6 +730,13 @@ void CRLBot::ReceiveAction()
 			       }
 			       // Clear keypress after handling
 			       pHeader->m_Keypress = 0;
+		       }
+
+		       // Handle episode reset from Python
+		       if(pHeader->m_Reset != 0)
+		       {
+			       m_MaxDistanceFromSpawn = 0.0f;
+			       pHeader->m_Reset = 0; // Clear the flag
 		       }
 	       }
        

@@ -78,7 +78,8 @@ class SharedMemoryHeader:
     reward: float           # float32
     done: int               # uint8
     truncated: int          # uint8
-    _padding2: bytes        # uint8[2]
+    reset: int              # uint8 (Python signals episode reset)
+    _padding2: bytes        # uint8[1]
     action_direction: int   # int8
     action_jump: int        # uint8
     action_hook: int        # uint8
@@ -86,11 +87,11 @@ class SharedMemoryHeader:
     action_aim_x: int       # int16
     action_aim_y: int       # int16
     action_weapon: int      # uint8
+    keypress: int          # uint8 (separate field)
     _padding3: tuple        # 3 uint8s
-    keypress: int           # uint8 (separate field)
     _reserved: bytes        # uint8[23]
 
-    STRUCT_FORMAT = '<BBBBIIIIfBB2sbBBBhhBB3B23s'
+    STRUCT_FORMAT = '<BBBBIIIIfBBB1sbBBBhhBB3B23s'
     STRUCT_SIZE = 64
 
     @classmethod
@@ -102,7 +103,7 @@ class SharedMemoryHeader:
         (
             client_ready, python_ready, shutdown, observation_mode,
             tick, frame_width, frame_height, frame_channels,
-            reward, done, truncated, _padding2,
+            reward, done, truncated, reset, _padding2,
             action_direction, action_jump, action_hook, action_fire,
             action_aim_x, action_aim_y, action_weapon,
             keypress,
@@ -114,7 +115,7 @@ class SharedMemoryHeader:
         return cls(
             client_ready, python_ready, shutdown, observation_mode,
             tick, frame_width, frame_height, frame_channels,
-            reward, done, truncated, _padding2,
+            reward, done, truncated, reset, _padding2,
             action_direction, action_jump, action_hook, action_fire,
             action_aim_x, action_aim_y, action_weapon,
             keypress, _padding3, _reserved_bytes
@@ -127,7 +128,7 @@ class SharedMemoryHeader:
             self.STRUCT_FORMAT,
             self.client_ready, self.python_ready, self.shutdown, self.observation_mode,
             self.tick, self.frame_width, self.frame_height, self.frame_channels,
-            self.reward, self.done, self.truncated, self._padding2,
+            self.reward, self.done, self.truncated, self.reset, self._padding2,
             self.action_direction, self.action_jump, self.action_hook, self.action_fire,
             self.action_aim_x, self.action_aim_y, self.action_weapon,
             self.keypress,
@@ -607,7 +608,7 @@ class TeeWorldsShmClient:
             time.sleep(0.001)
     
     def send_action(self, direction: int = 0, jump: int = 0, hook: int = 0, 
-                    fire: int = 0, aim_x: int = 0, aim_y: int = 0, weapon: int = 0):
+                    fire: int = 0, aim_x: int = 0, aim_y: int = 0, weapon: int = 0, reset: int = 0):
         """
         Send an action to DDNet.
         
@@ -619,6 +620,7 @@ class TeeWorldsShmClient:
             aim_x: Aim X coordinate (relative to player)
             aim_y: Aim Y coordinate (relative to player)
             weapon: Weapon to switch to (0-5)
+            reset: 1 to signal episode reset, 0 otherwise
         """
         if not self._connected:
             return
@@ -629,6 +631,9 @@ class TeeWorldsShmClient:
         self.shm_mmap.seek(action_offset)
         self.shm_mmap.write(struct.pack('<bBBBhhB',
             direction, jump, hook, fire, aim_x, aim_y, weapon))
+        
+        # Set reset flag
+        self._write_header_field(26, reset, 'B')  # reset field is at offset 26
         
         # Signal action is ready and clear client_ready
         self._write_header_field(0, 0, 'B')  # client_ready = 0

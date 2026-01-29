@@ -30,7 +30,8 @@ struct SSharedMemoryHeader
 	float m_Reward;
 	uint8_t m_Done;
 	uint8_t m_Truncated;
-	uint8_t m_Padding2[2];
+	uint8_t m_Reset;         // Python signals episode reset
+	uint8_t m_Padding2[1];
 
 	// Action (12 bytes) - written by Python
 	int8_t m_ActionDirection;   // -1, 0, 1
