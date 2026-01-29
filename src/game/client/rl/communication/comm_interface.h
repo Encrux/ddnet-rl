@@ -10,7 +10,7 @@
 namespace rl {
 
 // Shared memory layout header
-// Total size: 64 bytes (aligned)
+// Total size: 65 bytes (aligned)
 #pragma pack(push, 1)
 struct SSharedMemoryHeader
 {
@@ -19,19 +19,19 @@ struct SSharedMemoryHeader
 	uint8_t m_PythonReady;      // Python signals action is ready
 	uint8_t m_Shutdown;         // Signal to shutdown
 	uint8_t m_ObservationMode;  // 0=rendered, 1=structured (EObservationMode)
-	
+
 	// Frame info (16 bytes)
 	uint32_t m_Tick;
 	uint32_t m_FrameWidth;      // For rendered mode
 	uint32_t m_FrameHeight;     // For rendered mode
 	uint32_t m_FrameChannels;   // 3 for RGB, 1 for grayscale
-	
+
 	// RL signals (8 bytes)
 	float m_Reward;
 	uint8_t m_Done;
 	uint8_t m_Truncated;
 	uint8_t m_Padding2[2];
-	
+
 	// Action (12 bytes) - written by Python
 	int8_t m_ActionDirection;   // -1, 0, 1
 	uint8_t m_ActionJump;       // 0, 1
@@ -40,10 +40,11 @@ struct SSharedMemoryHeader
 	int16_t m_ActionAimX;       // aim target X
 	int16_t m_ActionAimY;       // aim target Y
 	uint8_t m_ActionWeapon;     // 0-5
+	uint8_t m_Keypress;         // NEW: keypress field (0 = none, else ASCII code)
 	uint8_t m_Padding3[3];
-	
-	// Reserved for future use (24 bytes)
-	uint8_t m_Reserved[24];
+
+	// Reserved for future use (23 bytes)
+	uint8_t m_Reserved[23];
 };
 #pragma pack(pop)
 

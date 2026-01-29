@@ -79,8 +79,6 @@ class SharedMemoryHeader:
     done: int               # uint8
     truncated: int          # uint8
     _padding2: bytes        # uint8[2]
-    
-    # Action
     action_direction: int   # int8
     action_jump: int        # uint8
     action_hook: int        # uint8
@@ -88,28 +86,53 @@ class SharedMemoryHeader:
     action_aim_x: int       # int16
     action_aim_y: int       # int16
     action_weapon: int      # uint8
-    _padding3: bytes        # uint8[3]
-    
-    # Reserved
-    _reserved: bytes        # uint8[24]
-    
-    STRUCT_FORMAT = '<BBBBIIIIfBB2sbBBBhhB3s24s'
+    _padding3: tuple        # 3 uint8s
+    keypress: int           # uint8 (separate field)
+    _reserved: bytes        # uint8[23]
+
+    STRUCT_FORMAT = '<BBBBIIIIfBB2sbBBBhhBB3B23s'
     STRUCT_SIZE = 64
-    
+
     @classmethod
     def from_bytes(cls, data: bytes) -> 'SharedMemoryHeader':
+        if len(data) < cls.STRUCT_SIZE:
+            print(f"[DEBUG] SharedMemoryHeader.from_bytes: buffer size is {len(data)}, expected {cls.STRUCT_SIZE}")
+            raise ValueError(f"SharedMemoryHeader.from_bytes: buffer size is {len(data)}, expected {cls.STRUCT_SIZE}")
         unpacked = struct.unpack(cls.STRUCT_FORMAT, data[:cls.STRUCT_SIZE])
-        return cls(*unpacked)
-    
+        (
+            client_ready, python_ready, shutdown, observation_mode,
+            tick, frame_width, frame_height, frame_channels,
+            reward, done, truncated, _padding2,
+            action_direction, action_jump, action_hook, action_fire,
+            action_aim_x, action_aim_y, action_weapon,
+            keypress,
+            pad0, pad1, pad2,
+            *_reserved
+        ) = unpacked
+        _padding3 = (pad0, pad1, pad2)
+        _reserved_bytes = _reserved[0] if _reserved else b''
+        return cls(
+            client_ready, python_ready, shutdown, observation_mode,
+            tick, frame_width, frame_height, frame_channels,
+            reward, done, truncated, _padding2,
+            action_direction, action_jump, action_hook, action_fire,
+            action_aim_x, action_aim_y, action_weapon,
+            keypress, _padding3, _reserved_bytes
+        )
+
     def to_bytes(self) -> bytes:
+        reserved = self._reserved if self._reserved else b''
+        pad0, pad1, pad2 = self._padding3 if self._padding3 else (0, 0, 0)
         return struct.pack(
             self.STRUCT_FORMAT,
             self.client_ready, self.python_ready, self.shutdown, self.observation_mode,
             self.tick, self.frame_width, self.frame_height, self.frame_channels,
             self.reward, self.done, self.truncated, self._padding2,
             self.action_direction, self.action_jump, self.action_hook, self.action_fire,
-            self.action_aim_x, self.action_aim_y, self.action_weapon, self._padding3,
-            self._reserved
+            self.action_aim_x, self.action_aim_y, self.action_weapon,
+            self.keypress,
+            pad0, pad1, pad2,
+            *reserved
         )
 
 
@@ -320,6 +343,26 @@ class StructuredObservation:
 
 
 class TeeWorldsShmClient:
+    def send_keypress(self, keycode: int):
+        """
+        Send a keypress to DDNet via shared memory (requires DDNet client support).
+        Args:
+            keycode: Integer keycode to send (e.g., ord('k') for 'k')
+        """
+        if not self._connected:
+            return
+        # Write keypress field (offset after action_weapon)
+        keypress_offset = 37  # After action_weapon at 36
+        self.shm_mmap.seek(keypress_offset)
+        self.shm_mmap.write(struct.pack('B', keycode))
+        # Signal action is ready and clear client_ready
+        self._write_header_field(0, 0, 'B')  # client_ready = 0
+        self._write_header_field(1, 1, 'B')  # python_ready = 1
+
+    def reset(self):
+        self.send_keypress(keycode=ord('k'))
+
+
     """
     Shared memory client to receive game state/frames from DDNet.
     

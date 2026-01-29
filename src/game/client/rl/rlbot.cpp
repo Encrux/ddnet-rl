@@ -694,19 +694,36 @@ void CRLBot::ReceiveAction()
 	}
 	
 	// Read action from shared memory
-	rl::SSharedMemoryHeader *pHeader = m_pComm->GetHeader();
-	if(pHeader)
-	{
-		m_ActionDirection = pHeader->m_ActionDirection;
-		m_ActionJump = pHeader->m_ActionJump;
-		m_ActionHook = pHeader->m_ActionHook;
-		m_ActionFire = pHeader->m_ActionFire;
-		m_ActionAimX = pHeader->m_ActionAimX;
-		m_ActionAimY = pHeader->m_ActionAimY;
-	}
-	
-	// Clear ready flag
-	m_pComm->ClearActionReady();
+	       rl::SSharedMemoryHeader *pHeader = m_pComm->GetHeader();
+	       if(pHeader)
+	       {
+		       m_ActionDirection = pHeader->m_ActionDirection;
+		       m_ActionJump = pHeader->m_ActionJump;
+		       m_ActionHook = pHeader->m_ActionHook;
+		       m_ActionFire = pHeader->m_ActionFire;
+		       m_ActionAimX = pHeader->m_ActionAimX;
+		       m_ActionAimY = pHeader->m_ActionAimY;
+
+		       // Handle keypress (if set)
+		       if(pHeader->m_Keypress != 0)
+		       {
+			       // Example: handle 'k' for kill
+			       if(pHeader->m_Keypress == 'k')
+			       {
+				       // Simulate kill key (call your kill logic here)
+				       if(GameClient() && GameClient()->m_Snap.m_pLocalCharacter)
+				       {
+					       // This is a placeholder. Replace with your actual kill logic:
+					       GameClient()->SendKill();
+				       }
+			       }
+			       // Clear keypress after handling
+			       pHeader->m_Keypress = 0;
+		       }
+	       }
+       
+	       // Clear ready flag
+	       m_pComm->ClearActionReady();
 }
 
 int CRLBot::GetActionDirection() const { return m_ActionDirection; }
