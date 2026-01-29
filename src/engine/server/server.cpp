@@ -239,6 +239,7 @@ CServer::CServer()
 
 	m_CurrentGameTick = MIN_TICK;
 	m_RunServer = UNINITIALIZED;
+	m_TickSpeed = 50;
 
 	m_aShutdownReason[0] = 0;
 
@@ -3487,6 +3488,21 @@ void CServer::ConKick(IConsole::IResult *pResult, void *pUser)
 		((CServer *)pUser)->Kick(pResult->GetInteger(0), "Kicked by console");
 }
 
+void CServer::ConTickrate(IConsole::IResult *pResult, void *pUser)
+{
+	CServer *pThis = static_cast<CServer *>(pUser);
+	int NewTickrate = pResult->GetInteger(0);
+	if(NewTickrate < 1 || NewTickrate > 1000)
+	{
+		pThis->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "server", "Tickrate must be between 1 and 1000");
+		return;
+	}
+	pThis->m_TickSpeed = NewTickrate;
+	char aBuf[64];
+	str_format(aBuf, sizeof(aBuf), "Server tickrate set to %d", NewTickrate);
+	pThis->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "server", aBuf);
+}
+
 void CServer::ConStatus(IConsole::IResult *pResult, void *pUser)
 {
 	char aBuf[1024];
@@ -4379,6 +4395,8 @@ void CServer::RegisterCommands()
 	Console()->Register("stoprecord", "", CFGFLAG_SERVER, ConStopRecord, this, "Stop recording");
 
 	Console()->Register("reload", "", CFGFLAG_SERVER, ConMapReload, this, "Reload the map");
+
+	Console()->Register("sv_tickrate", "i[tickrate]", CFGFLAG_SERVER, ConTickrate, this, "Set server tickrate");
 
 	Console()->Register("add_sqlserver", "s['r'|'w'] s[Database] s[Prefix] s[User] s[Password] s[IP] i[Port] ?i[SetUpDatabase ?]", CFGFLAG_SERVER | CFGFLAG_NONTEEHISTORIC, ConAddSqlServer, this, "add a sqlserver");
 	Console()->Register("dump_sqlservers", "s['r'|'w']", CFGFLAG_SERVER, ConDumpSqlServers, this, "dumps all sqlservers readservers = r, writeservers = w");

@@ -23,8 +23,8 @@ import torch.optim as optim
 from collections import deque
 from teeworlds_env import TeeWorldsShmClient
 
-NUM_ENVS = 2
-NUM_STEPS = 1000  # Steps per episode
+NUM_ENVS = 16
+NUM_STEPS = 20000  # Steps per episode
 DDNET_PATH = os.environ.get('DDNET_PATH', '../../../../../build/DDNet')  # Adjust as needed
 SERVER_PORT = 8303
 
@@ -37,6 +37,9 @@ BATCH_SIZE = 64
 MEMORY_SIZE = 10000
 MIN_REPLAY_SIZE = 1000
 TARGET_UPDATE = 1000
+
+#default 50
+SV_TICKRATE = 50
 
 class QNet(nn.Module):
     def __init__(self, obs_size, n_actions):
@@ -116,28 +119,11 @@ def env_worker(env_id, conn):
 # Main process: manages policy and aggregates experience
 def main():
 
+    # Start DDNet server
+    server_proc = start_ddnet_server()
 
     # Start DDNet clients as subprocesses
-    ddnet_procs = []
-    for i in range(NUM_ENVS):
-        cmd = [DDNET_PATH, f"connect localhost:{SERVER_PORT}; rl_enable state {i}; snd_volume 0; bind k kill"]
-        proc = subprocess.Popen(
-            cmd,
-            preexec_fn=os.setsid,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        ddnet_procs.append(proc)
-        # Wait for shared memory file to exist before starting worker
-        shm_path = f"/dev/shm/teeworlds_rl_{i}"
-        for _ in range(60):
-            if os.path.exists(shm_path):
-                print(f"Shared memory for environment {i} started successfully")
-                break
-            time.sleep(0.5)
-        else:
-            print(f"Timeout waiting for {shm_path}")
-            return
+    ddnet_procs = start_ddnet_clients()
     
     time.sleep(5)
     print("DDNet clients startup complete")
@@ -220,7 +206,8 @@ def main():
                 episode_steps[i] += 1
                 # End episode if done or max steps reached
                 if done or episode_steps[i] >= NUM_STEPS:
-                    print(f"[Env {i}] Episode {episode_count} finished with reward {episode_rewards[i]} after {episode_steps[i]} steps")
+                    if episode_steps[i] > 1:
+                        print(f"[Env {i}] Episode {episode_count} finished with reward {episode_rewards[i]} after {episode_steps[i]} steps")
                     dones[i] = True
                 steps_done += 1
             # Learn
@@ -262,12 +249,58 @@ def main():
         p.terminate()
         p.join()
 
+    # Terminate DDNet server
+    try:
+        os.killpg(os.getpgid(server_proc.pid), signal.SIGTERM)
+    except Exception:
+        pass
+
     # Terminate DDNet clients
     for proc in ddnet_procs:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except Exception:
             pass
+
+    
+def start_ddnet_server():
+
+    server_cmd = [DDNET_PATH.replace('DDNet', 'DDNet-Server'), f"sv_tickrate {SV_TICKRATE}; sv_max_clients_per_ip 64; sv_max_clients 64"]
+    server_proc = subprocess.Popen(
+        server_cmd,
+        preexec_fn=os.setsid,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    print(f"DDNet server started with tickrate {SV_TICKRATE}")
+    time.sleep(2)  # Wait for server to start
+
+    return server_proc
+
+
+def start_ddnet_clients():
+    ddnet_procs = []
+    for i in range(NUM_ENVS):
+        cmd = [DDNET_PATH, f"connect localhost:{SERVER_PORT}; rl_enable state {i}; snd_volume 0; bind k kill"]
+        proc = subprocess.Popen(
+            cmd,
+            preexec_fn=os.setsid,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        ddnet_procs.append(proc)
+        # Wait for shared memory file to exist before starting worker
+        shm_path = f"/dev/shm/teeworlds_rl_{i}"
+        for _ in range(60):
+            if os.path.exists(shm_path):
+                print(f"Shared memory for environment {i} started successfully")
+                break
+            time.sleep(0.5)
+        else:
+            print(f"Timeout waiting for {shm_path}")
+            return
+    
+    return ddnet_procs
 
 if __name__ == "__main__":
     main()

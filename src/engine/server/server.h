@@ -273,6 +273,8 @@ public:
 	int64_t m_ServerInfoFirstRequest;
 	int m_ServerInfoNumRequests;
 
+	int m_TickSpeed;
+
 	char m_aErrorShutdownReason[128];
 
 	CNameBans m_NameBans;
@@ -306,6 +308,7 @@ public:
 	void DemoRecorder_HandleAutoStart() override;
 
 	int64_t TickStartTime(int Tick);
+	int TickSpeed() const override { return m_TickSpeed; }
 
 	int Init();
 
@@ -432,6 +435,7 @@ public:
 	int Run();
 
 	static void ConKick(IConsole::IResult *pResult, void *pUser);
+	static void ConTickrate(IConsole::IResult *pResult, void *pUser);
 	static void ConStatus(IConsole::IResult *pResult, void *pUser);
 	static void ConShutdown(IConsole::IResult *pResult, void *pUser);
 	static void ConRecord(IConsole::IResult *pResult, void *pUser);

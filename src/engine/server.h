@@ -50,7 +50,7 @@ public:
 	};
 
 	int Tick() const { return m_CurrentGameTick; }
-	int TickSpeed() const { return SERVER_TICK_SPEED; }
+	virtual int TickSpeed() const = 0;
 
 	virtual int Port() const = 0;
 	virtual int MaxClients() const = 0;

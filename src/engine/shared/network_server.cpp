@@ -210,13 +210,6 @@ int CNetServer::TryAcceptClient(NETADDR &Addr, SECURITY_TOKEN SecurityToken, boo
 		return -1; // failed to add client?
 	}
 
-	if(Connlimit(Addr))
-	{
-		const char aMsg[] = "Too many connections in a short time";
-		CNetBase::SendControlMsg(m_Socket, &Addr, 0, NET_CTRLMSG_CLOSE, aMsg, sizeof(aMsg), SecurityToken, Sixup);
-		return -1; // failed to add client
-	}
-
 	// check for sv_max_clients_per_ip
 	if(NumClientsWithAddr(Addr) + 1 > m_MaxClientsPerIp)
 	{
