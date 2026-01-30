@@ -1,0 +1,16 @@
+# TensorBoard logs
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+
+# Checkpoints
+*.pt
+*.pth
+
+# Jupyter
+.ipynb_checkpoints/
