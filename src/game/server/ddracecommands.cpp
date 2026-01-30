@@ -7,6 +7,7 @@
 #include <game/server/entities/character.h>
 #include <game/server/gamemodes/ddnet.h>
 #include <game/server/player.h>
+#include <game/server/rl/botmanager.h>
 #include <game/server/save.h>
 #include <game/server/teams.h>
 
@@ -598,6 +599,81 @@ void CGameContext::ConAntibot(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
 	pSelf->Antibot()->ConsoleCommand(pResult->GetString(0));
+}
+
+void CGameContext::ConRLBots(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+	int NumBots = pResult->GetInteger(0);
+
+	if(NumBots <= 0)
+	{
+		// Disable RL bots
+		if(pSelf->m_pBotManager && pSelf->m_pBotManager->IsEnabled())
+		{
+			pSelf->m_pBotManager->Shutdown();
+			pSelf->m_pBotManager.reset();
+			pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", "RL bots disabled");
+		}
+		else
+		{
+			pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", "RL bots not active");
+		}
+		return;
+	}
+
+	if(NumBots > rl::MAX_RL_BOTS)
+	{
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "Maximum bots: %d", rl::MAX_RL_BOTS);
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+		return;
+	}
+
+	// Create or recreate bot manager
+	if(pSelf->m_pBotManager)
+	{
+		pSelf->m_pBotManager->Shutdown();
+		pSelf->m_pBotManager.reset();
+	}
+
+	pSelf->m_pBotManager = std::make_unique<rl::CBotManager>(pSelf);
+	if(pSelf->m_pBotManager->Init(NumBots))
+	{
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "RL bots enabled: %d bots", NumBots);
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+	}
+	else
+	{
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", "Failed to initialize RL bots");
+		pSelf->m_pBotManager.reset();
+	}
+}
+
+void CGameContext::ConRLStatus(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+
+	if(!pSelf->m_pBotManager || !pSelf->m_pBotManager->IsEnabled())
+	{
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", "RL bots: DISABLED");
+		return;
+	}
+
+	char aBuf[256];
+	str_format(aBuf, sizeof(aBuf), "RL bots: ENABLED (%d bots)", pSelf->m_pBotManager->NumBots());
+	pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+
+	// List bot client IDs
+	for(int i = 0; i < pSelf->m_pBotManager->NumBots(); i++)
+	{
+		int ClientId = pSelf->m_pBotManager->GetBotClientId(i);
+		CPlayer *pPlayer = pSelf->m_apPlayers[ClientId];
+		const char *pStatus = pPlayer && pPlayer->GetCharacter() ? "alive" : "dead";
+		str_format(aBuf, sizeof(aBuf), "  Bot %d: ClientId=%d (%s)", i, ClientId, pStatus);
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+	}
 }
 
 void CGameContext::ConDumpLog(IConsole::IResult *pResult, void *pUserData)

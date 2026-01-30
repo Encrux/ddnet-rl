@@ -656,7 +656,9 @@ int CServer::GetAuthedState(int ClientId) const
 	if(ClientId == IConsole::CLIENT_ID_NO_GAME)
 		return AUTHED_ADMIN;
 	dbg_assert(ClientId >= 0 && ClientId < MAX_CLIENTS, "Invalid ClientId: %d", ClientId);
-	dbg_assert(m_aClients[ClientId].m_State != CServer::CClient::STATE_EMPTY, "Client slot %d is empty", ClientId);
+	// Bot players have game state but no network client state - they're not authed
+	if(m_aClients[ClientId].m_State == CServer::CClient::STATE_EMPTY)
+		return AUTHED_NO;
 	return m_AuthManager.KeyLevel(m_aClients[ClientId].m_AuthKey);
 }
 
@@ -682,6 +684,9 @@ const char *CServer::GetAuthName(int ClientId) const
 bool CServer::HasAuthHidden(int ClientId) const
 {
 	dbg_assert(ClientId >= 0 && ClientId < MAX_CLIENTS, "Invalid ClientId: %d", ClientId);
+	// Bot players have no network client state - treat as not hidden
+	if(m_aClients[ClientId].m_State == CServer::CClient::STATE_EMPTY)
+		return false;
 	return m_aClients[ClientId].m_AuthHidden;
 }
 
@@ -786,6 +791,25 @@ bool CServer::ClientSlotEmpty(int ClientId) const
 bool CServer::ClientIngame(int ClientId) const
 {
 	return ClientId >= 0 && ClientId < MAX_CLIENTS && m_aClients[ClientId].m_State == CServer::CClient::STATE_INGAME;
+}
+
+void CServer::InitBotClient(int ClientId, const char *pName)
+{
+	if(ClientId < 0 || ClientId >= MAX_CLIENTS)
+		return;
+
+	// Initialize minimal client state for server-side bots
+	CClient *pClient = &m_aClients[ClientId];
+	pClient->m_State = CClient::STATE_INGAME;
+	str_copy(pClient->m_aName, pName, sizeof(pClient->m_aName));
+	str_copy(pClient->m_aClan, "RL", sizeof(pClient->m_aClan));
+	pClient->m_Country = -1;
+	pClient->m_Score = std::nullopt;
+	pClient->m_AuthKey = -1;
+	pClient->m_AuthTries = 0;
+	pClient->m_AuthHidden = false;
+	pClient->m_Flags = 0;
+	pClient->m_Latency = 0;
 }
 
 int CServer::Port() const

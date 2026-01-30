@@ -1,0 +1,105 @@
+/* DDNet Server RL - Bot Manager
+ *
+ * Manages server-side bot players for RL training.
+ * Creates bot players, injects inputs from Python, extracts observations.
+ *
+ * Portable: Can be adapted to other Teeworlds-based servers.
+ */
+#ifndef GAME_SERVER_RL_BOTMANAGER_H
+#define GAME_SERVER_RL_BOTMANAGER_H
+
+#include <game/rl/rl_protocol.h>
+#include <base/vmath.h>
+#include <generated/protocol.h>
+#include <memory>
+
+class CGameContext;
+class CPlayer;
+class CCharacter;
+class CCollision;
+
+namespace rl {
+
+class CServerShm;
+
+class CBotManager
+{
+public:
+	CBotManager(CGameContext *pGameContext);
+	~CBotManager();
+
+	// Initialize with N bots
+	bool Init(int NumBots);
+	void Shutdown();
+
+	// Called each server tick
+	void Tick();
+
+	// Check if enabled
+	bool IsEnabled() const { return m_Enabled; }
+	int NumBots() const { return m_NumBots; }
+
+	// Get bot client ID
+	int GetBotClientId(int BotIndex) const;
+
+	// Force respawn all bots (e.g., on map change)
+	void RespawnAllBots();
+
+	// Extract observations from all bots (call after world tick)
+	void ExtractObservations();
+
+private:
+	// Create bot players
+	bool CreateBotPlayers();
+
+	// Input injection
+	void InjectBotInputs();
+	void ConvertActionToInput(const SAction *pAction, CNetObj_PlayerInput *pInput);
+
+	// Observation extraction helpers
+	void ExtractPlayerObs(CCharacter *pChar, SPlayerObs *pObs, bool IsLocal);
+	void ExtractTileGrid(CCharacter *pChar, uint8_t *pGrid);
+	void ExtractRaycasts(CCharacter *pChar, SStructuredObservation *pObs);
+	float CastRay(vec2 Start, vec2 Dir, float MaxDist, int TileMask);
+
+	// Reward calculation
+	float CalculateReward(int BotIndex, const SStructuredObservation *pObs);
+	void ResetRewardState(int BotIndex);
+
+	// Spawn position for respawn
+	vec2 GetSpawnPos();
+
+	CGameContext *m_pGameContext;
+	CCollision *m_pCollision;
+	std::unique_ptr<CServerShm> m_pShm;
+
+	bool m_Enabled;
+	bool m_PlayersCreated;  // True once actual players have been created
+	int m_NumBots;
+	int m_aClientIds[MAX_RL_BOTS];  // Client IDs assigned to bots
+
+	// Per-bot reward tracking state
+	struct SBotRewardState
+	{
+		float m_LastPosX;
+		float m_LastPosY;
+		float m_MaxPosX;
+		float m_SpawnPosX;
+		float m_SpawnPosY;
+		int m_LastHookState;
+		int m_StuckCounter;
+		bool m_WasFrozen;
+		bool m_WasDead;
+	};
+	SBotRewardState m_aBotState[MAX_RL_BOTS];
+
+	// Input storage
+	CNetObj_PlayerInput m_aBotInputs[MAX_RL_BOTS];
+
+	// Tick tracking
+	int m_LastTick;
+};
+
+} // namespace rl
+
+#endif // GAME_SERVER_RL_BOTMANAGER_H

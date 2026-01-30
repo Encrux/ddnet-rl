@@ -2198,6 +2198,7 @@ set_src(GAME_SHARED GLOB src/game
   tuning.h
   version.h
   voting.h
+  rl/rl_protocol.h
 )
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "src/game/version.h")
 
@@ -2847,6 +2848,10 @@ if(SERVER)
     teehistorian.h
     teeinfo.cpp
     teeinfo.h
+    rl/botmanager.cpp
+    rl/botmanager.h
+    rl/server_shm.cpp
+    rl/server_shm.h
   )
   set(GAME_GENERATED_SERVER
     "src/generated/server_data.cpp"

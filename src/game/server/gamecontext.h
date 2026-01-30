@@ -21,6 +21,10 @@
 #include <memory>
 #include <string>
 
+namespace rl {
+class CBotManager;
+}
+
 /*
 	Tick
 		Game Context (CGameContext::tick)
@@ -167,6 +171,8 @@ class CGameContext : public IGameServer
 	static void ConDrySave(IConsole::IResult *pResult, void *pUserData);
 	static void ConDumpAntibot(IConsole::IResult *pResult, void *pUserData);
 	static void ConAntibot(IConsole::IResult *pResult, void *pUserData);
+	static void ConRLBots(IConsole::IResult *pResult, void *pUserData);
+	static void ConRLStatus(IConsole::IResult *pResult, void *pUserData);
 	static void ConchainSpecialMotdupdate(IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData);
 	static void ConchainSettingUpdate(IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData);
 	static void ConchainPracticeByDefaultUpdate(IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData);
@@ -223,6 +229,10 @@ public:
 
 	IGameController *m_pController;
 	CGameWorld m_World;
+
+	// RL Bot Manager (server-side bots)
+	std::unique_ptr<rl::CBotManager> m_pBotManager;
+	rl::CBotManager *BotManager() { return m_pBotManager.get(); }
 
 	// helper functions
 	CCharacter *GetPlayerChar(int ClientId);

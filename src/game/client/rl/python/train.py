@@ -27,6 +27,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from teeworlds_vec_env import TeeWorldsVecEnv, EnvConfig
+from teeworlds_server_env import TeeWorldsServerEnv, ServerEnvConfig
 from ppo_hybrid import PPOAgent, PPOConfig
 
 
@@ -42,6 +43,8 @@ def parse_args():
                         help="Server tickrate")
     parser.add_argument("--frame-skip", type=int, default=1,
                         help="Frame skip (1=no skip, 4=act every 4th tick)")
+    parser.add_argument("--server-side", action="store_true",
+                        help="Use server-side bots (much more efficient)")
 
     # Training
     parser.add_argument("--total-timesteps", type=int, default=10_000_000,
@@ -135,18 +138,27 @@ def main():
     # Log hyperparameters
     writer.add_text("hyperparameters", str(vars(args)))
 
-    # Create environment config
-    env_config = EnvConfig(
-        ddnet_path=args.ddnet_path,
-        server_path=args.server_path,
-        sv_tickrate=args.sv_tickrate,
-        frame_skip=args.frame_skip,
-        max_episode_steps=args.max_episode_steps,
-    )
-
     # Create environment
-    print(f"\nCreating environment with {args.num_envs} parallel instances...")
-    env = TeeWorldsVecEnv(num_envs=args.num_envs, config=env_config)
+    if args.server_side:
+        # Server-side bots (more efficient, single process)
+        print(f"\nCreating SERVER-SIDE environment with {args.num_envs} bots...")
+        server_config = ServerEnvConfig(
+            sv_tickrate=args.sv_tickrate,
+            max_episode_steps=args.max_episode_steps,
+        )
+        # Use default server_path (resolved relative to teeworlds_server_env.py)
+        env = TeeWorldsServerEnv(num_bots=args.num_envs, config=server_config)
+    else:
+        # Client-side environments (original approach)
+        print(f"\nCreating CLIENT-SIDE environment with {args.num_envs} parallel instances...")
+        env_config = EnvConfig(
+            ddnet_path=args.ddnet_path,
+            server_path=args.server_path,
+            sv_tickrate=args.sv_tickrate,
+            frame_skip=args.frame_skip,
+            max_episode_steps=args.max_episode_steps,
+        )
+        env = TeeWorldsVecEnv(num_envs=args.num_envs, config=env_config)
 
     try:
         # Get observation dimension

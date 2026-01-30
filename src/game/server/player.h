@@ -79,6 +79,7 @@ public:
 	void SetSpectatorId(int Id);
 
 	bool m_IsReady;
+	bool m_IsBot; // True if this is a server-side RL bot
 
 	//
 	int m_Vote;

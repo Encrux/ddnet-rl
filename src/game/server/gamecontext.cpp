@@ -6,6 +6,7 @@
 #include "gamemodes/ddnet.h"
 #include "gamemodes/mod.h"
 #include "player.h"
+#include "rl/botmanager.h"
 #include "score.h"
 #include "teeinfo.h"
 
@@ -1090,6 +1091,12 @@ void CGameContext::OnPreTickTeehistorian()
 
 void CGameContext::OnTick()
 {
+	// RL Bot Manager: inject inputs before physics
+	if(m_pBotManager && m_pBotManager->IsEnabled())
+	{
+		m_pBotManager->Tick();
+	}
+
 	// check tuning
 	CheckPureTuning();
 
@@ -1135,6 +1142,12 @@ void CGameContext::OnTick()
 	{
 		if(pPlayer)
 			pPlayer->PostPostTick();
+	}
+
+	// RL Bot Manager: extract observations after physics
+	if(m_pBotManager && m_pBotManager->IsEnabled())
+	{
+		m_pBotManager->ExtractObservations();
 	}
 
 	// update voting
@@ -3912,6 +3925,10 @@ void CGameContext::OnConsoleInit()
 	Console()->Register("votes", "?i[page]", CFGFLAG_SERVER, ConVotes, this, "Show all votes (page 0 by default, 20 entries per page)");
 	Console()->Register("dump_antibot", "", CFGFLAG_SERVER | CFGFLAG_STORE, ConDumpAntibot, this, "Dumps the antibot status");
 	Console()->Register("antibot", "r[command]", CFGFLAG_SERVER | CFGFLAG_STORE, ConAntibot, this, "Sends a command to the antibot");
+
+	// RL Bot commands
+	Console()->Register("sv_rl_bots", "i[num_bots]", CFGFLAG_SERVER, ConRLBots, this, "Enable RL mode with specified number of bots (0 to disable)");
+	Console()->Register("sv_rl_status", "", CFGFLAG_SERVER, ConRLStatus, this, "Show RL bot status");
 
 	Console()->Chain("sv_motd", ConchainSpecialMotdupdate, this);
 

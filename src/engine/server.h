@@ -232,6 +232,7 @@ public:
 	virtual void SetClientCountry(int ClientId, int Country) = 0;
 	virtual void SetClientScore(int ClientId, std::optional<int> Score) = 0;
 	virtual void SetClientFlags(int ClientId, int Flags) = 0;
+	virtual void InitBotClient(int ClientId, const char *pName) = 0;
 
 	virtual int SnapNewId() = 0;
 	virtual void SnapFreeId(int Id) = 0;
