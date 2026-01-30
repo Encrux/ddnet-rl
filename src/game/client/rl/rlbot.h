@@ -44,13 +44,19 @@ public:
 
 private:
 	// RL reward state tracking
-	int m_LastCheckpoint;
-	bool m_LastFinished;
 	float m_LastPosX;
 	float m_LastPosY;
+	float m_LastVelX;
+	float m_LastVelY;
 	float m_SpawnPosX;
 	float m_SpawnPosY;
-	float m_MaxDistanceFromSpawn;
+	int m_LastHookState;
+	bool m_WasFrozen;
+	bool m_WasDead;
+	int m_StuckCounter;
+	int m_LastCheckpointIndex;
+	int m_CurrentCheckpointIndex;
+	bool m_Done;
 	int m_LastTick;
 	float m_AccumulatedReward;
 	// Console commands
@@ -71,6 +77,16 @@ private:
 	void ExtractGameState(rl::SStructuredObservation *pObs);
 	void ExtractPlayerState(rl::SPlayerObs *pPlayerObs, int ClientId, bool IsLocal);
 	void ExtractLocalTiles(rl::SStructuredObservation *pObs);
+	void ExtractRaycasts(rl::SStructuredObservation *pObs);
+	void ExtractPlayerExtras(rl::SStructuredObservation *pObs);
+
+	// Reward calculation
+	float CalculateReward(const rl::SStructuredObservation *pObs);
+	void ResetRewardState();
+
+	// Raycast helper
+	float CastRay(float startX, float startY, float dirX, float dirY, float maxDist, int tileTypeMask);
+	bool IsTileHookable(int tileIndex);
 	
 	// Downscale frame to target resolution
 	void DownscaleFrame(const uint8_t *pSrc, uint32_t SrcWidth, uint32_t SrcHeight,

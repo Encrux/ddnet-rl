@@ -18,6 +18,10 @@ constexpr int TILE_GRID_WIDTH = 29;   // 14 left + 1 center + 14 right
 constexpr int TILE_GRID_HEIGHT = 21;  // 10 up + 1 center + 10 down
 constexpr int TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT; // 609
 
+// Raycast configuration
+constexpr int NUM_RAYCASTS = 16;      // Rays cast in 16 directions (every 22.5 degrees)
+constexpr float RAYCAST_MAX_DIST = 640.0f;  // 20 tiles * 32 pixels
+
 // Tile types for the local grid
 enum class ETileType : uint8_t
 {
@@ -146,14 +150,29 @@ struct SStructuredObservation
 	// Row-major order, centered on player
 	// Index = (y + 10) * 29 + (x + 14) where x,y are relative to player
 	uint8_t m_aTileGrid[TILE_GRID_SIZE];
-	
+
+	// Raycast observations - distances normalized to [0,1]
+	// 16 directions, starting at 0 degrees (right), going counter-clockwise
+	float m_aRaycastSolid[NUM_RAYCASTS];    // Distance to nearest solid (wall/ground)
+	float m_aRaycastDeath[NUM_RAYCASTS];    // Distance to nearest death tile
+	float m_aRaycastHookable[NUM_RAYCASTS]; // Distance to nearest hookable surface
+
+	// Extra player state
+	uint8_t m_IsGrounded;      // 1 if standing on solid ground
+	uint8_t m_JumpsRemaining;  // 0, 1, or 2 (based on m_Jumped state)
+	uint8_t m_CanHook;         // 1 if hook is available (not on cooldown)
+	uint8_t m_Reserved2;       // Alignment padding
+
 	// Padding to align to nice size
-	uint8_t m_Reserved[31];
+	uint8_t m_Reserved[27];
 };
 #pragma pack(pop)
 
-// Total: 8+36+540+640+192+(16+4+12)+609+31 = 2088 bytes
-static_assert(sizeof(SStructuredObservation) == 2088, "SStructuredObservation must be 2088 bytes");
+// Total: 8+36+540+640+192+(16+4+12)+609 + (16*4*3) + 4 + 27 = 2284 bytes
+// Raycast addition: 16 floats * 3 types * 4 bytes = 192 bytes
+// Extra state: 4 bytes
+// New total: 2088 - 31 (old reserved) + 192 + 4 + 27 = 2280 bytes
+static_assert(sizeof(SStructuredObservation) == 2280, "SStructuredObservation must be 2280 bytes");
 
 } // namespace rl
 

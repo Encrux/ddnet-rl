@@ -36,7 +36,8 @@ MAX_PICKUPS = 16
 TILE_GRID_WIDTH = 29
 TILE_GRID_HEIGHT = 21
 TILE_GRID_SIZE = 609  # 29 * 21
-STRUCTURED_OBS_SIZE = 2088
+NUM_RAYCASTS = 16
+STRUCTURED_OBS_SIZE = 2280  # Updated to include raycasts and extras
 
 
 class TileType(IntEnum):
@@ -194,9 +195,9 @@ class ProjectileObs:
         )
 
 
-@dataclass 
+@dataclass
 class StructuredObservation:
-    """Full structured observation (2088 bytes)"""
+    """Full structured observation (2280 bytes)"""
     tick: int
     game_flags: int
     game_state: int
@@ -209,42 +210,115 @@ class StructuredObservation:
     flag_carrier: Tuple[int, int]
     flag_at_stand: Tuple[bool, bool]
     tile_grid: np.ndarray  # [21, 29] - local tile grid centered on player
+    # New raycast observations
+    raycast_solid: np.ndarray    # [16] - distance to solid in 16 directions
+    raycast_death: np.ndarray    # [16] - distance to death tiles
+    raycast_hookable: np.ndarray # [16] - distance to hookable surfaces
+    # Extra player state
+    is_grounded: bool
+    jumps_remaining: int
+    can_hook: bool
     
     def to_flat_array(self) -> np.ndarray:
-        """Convert to a flat numpy array for RL training."""
+        """Convert to a flat numpy array for RL training.
+
+        New layout (~150 features instead of ~700):
+        - Player state: 15 features
+        - Raycasts: 48 features (16 dirs x 3 types)
+        - Local tiles (7x7): 49 features
+        - Other players: 25 features (5 players x 5 features)
+        Total: ~137 features
+        """
         features = []
-        
-        # Game state
-        features.extend([self.tick / 1000.0, self.game_flags, self.game_state])
-        
-        # Local player (normalized)
+
+        # Local player (normalized) - 15 features
         p = self.local_player
         features.extend([
-            p.pos_x / 10000.0, p.pos_y / 10000.0,  # Normalize position
-            p.vel_x / 100.0, p.vel_y / 100.0,      # Normalize velocity
-            p.direction, p.jumped, p.hook_state, p.weapon,
-            p.hook_pos_x / 10000.0, p.hook_pos_y / 10000.0,
-            p.hooked_player, int(p.is_frozen),
-            p.health / 10.0, p.armor / 10.0
+            p.vel_x / 50.0,                    # Normalized velocity
+            p.vel_y / 50.0,
+            float(self.is_grounded),          # Binary
+            float(self.jumps_remaining) / 2.0, # 0, 0.5, or 1
+            float(self.can_hook),             # Binary
+            p.direction,                      # -1, 0, 1
+            float(p.is_frozen),               # Binary
+            # Hook state one-hot (idle, flying, attached)
+            float(p.hook_state == 0),
+            float(p.hook_state == 1),
+            float(p.hook_state == 2),
+            # Aim direction (sin/cos for continuity) - computed from hook pos if hooked
+            0.0, 0.0,  # Placeholder - will be set by Python training code
+            p.health / 10.0,
+            p.armor / 10.0,
+            float(p.jumped) / 3.0,            # Jump state normalized
         ])
-        
-        # Other players (top 5 closest)
+
+        # Raycast observations - 48 features (already normalized 0-1)
+        features.extend(self.raycast_solid.tolist())
+        features.extend(self.raycast_death.tolist())
+        features.extend(self.raycast_hookable.tolist())
+
+        # Local tiles (7x7 around player) - 49 features
+        # One-hot encode into 4 key types: empty, solid, death, other
+        # For now, just use normalized tile values for the small grid
+        center_x = TILE_GRID_WIDTH // 2
+        center_y = TILE_GRID_HEIGHT // 2
+        small_grid = self.tile_grid[center_y-3:center_y+4, center_x-3:center_x+4]
+        tile_flat = small_grid.flatten().astype(np.float32) / 15.0
+        features.extend(tile_flat.tolist())
+
+        # Other players (top 5 closest) - 25 features
         for i in range(min(5, len(self.other_players))):
             op = self.other_players[i]
             if op.active:
                 features.extend([
                     (op.pos_x - p.pos_x) / 1000.0,  # Relative position
                     (op.pos_y - p.pos_y) / 1000.0,
+                    op.vel_x / 50.0, op.vel_y / 50.0,
+                    op.hook_state / 2.0
+                ])
+            else:
+                features.extend([0, 0, 0, 0, 0])
+
+        # Pad to 5 players if fewer
+        for _ in range(5 - min(5, len(self.other_players))):
+            features.extend([0, 0, 0, 0, 0])
+
+        return np.array(features, dtype=np.float32)
+
+    def to_flat_array_legacy(self) -> np.ndarray:
+        """Legacy flat array for backwards compatibility (~700 features)."""
+        features = []
+
+        # Game state
+        features.extend([self.tick / 1000.0, self.game_flags, self.game_state])
+
+        # Local player (normalized)
+        p = self.local_player
+        features.extend([
+            p.pos_x / 10000.0, p.pos_y / 10000.0,
+            p.vel_x / 100.0, p.vel_y / 100.0,
+            p.direction, p.jumped, p.hook_state, p.weapon,
+            p.hook_pos_x / 10000.0, p.hook_pos_y / 10000.0,
+            p.hooked_player, int(p.is_frozen),
+            p.health / 10.0, p.armor / 10.0
+        ])
+
+        # Other players (top 5 closest)
+        for i in range(min(5, len(self.other_players))):
+            op = self.other_players[i]
+            if op.active:
+                features.extend([
+                    (op.pos_x - p.pos_x) / 1000.0,
+                    (op.pos_y - p.pos_y) / 1000.0,
                     op.vel_x / 100.0, op.vel_y / 100.0,
                     op.hook_state
                 ])
             else:
                 features.extend([0, 0, 0, 0, 0])
-        
-        # Tile grid - flatten and normalize to [0, 1] range
-        # Tile types are 0-15, so divide by 15
+
+        # Full tile grid
         tile_flat = self.tile_grid.flatten().astype(np.float32) / 15.0
-        
+
         return np.concatenate([np.array(features, dtype=np.float32), tile_flat])
     
     def get_tile_at_relative(self, dx: int, dy: int) -> int:
@@ -286,30 +360,30 @@ class StructuredObservation:
     def from_bytes(cls, data: bytes) -> 'StructuredObservation':
         """Parse structured observation from raw bytes."""
         offset = 0
-        
+
         # Game state header (8 bytes)
         tick, game_flags, game_state, num_active, num_proj = struct.unpack_from('<IBBBB', data, offset)
         offset += 8
-        
+
         # Local player (36 bytes)
         local_player = PlayerObs.from_bytes(data[offset:offset + PlayerObs.STRUCT_SIZE])
         offset += PlayerObs.STRUCT_SIZE
-        
+
         # Other players (36 * 15 = 540 bytes)
         other_players = []
         for _ in range(MAX_OTHER_PLAYERS):
             other_players.append(PlayerObs.from_bytes(data[offset:offset + PlayerObs.STRUCT_SIZE]))
             offset += PlayerObs.STRUCT_SIZE
-        
+
         # Projectiles (20 * 32 = 640 bytes)
         projectiles = []
         for _ in range(MAX_PROJECTILES):
             projectiles.append(ProjectileObs.from_bytes(data[offset:offset + ProjectileObs.STRUCT_SIZE]))
             offset += ProjectileObs.STRUCT_SIZE
-        
+
         # Pickups (12 * 16 = 192 bytes) - skip for now
         offset += 12 * MAX_PICKUPS
-        
+
         # Flags (24 bytes)
         flag_pos = np.zeros((2, 2), dtype=np.float32)
         flag_pos[0, 0], flag_pos[0, 1] = struct.unpack_from('<ff', data, offset)
@@ -322,11 +396,27 @@ class StructuredObservation:
         flag_at_stand = (bool(flag_at_stand_raw[0]), bool(flag_at_stand_raw[1]))
         offset += 2
         offset += 12  # Padding
-        
+
         # Tile grid (609 bytes) - 29x21 grid centered on player, row-major
         tile_grid_flat = np.frombuffer(data[offset:offset + TILE_GRID_SIZE], dtype=np.uint8)
         tile_grid = tile_grid_flat.reshape((TILE_GRID_HEIGHT, TILE_GRID_WIDTH))
-        
+        offset += TILE_GRID_SIZE
+
+        # Raycast observations (16 * 4 * 3 = 192 bytes)
+        raycast_solid = np.frombuffer(data[offset:offset + NUM_RAYCASTS * 4], dtype=np.float32).copy()
+        offset += NUM_RAYCASTS * 4
+        raycast_death = np.frombuffer(data[offset:offset + NUM_RAYCASTS * 4], dtype=np.float32).copy()
+        offset += NUM_RAYCASTS * 4
+        raycast_hookable = np.frombuffer(data[offset:offset + NUM_RAYCASTS * 4], dtype=np.float32).copy()
+        offset += NUM_RAYCASTS * 4
+
+        # Extra player state (4 bytes)
+        is_grounded, jumps_remaining, can_hook, _ = struct.unpack_from('<BBBB', data, offset)
+        offset += 4
+
+        # Reserved (27 bytes) - skip
+        # offset += 27
+
         return cls(
             tick=tick,
             game_flags=game_flags,
@@ -339,7 +429,13 @@ class StructuredObservation:
             flag_pos=flag_pos,
             flag_carrier=flag_carrier,
             flag_at_stand=flag_at_stand,
-            tile_grid=tile_grid.copy()  # Copy to avoid reference to mmap buffer
+            tile_grid=tile_grid.copy(),
+            raycast_solid=raycast_solid,
+            raycast_death=raycast_death,
+            raycast_hookable=raycast_hookable,
+            is_grounded=bool(is_grounded),
+            jumps_remaining=jumps_remaining,
+            can_hook=bool(can_hook),
         )
 
 

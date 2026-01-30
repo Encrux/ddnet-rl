@@ -15,13 +15,19 @@
 #include <cmath>
 
 CRLBot::CRLBot() :
-	m_LastCheckpoint(-1),
-	m_LastFinished(false),
 	m_LastPosX(0.0f),
 	m_LastPosY(0.0f),
+	m_LastVelX(0.0f),
+	m_LastVelY(0.0f),
 	m_SpawnPosX(0.0f),
 	m_SpawnPosY(0.0f),
-	m_MaxDistanceFromSpawn(0.0f),
+	m_LastHookState(0),
+	m_WasFrozen(false),
+	m_WasDead(false),
+	m_StuckCounter(0),
+	m_LastCheckpointIndex(-1),
+	m_CurrentCheckpointIndex(-1),
+	m_Done(false),
 	m_LastTick(0),
 	m_AccumulatedReward(0.0f),
 	m_Enabled(false),
@@ -345,91 +351,20 @@ void CRLBot::SendStructuredObservation()
 	
 	// Extract game state
 	ExtractGameState(pObs);
-	
-		// --- Reward calculation ---
-		float reward = 0.0f;
-		float reward_speed = 0.0f;
-		float reward_distance = 0.0f;
-		float reward_checkpoint = 0.0f;
-		float reward_finish = 0.0f;
-		bool done = false;
-		bool truncated = false;
 
-	       const rl::SPlayerObs &local = pObs->m_LocalPlayer;
-	       int tick = pObs->m_Tick;
+	// Calculate reward using new system
+	float reward = CalculateReward(pObs);
+	bool truncated = false;
 
-
-		       // Speed reward (only if faster than normal walking)
-               float speed = std::abs(local.m_VelX); // Only horizontal speed
-               const float normal_walk_speed = 30.0f; // tweak as needed for DDNet
-               if(speed > normal_walk_speed) {
-                   reward_speed = (speed - normal_walk_speed) * 0.005f; // only reward excess horizontal speed
-                   reward += reward_speed;
-               }
-
-		       // Distance from spawn reward (sparse: only when reaching new max distance)
-		       float dx = local.m_PosX - m_SpawnPosX;
-		       float dy = local.m_PosY - m_SpawnPosY;
-		       float distance = std::sqrt(dx * dx + dy * dy);
-		       if(distance > m_MaxDistanceFromSpawn)
-		       {
-		           reward_distance = 0.001f; // Reward for reaching new max distance
-		           m_MaxDistanceFromSpawn = distance;
-		       }
-		       else
-		       {
-		           reward_distance = 0.0f;
-		       }
-		       reward += reward_distance;
-
-	       // Checkpoint/finish detection (using tile grid)
-	       // Find current checkpoint and finish status
-	       int checkpoint = -1;
-	       bool finished = false;
-	       // Center tile in grid
-	       int center_x = rl::TILE_GRID_WIDTH / 2;
-	       int center_y = rl::TILE_GRID_HEIGHT / 2;
-	       int center_idx = center_y * rl::TILE_GRID_WIDTH + center_x;
-	       uint8_t center_tile = pObs->m_aTileGrid[center_idx];
-	       if(center_tile == (uint8_t)rl::ETileType::CHECKPOINT)
-		       checkpoint = tick; // Use tick as unique checkpoint id (could be improved)
-	       if(center_tile == (uint8_t)rl::ETileType::FINISH)
-		       finished = true;
-
-	       	// Reward for reaching new checkpoint
-			if(checkpoint != -1 && checkpoint != m_LastCheckpoint)
-			{
-				reward_checkpoint = 0.1f;
-				reward += reward_checkpoint;
-				m_LastCheckpoint = checkpoint;
-			}
-
-			// Reward for finishing
-			if(finished && !m_LastFinished)
-			{
-				reward_finish = 1.0f;
-				reward += reward_finish;
-				done = true;
-				m_LastFinished = true;
-			}
-			if(!finished)
-				m_LastFinished = false;
-
-
-		//dbg_msg("rlbot", "Reward components: speed=%.3f, distance=%.3f, checkpoint=%.3f, finish=%.3f, total=%.3f", reward_speed, reward_distance, reward_checkpoint, reward_finish, reward);
-
-		// Accumulate reward (optional, for debugging)
-		m_AccumulatedReward += reward;
-
-	       // Update header
-	       rl::SSharedMemoryHeader *pHeader = m_pComm->GetHeader();
-	       if(pHeader)
-	       {
-		       pHeader->m_Tick = pObs->m_Tick;
-		       pHeader->m_Reward = reward;
-		       pHeader->m_Done = done ? 1 : 0;
-		       pHeader->m_Truncated = truncated ? 1 : 0;
-	       }
+	// Update header
+	rl::SSharedMemoryHeader *pHeader = m_pComm->GetHeader();
+	if(pHeader)
+	{
+		pHeader->m_Tick = pObs->m_Tick;
+		pHeader->m_Reward = reward;
+		pHeader->m_Done = m_Done ? 1 : 0;
+		pHeader->m_Truncated = truncated ? 1 : 0;
+	}
 	
 	// Signal observation is ready
 	m_pComm->SignalFrameReady();
@@ -463,7 +398,6 @@ void CRLBot::ExtractGameState(rl::SStructuredObservation *pObs)
 		{
 			m_SpawnPosX = pObs->m_LocalPlayer.m_PosX;
 			m_SpawnPosY = pObs->m_LocalPlayer.m_PosY;
-			m_MaxDistanceFromSpawn = 0.0f; // Reset max distance when spawn is set
 		}
 	}
 	
@@ -511,6 +445,12 @@ void CRLBot::ExtractGameState(rl::SStructuredObservation *pObs)
 	
 	// Local tile grid around player (29x21)
 	ExtractLocalTiles(pObs);
+
+	// Raycast observations
+	ExtractRaycasts(pObs);
+
+	// Extra player state (grounded, jumps remaining, etc.)
+	ExtractPlayerExtras(pObs);
 }
 
 void CRLBot::ExtractPlayerState(rl::SPlayerObs *pPlayerObs, int ClientId, bool IsLocal)
@@ -682,6 +622,274 @@ void CRLBot::ExtractLocalTiles(rl::SStructuredObservation *pObs)
 	}
 }
 
+bool CRLBot::IsTileHookable(int tileIndex)
+{
+	// Most solid tiles are hookable, except NOHOOK
+	switch(tileIndex)
+	{
+	case TILE_SOLID:
+		return true;
+	case TILE_NOHOOK:
+		return false;
+	default:
+		// Check if it's a solid-like tile
+		return tileIndex == TILE_SOLID;
+	}
+}
+
+float CRLBot::CastRay(float startX, float startY, float dirX, float dirY, float maxDist, int tileTypeMask)
+{
+	CGameClient *pGameClient = static_cast<CGameClient *>(GameClient());
+	CCollision *pCollision = pGameClient->Collision();
+
+	if(!pCollision || !pCollision->Layers())
+		return 1.0f;
+
+	int MapWidth = pCollision->GetWidth();
+	int MapHeight = pCollision->GetHeight();
+
+	const float step = 16.0f; // Check every half tile
+	for(float dist = step; dist < maxDist; dist += step)
+	{
+		float x = startX + dirX * dist;
+		float y = startY + dirY * dist;
+
+		int tileX = (int)(x / 32.0f);
+		int tileY = (int)(y / 32.0f);
+
+		// Check bounds
+		if(tileX < 0 || tileX >= MapWidth || tileY < 0 || tileY >= MapHeight)
+			return dist / maxDist; // Hit map boundary
+
+		int mapIndex = tileY * MapWidth + tileX;
+		int tileIdx = pCollision->GetTileIndex(mapIndex);
+
+		// Check against mask
+		// Mask bits: 1=SOLID, 2=DEATH, 4=HOOKABLE
+		if((tileTypeMask & 1) && tileIdx == TILE_SOLID)
+			return dist / maxDist;
+		if((tileTypeMask & 2) && tileIdx == TILE_DEATH)
+			return dist / maxDist;
+		if((tileTypeMask & 4) && (tileIdx == TILE_SOLID || tileIdx == TILE_NOHOOK))
+			return dist / maxDist; // Hookable includes solid and nohook edges
+	}
+
+	return 1.0f; // Nothing found within max distance
+}
+
+void CRLBot::ExtractRaycasts(rl::SStructuredObservation *pObs)
+{
+	float playerX = pObs->m_LocalPlayer.m_PosX;
+	float playerY = pObs->m_LocalPlayer.m_PosY;
+
+	// Cast rays in 16 directions (every 22.5 degrees)
+	for(int i = 0; i < rl::NUM_RAYCASTS; i++)
+	{
+		float angle = (float)i * (2.0f * 3.14159265f / rl::NUM_RAYCASTS);
+		float dirX = std::cos(angle);
+		float dirY = std::sin(angle);
+
+		// Cast ray for solid tiles (mask bit 1)
+		pObs->m_aRaycastSolid[i] = CastRay(playerX, playerY, dirX, dirY, rl::RAYCAST_MAX_DIST, 1);
+
+		// Cast ray for death tiles (mask bit 2)
+		pObs->m_aRaycastDeath[i] = CastRay(playerX, playerY, dirX, dirY, rl::RAYCAST_MAX_DIST, 2);
+
+		// Cast ray for hookable surfaces (mask bit 4)
+		pObs->m_aRaycastHookable[i] = CastRay(playerX, playerY, dirX, dirY, rl::RAYCAST_MAX_DIST, 4);
+	}
+}
+
+void CRLBot::ExtractPlayerExtras(rl::SStructuredObservation *pObs)
+{
+	CGameClient *pGameClient = static_cast<CGameClient *>(GameClient());
+	CCollision *pCollision = pGameClient->Collision();
+
+	const rl::SPlayerObs &local = pObs->m_LocalPlayer;
+
+	// Check if grounded (solid tile below player's feet)
+	// Player hitbox is roughly 28x28, check slightly below center
+	float feetX = local.m_PosX;
+	float feetY = local.m_PosY + 16.0f; // Below player center
+
+	int tileX = (int)(feetX / 32.0f);
+	int tileY = (int)(feetY / 32.0f);
+
+	pObs->m_IsGrounded = 0;
+	if(pCollision && pCollision->Layers())
+	{
+		int MapWidth = pCollision->GetWidth();
+		int MapHeight = pCollision->GetHeight();
+		if(tileX >= 0 && tileX < MapWidth && tileY >= 0 && tileY < MapHeight)
+		{
+			int mapIndex = tileY * MapWidth + tileX;
+			int tileIdx = pCollision->GetTileIndex(mapIndex);
+			if(tileIdx == TILE_SOLID)
+				pObs->m_IsGrounded = 1;
+		}
+	}
+
+	// Jumps remaining based on m_Jumped state
+	// In Teeworlds: 0 = can double jump, 1 = used ground jump (can air jump), 2+ = no jumps left
+	uint8_t jumped = local.m_Jumped;
+	if(jumped == 0)
+		pObs->m_JumpsRemaining = 2;
+	else if(jumped == 1)
+		pObs->m_JumpsRemaining = 1;
+	else
+		pObs->m_JumpsRemaining = 0;
+
+	// Hook availability (simplified: available if not currently attached or retracting)
+	pObs->m_CanHook = (local.m_HookState == 0) ? 1 : 0;
+}
+
+float CRLBot::CalculateReward(const rl::SStructuredObservation *pObs)
+{
+	float reward = 0.0f;
+	const rl::SPlayerObs &local = pObs->m_LocalPlayer;
+
+	// Skip reward calculation if player not active
+	if(!local.m_Active)
+		return 0.0f;
+
+	// ===== DENSE REWARDS (every step) =====
+
+	// 1. Progress reward: movement toward finish (assume rightward is progress)
+	float progress = (local.m_PosX - m_LastPosX) / 32.0f; // tiles moved
+	reward += progress * 0.01f;
+
+	// 2. Time penalty: encourage efficiency
+	reward -= 0.0005f;
+
+	// 3. Velocity bonus: reward moving fast in progress direction
+	if(local.m_VelX > 0)
+	{
+		reward += (local.m_VelX / 100.0f) * 0.002f;
+	}
+
+	// ===== MECHANIC REWARDS =====
+
+	// 4. Hook success: reward attaching hook (once per hook)
+	if(local.m_HookState == 2 && m_LastHookState != 2)
+	{
+		reward += 0.05f; // Successful hook attach
+	}
+
+	// 5. Hook momentum: reward speed gained while hooked
+	if(local.m_HookState == 2)
+	{
+		float speed = std::sqrt(local.m_VelX * local.m_VelX + local.m_VelY * local.m_VelY);
+		float lastSpeed = std::sqrt(m_LastVelX * m_LastVelX + m_LastVelY * m_LastVelY);
+		if(speed > lastSpeed)
+		{
+			reward += (speed - lastSpeed) * 0.002f;
+		}
+	}
+
+	// ===== SPARSE MILESTONES =====
+
+	// 6. Checkpoint (detect by standing on checkpoint tile)
+	int centerX = rl::TILE_GRID_WIDTH / 2;
+	int centerY = rl::TILE_GRID_HEIGHT / 2;
+	int centerIdx = centerY * rl::TILE_GRID_WIDTH + centerX;
+	uint8_t centerTile = pObs->m_aTileGrid[centerIdx];
+
+	if(centerTile == (uint8_t)rl::ETileType::CHECKPOINT)
+	{
+		// Use position as checkpoint ID (quantized to tile)
+		int cpId = ((int)(local.m_PosX / 32.0f)) * 10000 + ((int)(local.m_PosY / 32.0f));
+		if(cpId != m_LastCheckpointIndex)
+		{
+			reward += 0.5f;
+			m_LastCheckpointIndex = cpId;
+		}
+	}
+
+	// 7. Finish
+	if(centerTile == (uint8_t)rl::ETileType::FINISH)
+	{
+		reward += 5.0f;
+		m_Done = true;
+	}
+
+	// ===== PENALTIES =====
+
+	// 8. Death detection (player becomes inactive or health drops)
+	// In DDNet, death is often indicated by respawn at spawn position
+	bool possibleDeath = false;
+	float distFromLast = std::sqrt((local.m_PosX - m_LastPosX) * (local.m_PosX - m_LastPosX) +
+	                               (local.m_PosY - m_LastPosY) * (local.m_PosY - m_LastPosY));
+	// Large teleport back toward spawn suggests death
+	if(distFromLast > 500.0f && m_LastPosX > m_SpawnPosX + 100.0f)
+	{
+		float distToSpawn = std::sqrt((local.m_PosX - m_SpawnPosX) * (local.m_PosX - m_SpawnPosX) +
+		                              (local.m_PosY - m_SpawnPosY) * (local.m_PosY - m_SpawnPosY));
+		if(distToSpawn < 100.0f)
+			possibleDeath = true;
+	}
+
+	if(possibleDeath && !m_WasDead)
+	{
+		reward -= 1.0f;
+		m_WasDead = true;
+		m_Done = true;
+	}
+	else if(!possibleDeath)
+	{
+		m_WasDead = false;
+	}
+
+	// 9. Freeze penalty
+	if(local.m_IsFrozen && !m_WasFrozen)
+	{
+		reward -= 0.3f;
+	}
+
+	// 10. Stuck penalty (no progress for extended time)
+	if(std::abs(local.m_PosX - m_LastPosX) < 1.0f &&
+	   std::abs(local.m_PosY - m_LastPosY) < 1.0f)
+	{
+		m_StuckCounter++;
+		if(m_StuckCounter > 100) // ~2 seconds at 50 tick
+		{
+			reward -= 0.01f;
+		}
+	}
+	else
+	{
+		m_StuckCounter = 0;
+	}
+
+	// Update state for next frame
+	m_LastPosX = local.m_PosX;
+	m_LastPosY = local.m_PosY;
+	m_LastVelX = local.m_VelX;
+	m_LastVelY = local.m_VelY;
+	m_LastHookState = local.m_HookState;
+	m_WasFrozen = local.m_IsFrozen;
+
+	// Accumulate for debugging
+	m_AccumulatedReward += reward;
+
+	return reward;
+}
+
+void CRLBot::ResetRewardState()
+{
+	m_LastPosX = m_SpawnPosX;
+	m_LastPosY = m_SpawnPosY;
+	m_LastVelX = 0.0f;
+	m_LastVelY = 0.0f;
+	m_LastHookState = 0;
+	m_WasFrozen = false;
+	m_WasDead = false;
+	m_StuckCounter = 0;
+	m_LastCheckpointIndex = -1;
+	m_CurrentCheckpointIndex = -1;
+	m_Done = false;
+	m_AccumulatedReward = 0.0f;
+}
+
 void CRLBot::ReceiveAction()
 {
 	if(!m_pComm)
@@ -735,7 +943,7 @@ void CRLBot::ReceiveAction()
 		       // Handle episode reset from Python
 		       if(pHeader->m_Reset != 0)
 		       {
-			       m_MaxDistanceFromSpawn = 0.0f;
+			       ResetRewardState();
 			       pHeader->m_Reset = 0; // Clear the flag
 		       }
 	       }
