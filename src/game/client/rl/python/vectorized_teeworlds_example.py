@@ -21,9 +21,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque
+from torch.utils.tensorboard import SummaryWriter
 from teeworlds_env import TeeWorldsShmClient
 
-NUM_ENVS = 16
+NUM_ENVS = 63
 NUM_STEPS = 1000  # Steps per episode
 DDNET_PATH = os.environ.get('DDNET_PATH', '../../../../../build/DDNet')  # Adjust as needed
 SERVER_PORT = 8303
@@ -141,8 +142,8 @@ def main():
     global OBS_SIZE
     OBS_SIZE = obs_size
 
-    policy_net = QNet(OBS_SIZE, NUM_ENVS)
-    target_net = QNet(OBS_SIZE, NUM_ENVS)
+    policy_net = QNet(OBS_SIZE, N_ACTIONS)
+    target_net = QNet(OBS_SIZE, N_ACTIONS)
     target_net.load_state_dict(policy_net.state_dict())
     optimizer = optim.Adam(policy_net.parameters(), lr=LR)
     memory = ReplayBuffer(MEMORY_SIZE)
@@ -150,6 +151,9 @@ def main():
     episode_rewards = [0 for _ in range(NUM_ENVS)]
     dones = [False for _ in range(NUM_ENVS)]
     episode_steps = [0 for _ in range(NUM_ENVS)]
+    
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(log_dir='runs/vectorized_teeworlds')
     
     # Initialize current actions for delta accumulation
     current_actions = [{
@@ -166,9 +170,11 @@ def main():
     try:
         while True:
             actions = []
+            action_idxs = []  # Track action indices for replay
             for i in range(NUM_ENVS):
                 # Epsilon-greedy
                 eps = 0.05 + (1.0 - 0.05) * np.exp(-1. * steps_done / 10000)
+                writer.add_scalar('Epsilon', eps, steps_done)
                 if dones[i]:
                     # Request reset by sending a reset action
                     parent_conns[i].send({'reset': True})
@@ -187,6 +193,7 @@ def main():
                         'weapon': 0,
                     }
                     actions.append({'reset': True})
+                    action_idxs.append(None)  # No action index for reset
                     continue
                 if np.random.rand() < eps:
                     # Random absolute actions for exploration
@@ -199,6 +206,7 @@ def main():
                         'aim_y': np.random.randint(-180, 181),
                         'weapon': np.random.randint(0, 5),
                     }
+                    action_idx = -1  # Placeholder for random actions
                     # Update current action
                     for key in current_actions[i]:
                         if key in action:
@@ -207,7 +215,7 @@ def main():
                     with torch.no_grad():
                         state_t = torch.tensor(states[i]).unsqueeze(0).float()
                         qvals = policy_net(state_t)
-                        action_idx = int(torch.argmax(qvals)) % 5
+                        action_idx = int(torch.argmax(qvals))
                         # Map action_idx to delta action
                         delta_action = [
                             {'direction': 0, 'jump': 0, 'hook': 0, 'fire': 0, 'aim_x': 0, 'aim_y': 0, 'weapon': 0},  # no change
@@ -232,6 +240,7 @@ def main():
                     action = current_actions[i].copy()
                 parent_conns[i].send(action)
                 actions.append(action)
+                action_idxs.append(action_idx)
             # Collect results
             for i in range(NUM_ENVS):
                 if actions[i].get('reset', False):
@@ -241,27 +250,29 @@ def main():
                     print(f"Env {i} returned None observation.")
                     continue
                 next_state, reward, done, info = result
-                memory.push(states[i], actions[i], reward, next_state, done)
+                # Only push to memory if action_idx is valid (not random or reset)
+                if action_idxs[i] is not None and action_idxs[i] >= 0:
+                    memory.push(states[i], action_idxs[i], reward, next_state, done)  # Store index, not dict
                 states[i] = next_state
                 episode_rewards[i] += reward
                 episode_steps[i] += 1
                 # End episode if done or max steps reached
                 if done or episode_steps[i] >= NUM_STEPS:
                     #print(f"[Env {i}] Episode {episode_count} finished with reward {episode_rewards[i]} after {episode_steps[i]} steps")
+                    writer.add_scalar(f'Episode Reward/Env_{i}', episode_rewards[i], episode_count)
                     dones[i] = True
                     
                 steps_done += 1
             # Learn
             if len(memory) > MIN_REPLAY_SIZE:
                 batch = memory.sample(BATCH_SIZE)
-                batch_states, batch_actions, batch_rewards, batch_next_states, batch_dones = zip(*batch)
+                batch_states, batch_action_idxs, batch_rewards, batch_next_states, batch_dones = zip(*batch)  # Unpack indices
                 batch_states = torch.tensor(batch_states, dtype=torch.float32)
+                batch_action_idxs = torch.tensor(batch_action_idxs, dtype=torch.long)  # Now correctly indices
                 batch_rewards = torch.tensor(batch_rewards, dtype=torch.float32)
                 batch_next_states = torch.tensor(batch_next_states, dtype=torch.float32)
                 batch_dones = torch.tensor(batch_dones, dtype=torch.bool)
-                # For demonstration, use only the first action index (expand for full parametric)
-                batch_action_idxs = torch.zeros(BATCH_SIZE, dtype=torch.long)
-                qvals = policy_net(batch_states).gather(1, batch_action_idxs.unsqueeze(1)).squeeze(1)
+                qvals = policy_net(batch_states).gather(1, batch_action_idxs.unsqueeze(1)).squeeze(1)  # Use actual indices
                 with torch.no_grad():
                     next_qvals = target_net(batch_next_states).max(1)[0]
                     target = batch_rewards + GAMMA * next_qvals * (~batch_dones)
@@ -269,6 +280,7 @@ def main():
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                writer.add_scalar('Loss', loss.item(), steps_done)
             # Update target
             if steps_done % TARGET_UPDATE == 0:
                 target_net.load_state_dict(policy_net.state_dict())
@@ -276,6 +288,10 @@ def main():
             if all(dones):
                 print(f"All environments finished episode {episode_count}. Rewards: {[round(r, 3) for r in episode_rewards]}")
                 print(f"Max reward: {round(max(episode_rewards), 3)}, Avg reward: {round(sum(episode_rewards)/NUM_ENVS, 3)}")
+                avg_reward = sum(episode_rewards) / NUM_ENVS
+                max_reward = max(episode_rewards)
+                writer.add_scalar('Average Reward', avg_reward, episode_count)
+                writer.add_scalar('Max Reward', max_reward, episode_count)
                 episode_count += 1
     except KeyboardInterrupt:
         print("Training interrupted by user.")
@@ -284,6 +300,7 @@ def main():
         for i in range(NUM_ENVS):
             parent_conns[i].send({'close': True})
         print(f"Final episode rewards: {episode_rewards}")
+        writer.close()
 
 
     # Cleanup
@@ -323,7 +340,7 @@ def start_ddnet_server():
 def start_ddnet_clients():
     ddnet_procs = []
     for i in range(NUM_ENVS):
-        cmd = [DDNET_PATH, f"connect localhost:{SERVER_PORT}; rl_enable state {i}; snd_volume 0; bind k kill"]
+        cmd = [DDNET_PATH, f"connect localhost:{SERVER_PORT}; rl_enable state {i}; snd_volume 0; bind k kill; player_name {i}"]
         proc = subprocess.Popen(
             cmd,
             preexec_fn=os.setsid,
