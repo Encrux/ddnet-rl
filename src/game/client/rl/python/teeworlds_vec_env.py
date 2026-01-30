@@ -18,10 +18,37 @@ import subprocess
 import os
 import signal
 import time
+import atexit
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 import multiprocessing as mp
 from teeworlds_env import TeeWorldsShmClient, StructuredObservation
+
+# Global reference for signal handler cleanup
+_active_env: Optional['TeeWorldsVecEnv'] = None
+
+
+def _cleanup_on_exit():
+    """Cleanup function called on exit."""
+    global _active_env
+    if _active_env is not None:
+        try:
+            _active_env.close()
+        except:
+            pass
+
+
+def _signal_handler(signum, frame):
+    """Handle Ctrl+C and other signals."""
+    global _active_env
+    print(f"\nReceived signal {signum}, cleaning up...")
+    if _active_env is not None:
+        try:
+            _active_env.close()
+        except:
+            pass
+    # Re-raise to allow calling code to handle (e.g., save checkpoint)
+    raise KeyboardInterrupt()
 
 
 @dataclass
@@ -31,6 +58,7 @@ class EnvConfig:
     server_path: str = "../../../../../build/DDNet-Server"
     server_port: int = 8303
     sv_tickrate: int = 50
+    frame_skip: int = 1  # 1 = no skip, 4 = act every 4th tick
     max_episode_steps: int = 2000
     startup_wait: float = 5.0
     observation_timeout: float = 2.0
@@ -71,6 +99,14 @@ class TeeWorldsVecEnv:
 
         # Track if environment is running
         self._running = False
+        self._closed = False
+
+        # Register cleanup handlers
+        global _active_env
+        _active_env = self
+        atexit.register(_cleanup_on_exit)
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
 
         if auto_start:
             self.start()
@@ -105,6 +141,9 @@ class TeeWorldsVecEnv:
 
         print(f"Starting Teeworlds environment with {self.num_envs} clients...")
 
+        # Clean up any stale shared memory files
+        self._cleanup_shared_memory()
+
         # Start server
         self._start_server()
 
@@ -123,6 +162,18 @@ class TeeWorldsVecEnv:
 
         self._running = True
         print(f"Environment ready. Observation dim: {self.obs_dim}")
+
+    def _cleanup_shared_memory(self):
+        """Clean up any stale shared memory files from previous runs."""
+        import glob
+        stale_files = glob.glob("/dev/shm/teeworlds_rl_*")
+        if stale_files:
+            print(f"  Cleaning up {len(stale_files)} stale shared memory files...")
+            for f in stale_files:
+                try:
+                    os.remove(f)
+                except:
+                    pass
 
     def _start_server(self):
         """Start the DDNet server."""
@@ -144,40 +195,72 @@ class TeeWorldsVecEnv:
         time.sleep(2)  # Wait for server to initialize
 
     def _start_clients(self):
-        """Start DDNet clients."""
-        for i in range(self.num_envs):
-            cmd = [
-                self.config.ddnet_path,
-                f"connect localhost:{self.config.server_port}; "
-                f"rl_enable state {i}; "
-                f"snd_volume 0; "
-                f"gfx_screen_width 320; "
-                f"gfx_screen_height 240; "
-                f"bind k kill; "
-                f"player_name RL_{i}"
-            ]
+        """Start DDNet clients in batches to avoid overwhelming the server."""
+        batch_size = 8  # Smaller batches for more reliable startup
+        batch_delay = 1.0  # Delay between batches to let server process
 
-            proc = subprocess.Popen(
-                cmd,
-                preexec_fn=os.setsid,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self.client_procs.append(proc)
+        print(f"  Launching {self.num_envs} clients in batches of {batch_size}...")
 
-            # Wait for shared memory to be created
-            shm_path = f"/dev/shm/teeworlds_rl_{i}"
-            for _ in range(60):
-                if os.path.exists(shm_path):
-                    break
-                time.sleep(0.5)
-            else:
-                raise RuntimeError(f"Timeout waiting for {shm_path}")
+        for batch_start in range(0, self.num_envs, batch_size):
+            batch_end = min(batch_start + batch_size, self.num_envs)
+            print(f"    Starting clients {batch_start}-{batch_end-1}...")
 
-            if (i + 1) % 10 == 0:
-                print(f"  Started {i + 1}/{self.num_envs} clients")
+            # Launch batch
+            for i in range(batch_start, batch_end):
+                cmd = [
+                    self.config.ddnet_path,
+                    f"connect localhost:{self.config.server_port}; "
+                    f"rl_enable state {i}; "
+                    f"rl_frameskip {self.config.frame_skip}; "
+                    f"snd_volume 0; "
+                    f"gfx_screen_width 320; "
+                    f"gfx_screen_height 240; "
+                    f"bind k kill; "
+                    f"player_name RL_{i:02d}"
+                ]
 
-        print(f"All {self.num_envs} clients started")
+                proc = subprocess.Popen(
+                    cmd,
+                    preexec_fn=os.setsid,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self.client_procs.append(proc)
+
+            # Delay between batches to let server process connections
+            if batch_end < self.num_envs:
+                time.sleep(batch_delay)
+
+        # Wait for all shared memory files to be created
+        print(f"  Waiting for shared memory files...")
+        pending = set(range(self.num_envs))
+        start_time = time.time()
+        last_count = 0
+
+        for attempt in range(180):  # 90 seconds max
+            still_pending = set()
+            for i in pending:
+                shm_path = f"/dev/shm/teeworlds_rl_{i}"
+                if not os.path.exists(shm_path):
+                    still_pending.add(i)
+
+            if not still_pending:
+                break
+
+            ready_count = self.num_envs - len(still_pending)
+            # Print progress whenever count changes or every 5 seconds
+            if ready_count != last_count or attempt % 10 == 9:
+                elapsed = time.time() - start_time
+                print(f"    {ready_count}/{self.num_envs} clients ready ({elapsed:.1f}s)")
+                last_count = ready_count
+
+            pending = still_pending
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(f"Timeout waiting for {len(pending)} clients: {sorted(pending)[:10]}...")
+
+        elapsed = time.time() - start_time
+        print(f"  All {self.num_envs} clients started in {elapsed:.1f}s")
 
     def _start_workers(self):
         """Start worker processes for each environment."""
@@ -359,6 +442,10 @@ class TeeWorldsVecEnv:
 
     def close(self):
         """Clean up all resources."""
+        if self._closed:
+            return
+        self._closed = True
+
         print("Closing environment...")
 
         # Tell workers to close
@@ -370,23 +457,35 @@ class TeeWorldsVecEnv:
 
         # Wait for workers to finish
         for proc in self.worker_procs:
-            proc.join(timeout=2.0)
-            if proc.is_alive():
-                proc.terminate()
+            try:
+                proc.join(timeout=2.0)
+                if proc.is_alive():
+                    proc.terminate()
+            except:
+                pass
 
-        # Terminate clients
+        # Terminate clients - use SIGKILL for faster shutdown
+        print(f"  Terminating {len(self.client_procs)} clients...")
         for proc in self.client_procs:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except:
                 pass
 
         # Terminate server
         if self.server_proc:
             try:
-                os.killpg(os.getpgid(self.server_proc.pid), signal.SIGTERM)
+                print("  Terminating server...")
+                os.killpg(os.getpgid(self.server_proc.pid), signal.SIGKILL)
             except:
                 pass
+
+        # Clear process lists
+        self.worker_procs.clear()
+        self.client_procs.clear()
+        self.parent_conns.clear()
+        self.child_conns.clear()
+        self.server_proc = None
 
         self._running = False
         print("Environment closed")
@@ -398,7 +497,7 @@ class TeeWorldsVecEnv:
         self.close()
 
 
-def _env_worker(env_id: int, conn: mp.connection.Connection, timeout: float):
+def _env_worker(env_id: int, conn, timeout: float):
     """
     Worker process for a single environment.
 

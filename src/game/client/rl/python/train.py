@@ -40,6 +40,8 @@ def parse_args():
                         help="Maximum steps per episode")
     parser.add_argument("--sv-tickrate", type=int, default=50,
                         help="Server tickrate")
+    parser.add_argument("--frame-skip", type=int, default=1,
+                        help="Frame skip (1=no skip, 4=act every 4th tick)")
 
     # Training
     parser.add_argument("--total-timesteps", type=int, default=10_000_000,
@@ -138,6 +140,7 @@ def main():
         ddnet_path=args.ddnet_path,
         server_path=args.server_path,
         sv_tickrate=args.sv_tickrate,
+        frame_skip=args.frame_skip,
         max_episode_steps=args.max_episode_steps,
     )
 
@@ -185,6 +188,10 @@ def main():
         num_updates = args.total_timesteps // (args.num_steps * args.num_envs)
         print(f"\nStarting training for {args.total_timesteps:,} timesteps ({num_updates} updates)")
         print(f"Batch size: {args.num_steps * args.num_envs}")
+        print(f"Server tickrate: {args.sv_tickrate}, Frame skip: {args.frame_skip}")
+        if args.frame_skip > 1:
+            effective_rate = args.sv_tickrate / args.frame_skip
+            print(f"Effective decision rate: {effective_rate:.0f} Hz")
         print("-" * 60)
 
         start_time = time.time()
@@ -282,10 +289,24 @@ def main():
 
     except KeyboardInterrupt:
         print("\n\nTraining interrupted by user")
-        # Save checkpoint on interrupt
-        interrupt_path = os.path.join(run_dir, "checkpoint_interrupted.pt")
-        agent.save(interrupt_path)
-        print(f"Saved checkpoint: {interrupt_path}")
+        # Save checkpoint on interrupt if agent exists
+        if 'agent' in dir():
+            interrupt_path = os.path.join(run_dir, "checkpoint_interrupted.pt")
+            agent.save(interrupt_path)
+            print(f"Saved checkpoint: {interrupt_path}")
+
+    except Exception as e:
+        print(f"\n\nTraining failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        # Try to save checkpoint on error if agent exists
+        if 'agent' in dir():
+            try:
+                error_path = os.path.join(run_dir, "checkpoint_error.pt")
+                agent.save(error_path)
+                print(f"Saved checkpoint: {error_path}")
+            except:
+                pass
 
     finally:
         # Cleanup

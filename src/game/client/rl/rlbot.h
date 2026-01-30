@@ -50,6 +50,7 @@ private:
 	float m_LastVelY;
 	float m_SpawnPosX;
 	float m_SpawnPosY;
+	float m_MaxPosX; // Max X position reached this episode (for max-progress reward)
 	int m_LastHookState;
 	bool m_WasFrozen;
 	bool m_WasDead;
@@ -63,6 +64,7 @@ private:
 	static void ConRLEnable(IConsole::IResult *pResult, void *pUserData);
 	static void ConRLDisable(IConsole::IResult *pResult, void *pUserData);
 	static void ConRLStatus(IConsole::IResult *pResult, void *pUserData);
+	static void ConRLFrameSkip(IConsole::IResult *pResult, void *pUserData);
 	
 	// Called from graphics thread to capture frame (rendered mode only)
 	void OnGraphicsThreadCapture(TGLBackendReadPresentedImageData &ReadFunc);
@@ -71,6 +73,8 @@ private:
 	void ProcessCapturedFrame();
 	void SendFrame();
 	void SendStructuredObservation();
+	void SendStructuredObservationWithAccumulatedReward();
+	void AccumulateReward();
 	void ReceiveAction();
 	
 	// Extract game state into structured observation
@@ -122,7 +126,12 @@ private:
 	// Stats
 	uint64_t m_FrameCount;
 	int64_t m_LastFrameTime;
-	
+
+	// Frame skipping (based on server ticks, not client frames)
+	int m_FrameSkip;        // Number of server ticks between decisions (1 = every tick)
+	int m_LastCommTick;     // Server tick of last communication with Python
+	float m_SkippedReward;  // Accumulated reward during skipped frames
+
 	// Deferred enable (for startup)
 	bool m_PendingEnable{false};
 	int m_PendingEnvId{0};

@@ -21,6 +21,7 @@ CRLBot::CRLBot() :
 	m_LastVelY(0.0f),
 	m_SpawnPosX(0.0f),
 	m_SpawnPosY(0.0f),
+	m_MaxPosX(0.0f),
 	m_LastHookState(0),
 	m_WasFrozen(false),
 	m_WasDead(false),
@@ -43,7 +44,10 @@ CRLBot::CRLBot() :
 	m_ActionAimX(0),
 	m_ActionAimY(0),
 	m_FrameCount(0),
-	m_LastFrameTime(0)
+	m_LastFrameTime(0),
+	m_FrameSkip(1),
+	m_LastCommTick(-1),
+	m_SkippedReward(0.0f)
 {
 }
 
@@ -54,10 +58,12 @@ CRLBot::~CRLBot()
 
 void CRLBot::OnConsoleInit()
 {
-	Console()->Register("rl_enable", "?s[mode]?i[env_id]?i[width]?i[height]", CFGFLAG_CLIENT, ConRLEnable, this, 
+	Console()->Register("rl_enable", "?s[mode]?i[env_id]?i[width]?i[height]", CFGFLAG_CLIENT, ConRLEnable, this,
 		"Enable RL mode. mode='state' (default, headless) or 'render' (requires display). For render mode: env_id, width, height");
 	Console()->Register("rl_disable", "", CFGFLAG_CLIENT, ConRLDisable, this, "Disable RL mode");
 	Console()->Register("rl_status", "", CFGFLAG_CLIENT, ConRLStatus, this, "Show RL status");
+	Console()->Register("rl_frameskip", "?i[skip]", CFGFLAG_CLIENT, ConRLFrameSkip, this,
+		"Set frame skip (1=no skip, 4=act every 4th tick). Get current value if no argument.");
 }
 
 void CRLBot::OnInit()
@@ -87,6 +93,8 @@ void CRLBot::OnReset()
 	m_ActionFire = 0;
 	m_ActionAimX = 0;
 	m_ActionAimY = 0;
+	m_LastCommTick = -1; // Reset to communicate immediately
+	m_SkippedReward = 0.0f;
 }
 
 void CRLBot::OnRender()
@@ -97,10 +105,10 @@ void CRLBot::OnRender()
 		DoEnable(m_PendingEnvId, m_PendingWidth, m_PendingHeight, m_PendingMode);
 		m_PendingEnable = false;
 	}
-	
+
 	if(!m_Enabled || !m_pComm)
 		return;
-	
+
 	// Check for shutdown request from Python
 	if(m_pComm->IsShutdownRequested())
 	{
@@ -108,24 +116,49 @@ void CRLBot::OnRender()
 		OnShutdown();
 		return;
 	}
-	
-	// Send observation based on mode
-	if(m_ObservationMode == rl::EObservationMode::STRUCTURED)
+
+	m_FrameCount++;
+
+	// Get current server tick for tick-based frame skipping
+	int currentTick = Client()->GameTick(g_Config.m_ClDummy);
+
+	// Frame skipping based on SERVER TICKS, not client frames
+	// This ensures consistent behavior regardless of client frame rate
+	bool shouldCommunicate = false;
+	if(m_LastCommTick < 0)
 	{
-		// Structured mode: extract game state directly
-		SendStructuredObservation();
+		// First tick - always communicate
+		shouldCommunicate = true;
 	}
 	else
 	{
-		// Rendered mode: process frame captured by graphics thread callback
+		int ticksSinceComm = currentTick - m_LastCommTick;
+		shouldCommunicate = (ticksSinceComm >= m_FrameSkip);
+	}
+
+	if(m_ObservationMode == rl::EObservationMode::STRUCTURED)
+	{
+		if(shouldCommunicate)
+		{
+			// Communication tick: send observation with accumulated reward
+			SendStructuredObservationWithAccumulatedReward();
+			ReceiveAction();
+			m_LastCommTick = currentTick;
+			m_SkippedReward = 0.0f;
+		}
+		else
+		{
+			// Skipped tick: just accumulate reward (no blocking)
+			AccumulateReward();
+		}
+	}
+	else
+	{
+		// Rendered mode: frame skipping not yet implemented, always communicate
 		ProcessCapturedFrame();
 		SendFrame();
+		ReceiveAction();
 	}
-	
-	// Wait for and receive action
-	ReceiveAction();
-	
-	m_FrameCount++;
 }
 
 void CRLBot::OnGraphicsThreadCapture(TGLBackendReadPresentedImageData &ReadFunc)
@@ -370,6 +403,60 @@ void CRLBot::SendStructuredObservation()
 	m_pComm->SignalFrameReady();
 }
 
+void CRLBot::SendStructuredObservationWithAccumulatedReward()
+{
+	if(!m_pComm)
+		return;
+
+	// Get structured observation buffer
+	rl::SStructuredObservation *pObs = m_pComm->GetStructuredObservation();
+	if(!pObs)
+	{
+		dbg_msg("rl/debug", "SendStructuredObservationWithAccumulatedReward: observation buffer is null");
+		return;
+	}
+
+	// Extract game state
+	ExtractGameState(pObs);
+
+	// Calculate reward for this frame and add accumulated reward from skipped frames
+	float reward = CalculateReward(pObs) + m_SkippedReward;
+	bool truncated = false;
+
+	// Update header
+	rl::SSharedMemoryHeader *pHeader = m_pComm->GetHeader();
+	if(pHeader)
+	{
+		pHeader->m_Tick = pObs->m_Tick;
+		pHeader->m_Reward = reward;
+		pHeader->m_Done = m_Done ? 1 : 0;
+		pHeader->m_Truncated = truncated ? 1 : 0;
+	}
+
+	// Signal observation is ready
+	m_pComm->SignalFrameReady();
+}
+
+void CRLBot::AccumulateReward()
+{
+	if(!m_pComm)
+		return;
+
+	// Get structured observation buffer (we need to extract state to calculate reward)
+	rl::SStructuredObservation *pObs = m_pComm->GetStructuredObservation();
+	if(!pObs)
+		return;
+
+	// Extract game state
+	ExtractGameState(pObs);
+
+	// Calculate and accumulate reward
+	m_SkippedReward += CalculateReward(pObs);
+
+	// Note: We don't signal frame ready or wait for action here
+	// The last action continues to be applied
+}
+
 void CRLBot::ExtractGameState(rl::SStructuredObservation *pObs)
 {
 	// Zero out the observation
@@ -398,6 +485,7 @@ void CRLBot::ExtractGameState(rl::SStructuredObservation *pObs)
 		{
 			m_SpawnPosX = pObs->m_LocalPlayer.m_PosX;
 			m_SpawnPosY = pObs->m_LocalPlayer.m_PosY;
+			m_MaxPosX = m_SpawnPosX; // Initialize max progress
 		}
 	}
 	
@@ -754,18 +842,20 @@ float CRLBot::CalculateReward(const rl::SStructuredObservation *pObs)
 
 	// ===== DENSE REWARDS (every step) =====
 
-	// 1. Progress reward: movement toward finish (assume rightward is progress)
-	float progress = (local.m_PosX - m_LastPosX) / 32.0f; // tiles moved
-	reward += progress * 0.01f;
+	// 1. Max-progress reward: only reward when reaching NEW furthest X position
+	// This doesn't penalize going left (which may be necessary to progress)
+	float newMaxProgress = local.m_PosX - m_MaxPosX;
+	if(newMaxProgress > 0)
+	{
+		reward += (newMaxProgress / 32.0f) * 0.05f; // tiles of new progress
+	}
 
 	// 2. Time penalty: encourage efficiency
 	reward -= 0.0005f;
 
-	// 3. Velocity bonus: reward moving fast in progress direction
-	if(local.m_VelX > 0)
-	{
-		reward += (local.m_VelX / 100.0f) * 0.002f;
-	}
+	// 3. Speed bonus: reward moving fast (regardless of direction)
+	float speed = std::sqrt(local.m_VelX * local.m_VelX + local.m_VelY * local.m_VelY);
+	reward += (speed / 100.0f) * 0.001f;
 
 	// ===== MECHANIC REWARDS =====
 
@@ -778,11 +868,11 @@ float CRLBot::CalculateReward(const rl::SStructuredObservation *pObs)
 	// 5. Hook momentum: reward speed gained while hooked
 	if(local.m_HookState == 2)
 	{
-		float speed = std::sqrt(local.m_VelX * local.m_VelX + local.m_VelY * local.m_VelY);
+		float hookSpeed = std::sqrt(local.m_VelX * local.m_VelX + local.m_VelY * local.m_VelY);
 		float lastSpeed = std::sqrt(m_LastVelX * m_LastVelX + m_LastVelY * m_LastVelY);
-		if(speed > lastSpeed)
+		if(hookSpeed > lastSpeed)
 		{
-			reward += (speed - lastSpeed) * 0.002f;
+			reward += (hookSpeed - lastSpeed) * 0.002f;
 		}
 	}
 
@@ -868,6 +958,10 @@ float CRLBot::CalculateReward(const rl::SStructuredObservation *pObs)
 	m_LastHookState = local.m_HookState;
 	m_WasFrozen = local.m_IsFrozen;
 
+	// Update max position reached this episode
+	if(local.m_PosX > m_MaxPosX)
+		m_MaxPosX = local.m_PosX;
+
 	// Accumulate for debugging
 	m_AccumulatedReward += reward;
 
@@ -880,6 +974,7 @@ void CRLBot::ResetRewardState()
 	m_LastPosY = m_SpawnPosY;
 	m_LastVelX = 0.0f;
 	m_LastVelY = 0.0f;
+	m_MaxPosX = m_SpawnPosX; // Reset max progress to spawn position
 	m_LastHookState = 0;
 	m_WasFrozen = false;
 	m_WasDead = false;
@@ -888,27 +983,41 @@ void CRLBot::ResetRewardState()
 	m_CurrentCheckpointIndex = -1;
 	m_Done = false;
 	m_AccumulatedReward = 0.0f;
+	m_LastCommTick = -1; // Reset to communicate immediately after respawn
+	m_SkippedReward = 0.0f;
 }
 
 void CRLBot::ReceiveAction()
 {
 	if(!m_pComm)
 		return;
-	
+
 	// Wait for Python to send action (with timeout)
 	int Timeout = 1000; // 1 second timeout (in milliseconds)
 	int WaitTime = 0;
-	
+
+	auto startWait = std::chrono::high_resolution_clock::now();
+
 	while(!m_pComm->IsActionReady() && WaitTime < Timeout)
 	{
 		// Sleep for 1ms
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		WaitTime++;
 	}
-	
+
+	auto endWait = std::chrono::high_resolution_clock::now();
+	int waitMs = std::chrono::duration_cast<std::chrono::milliseconds>(endWait - startWait).count();
+
+	// Log if wait time is excessive (> 50ms suggests Python can't keep up)
+	if(waitMs > 50 && m_FrameCount % 100 == 0)
+	{
+		dbg_msg("rl/perf", "Env %d: waited %dms for Python action", m_EnvId, waitMs);
+	}
+
 	if(!m_pComm->IsActionReady())
 	{
 		// Timeout - use last action
+		dbg_msg("rl/perf", "Env %d: TIMEOUT waiting for action", m_EnvId);
 		return;
 	}
 	
@@ -1073,16 +1182,17 @@ void CRLBot::ConRLDisable(IConsole::IResult *pResult, void *pUserData)
 void CRLBot::ConRLStatus(IConsole::IResult *pResult, void *pUserData)
 {
 	CRLBot *pSelf = static_cast<CRLBot *>(pUserData);
-	
+
 	if(pSelf->m_Enabled)
 	{
 		const char *pModeName = (pSelf->m_ObservationMode == rl::EObservationMode::STRUCTURED) ? "structured" : "rendered";
 		dbg_msg("rl", "RL mode: ENABLED");
 		dbg_msg("rl", "  Env ID: %d", pSelf->m_EnvId);
 		dbg_msg("rl", "  Mode: %s", pModeName);
+		dbg_msg("rl", "  Frame skip: %d server ticks", pSelf->m_FrameSkip);
 		if(pSelf->m_ObservationMode == rl::EObservationMode::RENDERED)
 			dbg_msg("rl", "  Frame size: %dx%d", pSelf->m_FrameWidth, pSelf->m_FrameHeight);
-		dbg_msg("rl", "  Observations sent: %llu", (unsigned long long)pSelf->m_FrameCount);
+		dbg_msg("rl", "  Ticks processed: %llu", (unsigned long long)pSelf->m_FrameCount);
 		dbg_msg("rl", "  Action: dir=%d jump=%d hook=%d fire=%d aim=(%d,%d)",
 			pSelf->m_ActionDirection, pSelf->m_ActionJump, pSelf->m_ActionHook,
 			pSelf->m_ActionFire, pSelf->m_ActionAimX, pSelf->m_ActionAimY);
@@ -1090,5 +1200,33 @@ void CRLBot::ConRLStatus(IConsole::IResult *pResult, void *pUserData)
 	else
 	{
 		dbg_msg("rl", "RL mode: DISABLED");
+	}
+}
+
+void CRLBot::ConRLFrameSkip(IConsole::IResult *pResult, void *pUserData)
+{
+	CRLBot *pSelf = static_cast<CRLBot *>(pUserData);
+
+	if(pResult->NumArguments() > 0)
+	{
+		int skip = pResult->GetInteger(0);
+		if(skip < 1)
+		{
+			dbg_msg("rl", "Frame skip must be at least 1");
+			return;
+		}
+		if(skip > 100)
+		{
+			dbg_msg("rl", "Frame skip must be at most 100");
+			return;
+		}
+		pSelf->m_FrameSkip = skip;
+		pSelf->m_LastCommTick = -1; // Reset to communicate on next tick
+		dbg_msg("rl", "Frame skip set to %d (agent acts every %d server tick%s)",
+			skip, skip, skip > 1 ? "s" : "");
+	}
+	else
+	{
+		dbg_msg("rl", "Current frame skip: %d server ticks", pSelf->m_FrameSkip);
 	}
 }
