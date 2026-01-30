@@ -406,7 +406,8 @@ class TeeWorldsServerEnv:
             f.write(f"sv_max_clients 64\n")
             f.write(f"sv_rl_bots {self.num_bots}\n")
             f.write(f"sv_register 0\n")  # Don't register with master
-
+            f.write(f"sv_rcon_password p")
+            
         server_cmd = [self.config.server_path]
 
         self.server_proc = subprocess.Popen(

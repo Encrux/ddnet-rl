@@ -208,6 +208,7 @@ def main():
 
         start_time = time.time()
         global_step = agent.global_step
+        starting_global_step = global_step  # Track starting point for FPS calculation
 
         # Episode tracking
         episode_rewards = []
@@ -251,7 +252,7 @@ def main():
             # Logging
             if update % args.log_freq == 0:
                 elapsed = time.time() - start_time
-                fps = global_step / elapsed
+                fps = (global_step - starting_global_step) / elapsed
 
                 # TensorBoard logging
                 writer.add_scalar("charts/learning_rate", lr, global_step)
