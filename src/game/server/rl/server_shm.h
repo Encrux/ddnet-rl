@@ -19,8 +19,8 @@ public:
 	CServerShm();
 	~CServerShm();
 
-	// Initialize shared memory for N bots
-	bool Init(int NumBots);
+	// Initialize shared memory for N bots (ServerIndex for multi-server setups)
+	bool Init(int NumBots, int ServerIndex = 0);
 	void Shutdown();
 
 	// Check if initialized

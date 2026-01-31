@@ -33,6 +33,7 @@ CBotManager::CBotManager(CGameContext *pGameContext) :
 	m_FrameSkipCounter(0),
 	m_AllowPause(true),
 	m_WasPaused(false),
+	m_ShouldSignalObservations(false),
 	m_TotalTicks(0),
 	m_MissedActions(0),
 	m_ConsecutiveMisses(0),
@@ -51,7 +52,7 @@ CBotManager::~CBotManager()
 	Shutdown();
 }
 
-bool CBotManager::Init(int NumBots)
+bool CBotManager::Init(int NumBots, int ServerIndex)
 {
 	if(m_Enabled)
 	{
@@ -70,7 +71,7 @@ bool CBotManager::Init(int NumBots)
 
 	// Initialize shared memory
 	m_pShm = std::make_unique<CServerShm>();
-	if(!m_pShm->Init(NumBots))
+	if(!m_pShm->Init(NumBots, ServerIndex))
 	{
 		dbg_msg("rl/bots", "Failed to initialize shared memory");
 		m_pShm.reset();
@@ -299,6 +300,8 @@ void CBotManager::Tick()
 		m_ConsecutiveMisses++;
 		if(m_ConsecutiveMisses > m_MaxConsecutiveMisses)
 			m_MaxConsecutiveMisses = m_ConsecutiveMisses;
+		// Mark that we should NOT signal observations this tick
+		m_ShouldSignalObservations = false;
 		return;
 	}
 
@@ -316,10 +319,13 @@ void CBotManager::Tick()
 	// Inject inputs
 	InjectBotInputs();
 
-	// Clear action ready flag
-	m_pShm->ClearActionsReady();
+	// Clear action ready flag (but not server_ready - we'll set that after observations)
+	SServerRLHeader *pHeader = m_pShm->GetHeader();
+	if(pHeader)
+		pHeader->m_PythonReady = 0;
 
-	// Extract observations after physics update (will be called after world tick)
+	// Mark that we should signal observations after ExtractObservations
+	m_ShouldSignalObservations = true;
 }
 
 void CBotManager::InjectBotInputs()
@@ -552,8 +558,9 @@ void CBotManager::ExtractObservations()
 		}
 	}
 
-	// Only signal observations on decision ticks
-	if(IsDecisionTick)
+	// Only signal observations when we actually processed new actions from Python
+	// This prevents overwriting observations while Python is still reading
+	if(IsDecisionTick && m_ShouldSignalObservations)
 	{
 		// Update header tick
 		SServerRLHeader *pHeader = m_pShm->GetHeader();
@@ -564,6 +571,7 @@ void CBotManager::ExtractObservations()
 
 		// Signal observations are ready
 		m_pShm->SignalObservationsReady();
+		m_ShouldSignalObservations = false;  // Reset until next successful action read
 	}
 
 	m_LastTick = CurrentTick;

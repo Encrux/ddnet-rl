@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 namespace rl {
 
@@ -19,7 +20,7 @@ namespace rl {
 // Configuration Constants
 // ============================================================================
 
-constexpr int MAX_RL_BOTS = 64;
+constexpr int MAX_RL_BOTS = 128;
 
 // Maximum number of other players to track per bot
 constexpr int MAX_OTHER_PLAYERS = 15;
@@ -263,15 +264,22 @@ struct SServerRLSharedMemory
 // ============================================================================
 
 // Name for shm_open (without /dev/shm prefix)
-inline const char* GetServerRLShmName()
+// ServerIndex allows multiple servers to run in parallel
+inline void GetServerRLShmName(char *pBuf, size_t BufSize, int ServerIndex = 0)
 {
-	return "/ddnet_rl_server";
+	if(ServerIndex == 0)
+		snprintf(pBuf, BufSize, "/ddnet_rl_server");
+	else
+		snprintf(pBuf, BufSize, "/ddnet_rl_server_%d", ServerIndex);
 }
 
 // Full path for Python (with /dev/shm prefix)
-inline const char* GetServerRLShmPath()
+inline void GetServerRLShmPath(char *pBuf, size_t BufSize, int ServerIndex = 0)
 {
-	return "/dev/shm/ddnet_rl_server";
+	if(ServerIndex == 0)
+		snprintf(pBuf, BufSize, "/dev/shm/ddnet_rl_server");
+	else
+		snprintf(pBuf, BufSize, "/dev/shm/ddnet_rl_server_%d", ServerIndex);
 }
 
 inline size_t GetServerRLShmSize()

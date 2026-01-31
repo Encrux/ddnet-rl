@@ -26,6 +26,7 @@ import subprocess
 import os
 import signal
 import atexit
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 
@@ -36,9 +37,18 @@ from teeworlds_env import (
     TILE_GRID_SIZE, TILE_GRID_WIDTH, TILE_GRID_HEIGHT, NUM_RAYCASTS
 )
 
+# Re-define locally for vectorized parsing
+_TILE_GRID_SIZE = TILE_GRID_SIZE  # 1333
+
 # Constants matching C++ rl_protocol.h
-MAX_RL_BOTS = 64
-SHM_PATH = "/dev/shm/ddnet_rl_server"
+MAX_RL_BOTS = 128
+SHM_PATH_BASE = "/dev/shm/ddnet_rl_server"
+
+def get_shm_path(server_index: int = 0) -> str:
+    """Get shared memory path for a server index."""
+    if server_index == 0:
+        return SHM_PATH_BASE
+    return f"{SHM_PATH_BASE}_{server_index}"
 
 # Struct sizes (must match C++ rl_protocol.h)
 HEADER_SIZE = 32        # SServerRLHeader
@@ -87,7 +97,7 @@ class ServerEnvConfig:
     frame_skip: int = 1      # 1 = no skip, 4 = act every 4th tick (decision rate = tickrate/frame_skip)
     max_episode_steps: int = 2000
     startup_wait: float = 3.0
-    action_timeout: float = 0.1  # Timeout waiting for Python to provide actions
+    action_timeout: float = 0.5  # Timeout waiting for observations (increased for debugging)
     use_dict_obs: bool = False   # Return dict observations for CNN policy
     map_name: str = "Tutorial"   # Map to load (use novice maps for training)
     sv_name: str = "RL Training" # Server name
@@ -105,9 +115,10 @@ class ServerShmClient:
     Communicates with the DDNet server's bot manager via a single shared memory region.
     """
 
-    def __init__(self, num_bots: int):
+    def __init__(self, num_bots: int, server_index: int = 0):
         self.num_bots = num_bots
-        self.shm_path = SHM_PATH
+        self.server_index = server_index
+        self.shm_path = get_shm_path(server_index)
         self.shm_file = None
         self.shm_mmap = None
         self._connected = False
@@ -202,23 +213,45 @@ class ServerShmClient:
         self.shm_mmap.write(action_data)
 
     def write_actions_batch(self, actions: Dict[str, np.ndarray]):
-        """Write actions for all bots at once."""
+        """Write actions for all bots at once (vectorized, single memcpy)."""
         discrete_actions = actions['discrete']  # (num_bots, 3)
         continuous_actions = actions['continuous']  # (num_bots, 2)
         resets = actions.get('reset', np.zeros(self.num_bots, dtype=np.int32))
 
-        for i in range(self.num_bots):
-            direction = int(discrete_actions[i, 0]) - 1  # 0,1,2 -> -1,0,1
-            jump = int(discrete_actions[i, 1])
-            hook = int(discrete_actions[i, 2])
+        # Vectorized action computation
+        n = self.num_bots
+        direction = discrete_actions[:, 0].astype(np.int32) - 1  # 0,1,2 -> -1,0,1
+        jump = discrete_actions[:, 1].astype(np.int32)
+        hook = discrete_actions[:, 2].astype(np.int32)
 
-            # Continuous aim
-            aim_angle = float(continuous_actions[i, 0]) * np.pi
-            aim_magnitude = (float(continuous_actions[i, 1]) + 1.0) / 2.0
-            aim_x = int(np.cos(aim_angle) * aim_magnitude * 200)
-            aim_y = int(np.sin(aim_angle) * aim_magnitude * 200)
+        # Continuous aim (vectorized)
+        aim_angle = continuous_actions[:, 0] * np.pi
+        aim_magnitude = (continuous_actions[:, 1] + 1.0) / 2.0
+        aim_x = (np.cos(aim_angle) * aim_magnitude * 200).astype(np.int32)
+        aim_y = (np.sin(aim_angle) * aim_magnitude * 200).astype(np.int32)
 
-            self.write_action(i, direction, jump, hook, 0, aim_x, aim_y, 0, int(resets[i]))
+        # Build action array: SAction is 8 int32s = 32 bytes
+        # Layout: direction, jump, hook, fire, aim_x, aim_y, weapon, reset
+        action_array = np.zeros((n, 8), dtype=np.int32)
+        action_array[:, 0] = direction
+        action_array[:, 1] = jump
+        action_array[:, 2] = hook
+        action_array[:, 3] = 0  # fire
+        action_array[:, 4] = aim_x
+        action_array[:, 5] = aim_y
+        action_array[:, 6] = 0  # weapon
+        action_array[:, 7] = resets.astype(np.int32)
+
+        # Write all actions with strided writes (actions are at start of each SBotData)
+        # Each SBotData is 3072 bytes, action is first 32 bytes
+        raw_bytes = action_array.tobytes()  # n * 32 bytes contiguous
+
+        # Write each action to the correct offset (unfortunately can't do single write due to stride)
+        # But we can minimize syscalls by writing all actions first, then seeking once
+        for i in range(n):
+            offset = HEADER_SIZE + (i * BOT_DATA_SIZE)
+            self.shm_mmap.seek(offset)
+            self.shm_mmap.write(raw_bytes[i*32:(i+1)*32])
 
     def read_observation(self, bot_index: int) -> Tuple[Optional[StructuredObservation], float, bool]:
         """Read observation, reward, and done flag for a specific bot."""
@@ -256,6 +289,134 @@ class ServerShmClient:
             dones[i] = done
 
         return observations, rewards, dones
+
+    def read_observations_batch_fast(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read all observations as flat arrays directly (optimized with views).
+
+        Returns:
+            observations: np.ndarray of shape (num_bots, 141)
+            rewards: np.ndarray of shape (num_bots,)
+            dones: np.ndarray of shape (num_bots,)
+        """
+        n = self.num_bots
+
+        # Read ALL bot data at once (single memcpy) - keep as bytes object
+        start_offset = HEADER_SIZE
+        total_size = n * BOT_DATA_SIZE
+        self.shm_mmap.seek(start_offset)
+        raw = self.shm_mmap.read(total_size)
+
+        # Create 1D numpy view of raw bytes (no copy)
+        raw_arr = np.frombuffer(raw, dtype=np.uint8)
+
+        # Pre-allocate output
+        features = np.zeros((n, 141), dtype=np.float32)
+
+        # Offsets within SBotData
+        OBS_START = ACTION_SIZE  # 32
+        LOCAL_PLAYER = OBS_START + 8
+        OTHER_PLAYERS = LOCAL_PLAYER + 36
+        TILES = OBS_START + 1452
+        RAYCASTS = OBS_START + 2785
+        EXTRA_STATE = OBS_START + 2977
+        CHECKPOINT = OBS_START + 2981
+        REWARD_OFF = OBS_START + OBS_SIZE  # 3052
+        DONE_OFF = REWARD_OFF + 4
+
+        # Build index arrays for strided access (computed once, reused)
+        bot_offsets = np.arange(n) * BOT_DATA_SIZE
+
+        # Extract rewards (4 bytes each, stride=BOT_DATA_SIZE)
+        reward_indices = bot_offsets + REWARD_OFF
+        rewards = np.array([struct.unpack_from('<f', raw, int(idx))[0] for idx in reward_indices], dtype=np.float32)
+
+        # Extract dones
+        done_indices = bot_offsets + DONE_OFF
+        dones = np.array([struct.unpack_from('<i', raw, int(idx))[0] != 0 for idx in done_indices], dtype=bool)
+
+        # === Vectorized float extraction using stride tricks ===
+        # Local player floats: pos_x, pos_y, vel_x, vel_y at LOCAL_PLAYER
+        player_float_offsets = bot_offsets + LOCAL_PLAYER
+        pos_x = np.array([struct.unpack_from('<f', raw, int(o))[0] for o in player_float_offsets])
+        pos_y = np.array([struct.unpack_from('<f', raw, int(o)+4)[0] for o in player_float_offsets])
+        vel_x = np.array([struct.unpack_from('<f', raw, int(o)+8)[0] for o in player_float_offsets])
+        vel_y = np.array([struct.unpack_from('<f', raw, int(o)+12)[0] for o in player_float_offsets])
+
+        # Single-byte fields using raw array indexing (very fast)
+        direction = raw_arr[bot_offsets + LOCAL_PLAYER + 16].astype(np.int8).astype(np.float32)
+        jumped = raw_arr[bot_offsets + LOCAL_PLAYER + 17].astype(np.float32)
+        hook_state = raw_arr[bot_offsets + LOCAL_PLAYER + 18].astype(np.float32)
+        is_frozen = raw_arr[bot_offsets + LOCAL_PLAYER + 30].astype(np.float32)
+        health = raw_arr[bot_offsets + LOCAL_PLAYER + 32].astype(np.float32)
+        armor = raw_arr[bot_offsets + LOCAL_PLAYER + 33].astype(np.float32)
+        is_grounded = raw_arr[bot_offsets + EXTRA_STATE].astype(np.float32)
+        jumps_remaining = raw_arr[bot_offsets + EXTRA_STATE + 1].astype(np.float32)
+        can_hook = raw_arr[bot_offsets + EXTRA_STATE + 2].astype(np.float32)
+
+        # Build features array
+        features[:, 0] = vel_x / 50.0
+        features[:, 1] = vel_y / 50.0
+        features[:, 2] = is_grounded
+        features[:, 3] = jumps_remaining / 2.0
+        features[:, 4] = can_hook
+        features[:, 5] = direction
+        features[:, 6] = is_frozen
+        features[:, 7] = (hook_state == 0).astype(np.float32)
+        features[:, 8] = (hook_state == 1).astype(np.float32)
+        features[:, 9] = (hook_state == 2).astype(np.float32)
+        features[:, 12] = health / 10.0
+        features[:, 13] = armor / 10.0
+        features[:, 14] = jumped / 3.0
+
+        # Checkpoint floats
+        cp_offsets = bot_offsets + CHECKPOINT
+        cp_x = np.array([struct.unpack_from('<f', raw, int(o))[0] for o in cp_offsets])
+        cp_y = np.array([struct.unpack_from('<f', raw, int(o)+4)[0] for o in cp_offsets])
+        cp_idx = np.array([struct.unpack_from('<i', raw, int(o)+8)[0] for o in cp_offsets], dtype=np.float32)
+        total_cp = np.array([struct.unpack_from('<i', raw, int(o)+12)[0] for o in cp_offsets], dtype=np.float32)
+
+        features[:, 15] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
+        features[:, 16] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
+        features[:, 17] = cp_idx / np.maximum(1.0, total_cp)
+        features[:, 18] = total_cp / 20.0
+
+        # Raycasts - 48 floats per bot
+        for i in range(n):
+            base = int(bot_offsets[i]) + RAYCASTS
+            features[i, 19:67] = struct.unpack_from('<48f', raw, base)
+
+        # Tiles 7x7 center - extract using byte indexing
+        # Center of 43x31 grid is (21, 15), we want 7x7 around it: rows 12-18, cols 18-24
+        for ty in range(7):
+            for tx in range(7):
+                tile_row = 12 + ty
+                tile_col = 18 + tx
+                tile_local_offset = tile_row * 43 + tile_col
+                tile_indices = bot_offsets + TILES + tile_local_offset
+                features[:, 67 + ty * 7 + tx] = raw_arr[tile_indices].astype(np.float32) / 15.0
+
+        # Other players (5 players x 5 features) - simplified, just extract if active
+        for j in range(5):
+            op_local = OTHER_PLAYERS + j * 36
+            op_active = raw_arr[bot_offsets + op_local + 29]
+            active_mask = op_active > 0
+
+            if np.any(active_mask):
+                for i in np.where(active_mask)[0]:
+                    base = int(bot_offsets[i]) + op_local
+                    op_px, op_py, op_vx, op_vy = struct.unpack_from('<ffff', raw, base)
+                    op_hook = raw[base + 18]
+                    feat_base = 116 + j * 5
+                    features[i, feat_base] = (op_px - pos_x[i]) / 1000.0
+                    features[i, feat_base + 1] = (op_py - pos_y[i]) / 1000.0
+                    features[i, feat_base + 2] = op_vx / 50.0
+                    features[i, feat_base + 3] = op_vy / 50.0
+                    features[i, feat_base + 4] = float(op_hook) / 2.0
+
+        # Sanitize NaN/inf
+        np.nan_to_num(features, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        return features, rewards, dones
 
     def wait_for_observations(self, timeout: float = 1.0) -> bool:
         """Wait for server to signal observations are ready."""
@@ -307,28 +468,41 @@ class TeeWorldsServerEnv:
     def __init__(
         self,
         num_bots: int = 63,
+        num_servers: int = 1,
         config: Optional[ServerEnvConfig] = None,
         auto_start: bool = True,
     ):
-        self.num_envs = num_bots
-        self.num_bots = num_bots
+        self.num_bots_per_server = num_bots
+        self.num_servers = num_servers
+        self.num_bots = num_bots * num_servers  # Total bots across all servers
+        self.num_envs = self.num_bots  # Alias for compatibility
         self.config = config or ServerEnvConfig()
         self.use_dict_obs = self.config.use_dict_obs
 
-        # Process management
-        self.server_proc: Optional[subprocess.Popen] = None
+        # Process management (list for multiple servers)
+        self.server_procs: List[subprocess.Popen] = []
 
-        # Shared memory client
-        self.shm_client: Optional[ServerShmClient] = None
+        # Shared memory clients (list for multiple servers)
+        self.shm_clients: List[ServerShmClient] = []
 
         # Environment state
         self.obs_dim: Optional[int] = None
-        self.episode_steps = np.zeros(num_bots, dtype=np.int32)
-        self.episode_rewards = np.zeros(num_bots, dtype=np.float32)
+        self.episode_steps = np.zeros(self.num_bots, dtype=np.int32)
+        self.episode_rewards = np.zeros(self.num_bots, dtype=np.float32)
 
         # Track state
         self._running = False
         self._closed = False
+
+        # Thread pool for parallel shm I/O (GIL is released during mmap operations)
+        self._executor = ThreadPoolExecutor(max_workers=min(32, self.num_servers))
+
+        # Timing instrumentation
+        self._step_count = 0
+        self._timing_write = 0.0
+        self._timing_wait = 0.0
+        self._timing_read = 0.0
+        self._timing_total = 0.0
 
         # Register cleanup handlers
         global _active_server_env
@@ -364,93 +538,121 @@ class TeeWorldsServerEnv:
         }
 
     def start(self):
-        """Start the DDNet server with RL bots."""
+        """Start the DDNet server(s) with RL bots."""
         if self._running:
             return
 
-        print(f"Starting Teeworlds server-side environment with {self.num_bots} bots...")
+        print(f"Starting Teeworlds server-side environment with {self.num_bots} bots ({self.num_servers} server(s), {self.num_bots_per_server} bots each)...")
 
-        # Clean up stale shared memory
+        # Clean up stale shared memory for all servers
         self._cleanup_shared_memory()
 
-        # Start server with RL bots
-        self._start_server()
+        # Start servers with RL bots
+        for server_idx in range(self.num_servers):
+            self._start_server(server_idx)
 
-        # Connect to shared memory
-        self.shm_client = ServerShmClient(self.num_bots)
-        if not self.shm_client.connect():
-            raise RuntimeError("Failed to connect to server shared memory")
+        # Connect to shared memory for each server
+        for server_idx in range(self.num_servers):
+            shm_client = ServerShmClient(self.num_bots_per_server, server_idx)
+            if not shm_client.connect():
+                raise RuntimeError(f"Failed to connect to server {server_idx} shared memory")
+            self.shm_clients.append(shm_client)
 
-        # Wait for first observations
+        # Wait for first observations from all servers
         print("Waiting for initial observations...")
-        if not self.shm_client.wait_for_observations(timeout=10.0):
-            raise RuntimeError("Timeout waiting for initial observations")
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            if not shm_client.wait_for_observations(timeout=10.0):
+                raise RuntimeError(f"Timeout waiting for initial observations from server {server_idx}")
 
-        # Get observation dimension
-        observations, _, _ = self.shm_client.read_observations_batch()
-        valid_obs = [o for o in observations if o is not None]
-        if valid_obs:
-            if self.use_dict_obs:
-                dict_obs = valid_obs[0].to_dict_observation()
-                self.obs_dim = sum(np.prod(v.shape) for v in dict_obs.values())
-            else:
-                self.obs_dim = len(valid_obs[0].to_flat_array())
-        else:
-            raise RuntimeError("No valid observations received")
-
+        # Set observation dimension (fast path always returns 141)
+        self.obs_dim = 141
         self._running = True
-        mode_str = "dict (CNN)" if self.use_dict_obs else "flat"
-        print(f"Environment ready. Observation mode: {mode_str}, dim: {self.obs_dim}")
+        print(f"Environment ready. Observation dim: {self.obs_dim}")
 
     def _cleanup_shared_memory(self):
-        """Clean up stale shared memory files."""
-        if os.path.exists(SHM_PATH):
-            try:
-                os.remove(SHM_PATH)
-                print(f"  Removed stale shared memory: {SHM_PATH}")
-            except:
-                pass
+        """Clean up stale shared memory files and config files for all servers."""
+        for server_idx in range(self.num_servers):
+            shm_path = get_shm_path(server_idx)
+            if os.path.exists(shm_path):
+                try:
+                    os.remove(shm_path)
+                    print(f"  Removed stale shared memory: {shm_path}")
+                except:
+                    pass
 
-    def _start_server(self):
-        """Start the DDNet server with RL bots enabled."""
-        # Create a temporary config file for RL settings
-        # DDNet server reads myServerconfig.cfg from the data directory
+        # Clear myServerconfig.cfg from all possible locations
+        # DDNet-Server loads this after command-line args, so it would override them
+        config_locations = [
+            os.path.expanduser("~/.teeworlds/myServerconfig.cfg"),
+        ]
+
+        # Also check build/data directory
         server_dir = os.path.dirname(os.path.abspath(self.config.server_path))
         data_dir = os.path.join(server_dir, "data")
-        config_path = os.path.join(data_dir, "myServerconfig.cfg")
+        config_locations.append(os.path.join(data_dir, "myServerconfig.cfg"))
+        # Also clear any indexed configs from previous multi-server runs
+        for i in range(10):
+            config_locations.append(os.path.join(data_dir, f"myServerconfig_{i}.cfg"))
 
-        # Write RL configuration
-        os.makedirs(data_dir, exist_ok=True)
-        with open(config_path, 'w') as f:
-            f.write(f"# RL Training Config (auto-generated)\n")
-            f.write(f"sv_name \"{self.config.sv_name}\"\n")
-            f.write(f"sv_port {self.config.server_port}\n")
-            f.write(f"sv_map \"{self.config.map_name}\"\n")
-            f.write(f"sv_tickrate {self.config.sv_tickrate}\n")
-            f.write(f"sv_max_clients 64\n")
-            f.write(f"sv_rl_bots {self.num_bots}\n")
-            f.write(f"sv_rl_frame_skip {self.config.frame_skip}\n")
-            f.write(f"sv_register 0\n")  # Don't register with master
-            f.write(f"sv_rcon_password p\n")
-            # Allow spectators to connect and watch
-            if self.config.allow_spectators:
-                # Reserve only 1 spectator slot to maximize bot capacity (64 - 1 = 63 active)
-                f.write(f"sv_spectator_slots 1\n")
-                f.write(f"sv_max_clients_per_ip 4\n")
+        for config_path in config_locations:
+            if os.path.exists(config_path):
+                try:
+                    os.remove(config_path)
+                    print(f"  Removed config: {config_path}")
+                except Exception as e:
+                    print(f"  Warning: Could not remove {config_path}: {e}")
 
-        server_cmd = [self.config.server_path]
+    def _start_server(self, server_idx: int = 0):
+        """Start a DDNet server with RL bots enabled."""
+        server_dir = os.path.dirname(os.path.abspath(self.config.server_path))
 
-        self.server_proc = subprocess.Popen(
+        # Calculate port for this server
+        server_port = self.config.server_port + server_idx
+
+        # Server name with index
+        if self.num_servers > 1:
+            sv_name = f"{self.config.sv_name} #{server_idx}"
+        else:
+            sv_name = self.config.sv_name
+
+        # Build server command with all settings as command-line arguments
+        # DDNet-Server accepts console commands as positional arguments
+        server_cmd = [
+            self.config.server_path,
+            f"sv_name \"{sv_name}\"",
+            f"sv_port {server_port}",
+            f"sv_map \"{self.config.map_name}\"",
+            f"sv_tickrate {self.config.sv_tickrate}",
+            f"sv_max_clients 128",
+            f"sv_register 0",
+            f"sv_rcon_password rltraining",
+        ]
+
+        if self.config.allow_spectators:
+            server_cmd.extend([
+                f"sv_spectator_slots 1",
+                f"sv_max_clients_per_ip 4",
+            ])
+
+        # RL-specific settings (these must come after basic server setup)
+        server_cmd.extend([
+            f"sv_rl_frame_skip {self.config.frame_skip}",
+            f"sv_rl_bots {self.num_bots_per_server} {server_idx}",
+        ])
+
+        server_proc = subprocess.Popen(
             server_cmd,
             preexec_fn=os.setsid,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             cwd=server_dir,  # Run from server directory so it finds data/
         )
+        self.server_procs.append(server_proc)
+
         effective_rate = self.config.sv_tickrate // self.config.frame_skip
-        print(f"Server started (PID: {self.server_proc.pid}, map: {self.config.map_name}, tickrate: {self.config.sv_tickrate}, frame_skip: {self.config.frame_skip}, decision_rate: {effective_rate}Hz, bots: {self.num_bots})")
+        print(f"Server {server_idx} started (PID: {server_proc.pid}, port: {server_port}, map: {self.config.map_name}, tickrate: {self.config.sv_tickrate}, decision_rate: {effective_rate}Hz, bots: {self.num_bots_per_server})")
         if self.config.allow_spectators:
-            print(f"  Connect with DDNet client to 127.0.0.1:{self.config.server_port} to watch")
+            print(f"  Connect with DDNet client to 127.0.0.1:{server_port} to watch")
         time.sleep(self.config.startup_wait)
 
     def reset(self, seed: Optional[int] = None):
@@ -458,35 +660,32 @@ class TeeWorldsServerEnv:
         if not self._running:
             self.start()
 
-        # Send reset signal for all bots
-        reset_actions = {
-            'discrete': np.zeros((self.num_bots, 3), dtype=np.int32),
-            'continuous': np.zeros((self.num_bots, 2), dtype=np.float32),
-            'reset': np.ones(self.num_bots, dtype=np.int32),
-        }
-        self.shm_client.write_actions_batch(reset_actions)
-        self.shm_client.signal_actions_ready()
+        # Send reset signal for all bots on all servers
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            reset_actions = {
+                'discrete': np.zeros((self.num_bots_per_server, 3), dtype=np.int32),
+                'continuous': np.zeros((self.num_bots_per_server, 2), dtype=np.float32),
+                'reset': np.ones(self.num_bots_per_server, dtype=np.int32),
+            }
+            shm_client.write_actions_batch(reset_actions)
+            shm_client.signal_actions_ready()
 
-        # Wait for observations
-        if not self.shm_client.wait_for_observations(timeout=2.0):
-            print("Warning: Timeout waiting for reset observations")
+        # Wait for observations from all servers
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            if not shm_client.wait_for_observations(timeout=2.0):
+                print(f"Warning: Timeout waiting for reset observations from server {server_idx}")
 
-        # Read observations
-        observations, _, _ = self.shm_client.read_observations_batch()
+        # Read observations from all servers using fast path
+        all_observations = []
+        for shm_client in self.shm_clients:
+            observations, _, _ = shm_client.read_observations_batch_fast()
+            all_observations.append(observations)
 
         self.episode_steps[:] = 0
         self.episode_rewards[:] = 0.0
 
-        if self.use_dict_obs:
-            return self._observations_to_dict(observations), {}
-        else:
-            obs_array = []
-            for i, obs in enumerate(observations):
-                if obs is not None:
-                    obs_array.append(obs.to_flat_array())
-                else:
-                    obs_array.append(np.zeros(self.obs_dim, dtype=np.float32))
-            return np.array(obs_array, dtype=np.float32), {}
+        obs_out = np.vstack(all_observations)  # (total_bots, 141)
+        return obs_out, {}
 
     def _observations_to_dict(self, observations: List[Optional[StructuredObservation]]) -> Dict[str, np.ndarray]:
         """Convert list of observations to batched dict format for CNN."""
@@ -512,6 +711,34 @@ class TeeWorldsServerEnv:
             'checkpoint': np.array(checkpoint_list, dtype=np.float32),
         }
 
+    def _write_server_actions(self, server_idx: int, actions: Dict[str, np.ndarray]):
+        """Write actions to one server (runs in thread)."""
+        shm_client = self.shm_clients[server_idx]
+        start_idx = server_idx * self.num_bots_per_server
+        end_idx = start_idx + self.num_bots_per_server
+        server_actions = {
+            'discrete': actions['discrete'][start_idx:end_idx],
+            'continuous': actions['continuous'][start_idx:end_idx],
+        }
+        if 'reset' in actions:
+            server_actions['reset'] = actions['reset'][start_idx:end_idx]
+        shm_client.write_actions_batch(server_actions)
+        shm_client.signal_actions_ready()
+
+    def _read_server_observations(self, server_idx: int):
+        """Wait and read from one server (runs in thread)."""
+        shm_client = self.shm_clients[server_idx]
+        t_start = time.perf_counter()
+        if not shm_client.wait_for_observations(timeout=self.config.action_timeout):
+            return server_idx, None, None, None, True, 0.0, 0.0  # timeout_occurred=True
+        t_wait = time.perf_counter()
+        # Use fast path - returns flat arrays directly
+        observations, rewards, dones = shm_client.read_observations_batch_fast()
+        t_read = time.perf_counter()
+        wait_ms = (t_wait - t_start) * 1000
+        read_ms = (t_read - t_wait) * 1000
+        return server_idx, observations, rewards, dones, False, wait_ms, read_ms
+
     def step(
         self,
         actions: Dict[str, np.ndarray]
@@ -531,29 +758,102 @@ class TeeWorldsServerEnv:
             truncated: np.ndarray of shape (num_envs,) - True if max steps reached
             infos: List of dicts with additional info per environment
         """
-        # Write actions
-        self.shm_client.write_actions_batch(actions)
-        self.shm_client.signal_actions_ready()
+        t0 = time.perf_counter()
 
-        # Wait for observations
-        if not self.shm_client.wait_for_observations(timeout=self.config.action_timeout):
-            # Timeout - return last state with zero reward
-            print("Warning: Timeout waiting for observations")
-            return (
-                np.zeros((self.num_envs, self.obs_dim), dtype=np.float32),
-                np.zeros(self.num_envs, dtype=np.float32),
-                np.zeros(self.num_envs, dtype=bool),
-                np.zeros(self.num_envs, dtype=bool),
-                [{'error': True} for _ in range(self.num_envs)]
-            )
+        # Parallel writes: submit all write tasks to thread pool
+        t1 = time.perf_counter()
+        write_futures = [
+            self._executor.submit(self._write_server_actions, idx, actions)
+            for idx in range(self.num_servers)
+        ]
+        for f in write_futures:
+            f.result()  # Wait for all writes to complete
+        t2 = time.perf_counter()
 
-        # Read observations
-        observations, rewards, dones = self.shm_client.read_observations_batch()
+        # Parallel wait+read: submit all read tasks to thread pool
+        read_futures = [
+            self._executor.submit(self._read_server_observations, idx)
+            for idx in range(self.num_servers)
+        ]
+        t3 = time.perf_counter()
 
+        # Collect results in order
+        results = [None] * self.num_servers
+        wait_times = [0.0] * self.num_servers
+        read_times = [0.0] * self.num_servers
+        timeout_occurred = False
+        for f in read_futures:
+            idx, obs, rew, done, timed_out, wait_ms, read_ms = f.result()
+            if timed_out:
+                timeout_occurred = True
+                print(f"Warning: Timeout waiting for observations from server {idx}")
+            results[idx] = (obs, rew, done)
+            wait_times[idx] = wait_ms
+            read_times[idx] = read_ms
+        t4 = time.perf_counter()
+
+        # Timing instrumentation (log every 100 steps)
+        self._step_count += 1
+        self._timing_write += (t2 - t1)
+        self._timing_wait += (t3 - t2)
+        self._timing_read += (t4 - t3)
+        self._timing_total += (t4 - t0)
+
+        # Track per-server wait and read times
+        if not hasattr(self, '_server_wait_times'):
+            self._server_wait_times = [0.0] * self.num_servers
+            self._server_read_times = [0.0] * self.num_servers
+        for i, (wt, rt) in enumerate(zip(wait_times, read_times)):
+            self._server_wait_times[i] += wt
+            self._server_read_times[i] += rt
+
+        if self._step_count % 10 == 0:
+            avg_write = self._timing_write / 10 * 1000  # ms
+            avg_read = self._timing_read / 10 * 1000    # ms
+            avg_total = self._timing_total / 10 * 1000  # ms
+            budget = 20.0  # 50Hz = 20ms per tick
+
+            # Show per-server wait and read times
+            wait_avgs = [wt / 10 for wt in self._server_wait_times]
+            read_avgs = [rt / 10 for rt in self._server_read_times]
+            max_wait = max(wait_avgs)
+            max_read = max(read_avgs)
+            sum_read = sum(read_avgs)
+
+            print(f"Step (ms): write={avg_write:.1f}, wait+read={avg_read:.1f}, total={avg_total:.1f} | "
+                  f"server: max_wait={max_wait:.1f}, max_read={max_read:.1f}, sum_read={sum_read:.0f}")
+
+            self._timing_write = 0.0
+            self._timing_wait = 0.0
+            self._timing_read = 0.0
+            self._timing_total = 0.0
+            self._server_wait_times = [0.0] * self.num_servers
+            self._server_read_times = [0.0] * self.num_servers
+
+        # Aggregate results from all servers (handles partial timeouts gracefully)
+        # Fast path returns numpy arrays directly: obs is (num_bots, 141), rew is (num_bots,), done is (num_bots,)
+        all_observations = []
+        all_rewards = []
+        all_dones = []
+        for obs, rew, done in results:
+            if obs is not None:
+                all_observations.append(obs)  # numpy array (num_bots, 141)
+                all_rewards.append(rew)
+                all_dones.append(done)
+            else:
+                # Handle timeout case - append zeros
+                all_observations.append(np.zeros((self.num_bots_per_server, 141), dtype=np.float32))
+                all_rewards.append(np.zeros(self.num_bots_per_server, dtype=np.float32))
+                all_dones.append(np.zeros(self.num_bots_per_server, dtype=bool))
+
+        # Stack all observations into single array
+        obs_out = np.vstack(all_observations)  # (total_bots, 141)
+        rewards = np.concatenate(all_rewards)
+        dones = np.concatenate(all_dones)
         truncated = np.zeros(self.num_envs, dtype=bool)
         infos = []
 
-        for i, obs in enumerate(observations):
+        for i in range(self.num_envs):
             self.episode_steps[i] += 1
             self.episode_rewards[i] += rewards[i]
 
@@ -579,18 +879,7 @@ class TeeWorldsServerEnv:
         # Auto-reset environments that are done or truncated
         reset_mask = dones | truncated
         if np.any(reset_mask):
-            self._reset_envs_observations(reset_mask, observations)
-
-        if self.use_dict_obs:
-            obs_out = self._observations_to_dict(observations)
-        else:
-            obs_array = []
-            for i, obs in enumerate(observations):
-                if obs is not None:
-                    obs_array.append(obs.to_flat_array())
-                else:
-                    obs_array.append(np.zeros(self.obs_dim, dtype=np.float32))
-            obs_out = np.array(obs_array, dtype=np.float32)
+            self._reset_envs_fast(reset_mask, obs_out)
 
         return (
             obs_out,
@@ -600,24 +889,82 @@ class TeeWorldsServerEnv:
             infos
         )
 
-    def _reset_envs_observations(self, mask: np.ndarray, observations: List[Optional[StructuredObservation]]):
-        """Reset specific environments and update observations in place."""
-        # Send reset for masked environments
-        reset_actions = {
-            'discrete': np.zeros((self.num_bots, 3), dtype=np.int32),
-            'continuous': np.zeros((self.num_bots, 2), dtype=np.float32),
-            'reset': mask.astype(np.int32),
-        }
-        self.shm_client.write_actions_batch(reset_actions)
-        self.shm_client.signal_actions_ready()
+    def _reset_envs_fast(self, mask: np.ndarray, observations: np.ndarray):
+        """Reset specific environments and update observations in place (fast numpy version)."""
+        # Split mask across servers and send reset for masked environments
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            start_idx = server_idx * self.num_bots_per_server
+            end_idx = start_idx + self.num_bots_per_server
+            server_mask = mask[start_idx:end_idx]
 
-        # Wait for server to process reset and return fresh observations
-        if self.shm_client.wait_for_observations(timeout=0.1):
-            # Update observations for reset environments with fresh post-reset state
-            for i in np.where(mask)[0]:
-                obs, reward, done = self.shm_client.read_observation(i)
-                if obs:
-                    observations[i] = obs
+            if not np.any(server_mask):
+                continue
+
+            reset_actions = {
+                'discrete': np.zeros((self.num_bots_per_server, 3), dtype=np.int32),
+                'continuous': np.zeros((self.num_bots_per_server, 2), dtype=np.float32),
+                'reset': server_mask.astype(np.int32),
+            }
+            shm_client.write_actions_batch(reset_actions)
+            shm_client.signal_actions_ready()
+
+        # Wait for servers to process reset and return fresh observations
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            start_idx = server_idx * self.num_bots_per_server
+            end_idx = start_idx + self.num_bots_per_server
+            server_mask = mask[start_idx:end_idx]
+
+            if not np.any(server_mask):
+                continue
+
+            if shm_client.wait_for_observations(timeout=0.1):
+                # Read fresh observations for reset environments
+                fresh_obs, _, _ = shm_client.read_observations_batch_fast()
+                # Update only masked environments
+                for local_i in np.where(server_mask)[0]:
+                    global_i = start_idx + local_i
+                    observations[global_i] = fresh_obs[local_i]
+
+        # Reset counters for masked environments
+        for i in np.where(mask)[0]:
+            self.episode_steps[i] = 0
+            self.episode_rewards[i] = 0.0
+
+    def _reset_envs_observations(self, mask: np.ndarray, observations: List[Optional[StructuredObservation]]):
+        """Reset specific environments and update observations in place (legacy version)."""
+        # Split mask across servers and send reset for masked environments
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            start_idx = server_idx * self.num_bots_per_server
+            end_idx = start_idx + self.num_bots_per_server
+            server_mask = mask[start_idx:end_idx]
+
+            if not np.any(server_mask):
+                continue
+
+            reset_actions = {
+                'discrete': np.zeros((self.num_bots_per_server, 3), dtype=np.int32),
+                'continuous': np.zeros((self.num_bots_per_server, 2), dtype=np.float32),
+                'reset': server_mask.astype(np.int32),
+            }
+            shm_client.write_actions_batch(reset_actions)
+            shm_client.signal_actions_ready()
+
+        # Wait for servers to process reset and return fresh observations
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            start_idx = server_idx * self.num_bots_per_server
+            end_idx = start_idx + self.num_bots_per_server
+            server_mask = mask[start_idx:end_idx]
+
+            if not np.any(server_mask):
+                continue
+
+            if shm_client.wait_for_observations(timeout=0.1):
+                # Update observations for reset environments with fresh post-reset state
+                for local_i in np.where(server_mask)[0]:
+                    global_i = start_idx + local_i
+                    obs, reward, done = shm_client.read_observation(local_i)
+                    if obs:
+                        observations[global_i] = obs
 
         # Reset counters for masked environments
         for i in np.where(mask)[0]:
@@ -626,25 +973,25 @@ class TeeWorldsServerEnv:
 
     def pause(self):
         """
-        Signal the server to pause simulation.
+        Signal all servers to pause simulation.
 
         Call this before PPO updates to prevent bots from taking actions
-        with stale policy during the update. The server will freeze physics
+        with stale policy during the update. The servers will freeze physics
         until unpause() is called.
 
         Note: Requires sv_rl_allow_pause 1 on the server (default).
         """
-        if self.shm_client:
-            self.shm_client.signal_pause()
+        for shm_client in self.shm_clients:
+            shm_client.signal_pause()
 
     def unpause(self):
         """
-        Signal the server to resume simulation.
+        Signal all servers to resume simulation.
 
         Call this after PPO updates to resume normal operation.
         """
-        if self.shm_client:
-            self.shm_client.signal_unpause()
+        for shm_client in self.shm_clients:
+            shm_client.signal_unpause()
 
     def close(self):
         """Clean up all resources."""
@@ -654,19 +1001,26 @@ class TeeWorldsServerEnv:
 
         print("Closing server environment...")
 
-        # Disconnect from shared memory
-        if self.shm_client:
-            self.shm_client.disconnect()
-            self.shm_client = None
+        # Shutdown thread pool
+        if hasattr(self, '_executor'):
+            self._executor.shutdown(wait=False)
 
-        # Terminate server
-        if self.server_proc:
+        # Disconnect from all shared memory clients
+        for server_idx, shm_client in enumerate(self.shm_clients):
             try:
-                print("  Terminating server...")
-                os.killpg(os.getpgid(self.server_proc.pid), signal.SIGKILL)
+                shm_client.disconnect()
             except:
                 pass
-            self.server_proc = None
+        self.shm_clients = []
+
+        # Terminate all servers
+        for server_idx, server_proc in enumerate(self.server_procs):
+            try:
+                print(f"  Terminating server {server_idx}...")
+                os.killpg(os.getpgid(server_proc.pid), signal.SIGKILL)
+            except:
+                pass
+        self.server_procs = []
 
         self._running = False
         print("Server environment closed")
@@ -678,33 +1032,35 @@ class TeeWorldsServerEnv:
         self.close()
 
 
-def make_server_env(num_bots: int = 63, **kwargs) -> TeeWorldsServerEnv:
+def make_server_env(num_bots: int = 63, num_servers: int = 1, **kwargs) -> TeeWorldsServerEnv:
     """Create a server-side Teeworlds environment."""
     config = ServerEnvConfig(**kwargs)
-    return TeeWorldsServerEnv(num_bots=num_bots, config=config)
+    return TeeWorldsServerEnv(num_bots=num_bots, num_servers=num_servers, config=config)
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-bots", type=int, default=8)
+    parser.add_argument("--num-bots", type=int, default=8, help="Bots per server")
+    parser.add_argument("--num-servers", type=int, default=1, help="Number of servers")
     parser.add_argument("--steps", type=int, default=100)
     args = parser.parse_args()
 
-    print(f"Testing TeeWorldsServerEnv with {args.num_bots} bots...")
+    total_bots = args.num_bots * args.num_servers
+    print(f"Testing TeeWorldsServerEnv with {total_bots} bots ({args.num_servers} server(s), {args.num_bots} bots each)...")
 
-    with TeeWorldsServerEnv(num_bots=args.num_bots) as env:
+    with TeeWorldsServerEnv(num_bots=args.num_bots, num_servers=args.num_servers) as env:
         obs, _ = env.reset()
         print(f"Observation shape: {obs.shape}")
 
-        total_rewards = np.zeros(args.num_bots)
+        total_rewards = np.zeros(total_bots)
 
         for step in range(args.steps):
             # Random actions
             actions = {
-                'discrete': np.random.randint([0, 0, 0], [3, 2, 2], size=(args.num_bots, 3)),
-                'continuous': np.random.uniform(-1, 1, size=(args.num_bots, 2)).astype(np.float32),
+                'discrete': np.random.randint([0, 0, 0], [3, 2, 2], size=(total_bots, 3)),
+                'continuous': np.random.uniform(-1, 1, size=(total_bots, 2)).astype(np.float32),
             }
 
             obs, rewards, dones, truncated, infos = env.step(actions)

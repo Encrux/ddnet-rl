@@ -45,8 +45,12 @@ def parse_args():
                         help="Frame skip (1=no skip, 4=act every 4th tick)")
     parser.add_argument("--server-side", action="store_true",
                         help="Use server-side bots (much more efficient)")
-    parser.add_argument("--no-sync-inference", action="store_true",
-                        help="Don't pause server during inference (faster but bots may stutter)")
+    parser.add_argument("--num-servers", type=int, default=1,
+                        help="Number of servers (each with --num-envs bots)")
+    parser.add_argument("--sync-inference", action="store_true",
+                        help="Pause server during inference (slower but no stutter)")
+    parser.add_argument("--sync-update", action="store_true",
+                        help="Pause server during PPO update (prevents stale policy actions)")
     parser.add_argument("--map", type=str, default="Tutorial",
                         help="Map to train on (default: Tutorial)")
 
@@ -159,8 +163,12 @@ def main():
 
     # Create environment
     if args.server_side:
-        # Server-side bots (more efficient, single process)
-        print(f"\nCreating SERVER-SIDE environment with {args.num_envs} bots on map '{args.map}'...")
+        # Server-side bots (more efficient, single process per server)
+        total_bots = args.num_envs * args.num_servers
+        if args.num_servers > 1:
+            print(f"\nCreating SERVER-SIDE environment with {total_bots} bots ({args.num_servers} servers, {args.num_envs} bots each) on map '{args.map}'...")
+        else:
+            print(f"\nCreating SERVER-SIDE environment with {args.num_envs} bots on map '{args.map}'...")
         server_config = ServerEnvConfig(
             sv_tickrate=args.sv_tickrate,
             frame_skip=args.frame_skip,
@@ -169,7 +177,9 @@ def main():
             map_name=args.map,
         )
         # Use default server_path (resolved relative to teeworlds_server_env.py)
-        env = TeeWorldsServerEnv(num_bots=args.num_envs, config=server_config)
+        env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)
+        # Update num_envs to reflect total bots for training loop
+        args.num_envs = total_bots
     else:
         # Client-side environments (original approach)
         print(f"\nCreating CLIENT-SIDE environment with {args.num_envs} parallel instances...")
@@ -185,13 +195,19 @@ def main():
     try:
         # Get observation dimension
         obs, _ = env.reset()
-        if args.use_cnn:
-            # Dict observation
+        if isinstance(obs, dict):
+            # Dict observation (CNN mode)
             obs_dim = sum(np.prod(v.shape[1:]) for v in obs.values())
             print(f"Dict observation - tiles: {obs['tiles'].shape}, player: {obs['player_state'].shape}, checkpoint: {obs['checkpoint'].shape}")
         else:
+            # Flat observation (fast path)
             obs_dim = obs.shape[1]
         print(f"Observation dimension: {obs_dim}")
+
+        # Force use_cnn=False for fast path (flat observations)
+        # TODO: Re-enable CNN support with dict observations if needed
+        if args.use_cnn:
+            print("Warning: --use-cnn is not supported with fast observation path, using MLP")
 
         # Create PPO config
         ppo_config = PPOConfig(
@@ -208,7 +224,7 @@ def main():
             target_kl=args.target_kl,
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
-            use_cnn=args.use_cnn,
+            use_cnn=False,  # Always use MLP with fast flat observations
         )
 
         # Create agent
@@ -233,8 +249,9 @@ def main():
             effective_rate = args.sv_tickrate / args.frame_skip
             print(f"Effective decision rate: {effective_rate:.0f} Hz")
         if args.server_side:
-            sync_mode = "sync (pause during inference)" if not args.no_sync_inference else "async (may stutter)"
-            print(f"Inference mode: {sync_mode}")
+            inference_mode = "sync (pause)" if args.sync_inference else "async (no pause)"
+            update_mode = "sync (pause)" if args.sync_update else "async (no pause)"
+            print(f"Inference: {inference_mode}, PPO update: {update_mode}")
         print("-" * 60)
 
         start_time = time.time()
@@ -259,12 +276,11 @@ def main():
             for step in range(args.num_steps):
                 global_step += args.num_envs
 
-                # Get action (pause during inference to prevent bots from repeating stale actions)
-                sync_inference = args.server_side and not args.no_sync_inference
-                if sync_inference:
+                # Get action (optionally pause during inference to prevent stale actions)
+                if args.server_side and args.sync_inference:
                     env.pause()
                 action, log_prob, value = agent.get_action(obs)
-                if sync_inference:
+                if args.server_side and args.sync_inference:
                     env.unpause()
 
                 # Environment step
@@ -281,11 +297,11 @@ def main():
                         episode_rewards.append(info['episode']['r'])
                         episode_lengths.append(info['episode']['l'])
 
-            # PPO update (pause simulation to prevent bots from acting with stale policy)
-            if args.server_side:
+            # PPO update (optionally pause to prevent bots from acting with stale policy)
+            if args.server_side and args.sync_update:
                 env.pause()
             stats = agent.update(obs, done | truncated)
-            if args.server_side:
+            if args.server_side and args.sync_update:
                 env.unpause()
             agent.global_step = global_step
 

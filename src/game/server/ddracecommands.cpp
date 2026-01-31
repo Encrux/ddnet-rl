@@ -605,6 +605,7 @@ void CGameContext::ConRLBots(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;
 	int NumBots = pResult->GetInteger(0);
+	int ServerIndex = pResult->NumArguments() > 1 ? pResult->GetInteger(1) : 0;
 
 	if(NumBots <= 0)
 	{
@@ -638,10 +639,10 @@ void CGameContext::ConRLBots(IConsole::IResult *pResult, void *pUserData)
 	}
 
 	pSelf->m_pBotManager = std::make_unique<rl::CBotManager>(pSelf);
-	if(pSelf->m_pBotManager->Init(NumBots))
+	if(pSelf->m_pBotManager->Init(NumBots, ServerIndex))
 	{
 		char aBuf[128];
-		str_format(aBuf, sizeof(aBuf), "RL bots enabled: %d bots", NumBots);
+		str_format(aBuf, sizeof(aBuf), "RL bots enabled: %d bots (server index %d)", NumBots, ServerIndex);
 		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
 	}
 	else

@@ -30,8 +30,8 @@ public:
 	CBotManager(CGameContext *pGameContext);
 	~CBotManager();
 
-	// Initialize with N bots
-	bool Init(int NumBots);
+	// Initialize with N bots (ServerIndex for multi-server setups)
+	bool Init(int NumBots, int ServerIndex = 0);
 	void Shutdown();
 
 	// Called each server tick
@@ -135,6 +135,9 @@ private:
 	// Pause support
 	bool m_AllowPause;
 	bool m_WasPaused;  // Track pause state transitions for latency reset
+
+	// Sync flag: only signal observations when we actually processed new actions
+	bool m_ShouldSignalObservations;
 
 	// Diagnostic stats
 	int m_TotalTicks;

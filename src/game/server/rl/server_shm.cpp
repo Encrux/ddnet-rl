@@ -28,7 +28,7 @@ CServerShm::~CServerShm()
 	Shutdown();
 }
 
-bool CServerShm::Init(int NumBots)
+bool CServerShm::Init(int NumBots, int ServerIndex)
 {
 	if(m_Initialized)
 	{
@@ -45,8 +45,8 @@ bool CServerShm::Init(int NumBots)
 	m_NumBots = NumBots;
 	m_ShmSize = sizeof(SServerRLSharedMemory);
 
-	// Use fixed name from protocol (shm_open expects name without /dev/shm/)
-	str_copy(m_aShmPath, GetServerRLShmName(), sizeof(m_aShmPath));
+	// Use indexed name from protocol (shm_open expects name without /dev/shm/)
+	GetServerRLShmName(m_aShmPath, sizeof(m_aShmPath), ServerIndex);
 
 	// Remove existing shared memory if it exists
 	shm_unlink(m_aShmPath);

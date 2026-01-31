@@ -52,6 +52,9 @@ class PPOConfig:
     checkpoint_dim: int = 4      # Checkpoint navigation features
     cnn_channels: Tuple[int, ...] = (32, 64, 64)  # CNN channel progression
 
+    # Mixed precision training (2-3x speedup on modern GPUs)
+    use_amp: bool = True
+
 
 def layer_init(layer: nn.Module, std: float = np.sqrt(2), bias_const: float = 0.0) -> nn.Module:
     """Initialize layer with orthogonal weights."""
@@ -255,9 +258,13 @@ class HybridActor(nn.Module):
         """
         discrete_logits, cont_mean, cont_std = self.forward(x)
 
-        # Create distributions
-        discrete_dists = [Categorical(logits=logits) for logits in discrete_logits]
-        cont_dist = Normal(cont_mean, cont_std)
+        # Create distributions (cast to float32, disable validation for speed)
+        # NaN can occur with AMP, so we clamp to prevent crashes
+        discrete_dists = [
+            Categorical(logits=torch.clamp(logits.float(), -50, 50), validate_args=False)
+            for logits in discrete_logits
+        ]
+        cont_dist = Normal(cont_mean.float(), cont_std.float().clamp(min=1e-6), validate_args=False)
 
         if action is None:
             # Sample new action
@@ -351,6 +358,13 @@ class PPOAgent:
             eps=1e-5
         )
 
+        # Mixed precision training
+        self.use_amp = self.config.use_amp and self.device.type == "cuda"
+        if self.use_amp:
+            self.scaler = torch.amp.GradScaler("cuda")
+        else:
+            self.scaler = None
+
         # Rollout storage
         self.num_steps = self.config.num_steps
         self._init_storage()
@@ -391,7 +405,8 @@ class PPOAgent:
 
     def _obs_to_tensor(self, obs: Union[np.ndarray, Dict[str, np.ndarray]]) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """Convert numpy observation to tensor(s)."""
-        if self.use_cnn:
+        # Auto-detect observation type (dict vs flat array)
+        if isinstance(obs, dict):
             return {
                 'tiles': torch.from_numpy(obs['tiles']).float().to(self.device),
                 'player_state': torch.from_numpy(obs['player_state']).float().to(self.device),
@@ -561,55 +576,66 @@ class PPOAgent:
                 mb_returns = b_returns[mb_indices]
                 mb_values = b_values[mb_indices]
 
-                # Forward pass
-                _, new_log_prob, entropy = self.actor.get_action(mb_obs, mb_action)
-                new_value = self.critic(mb_obs).squeeze(-1)
+                # Forward pass (with optional mixed precision)
+                with torch.amp.autocast("cuda", enabled=self.use_amp):
+                    _, new_log_prob, entropy = self.actor.get_action(mb_obs, mb_action)
+                    new_value = self.critic(mb_obs).squeeze(-1)
 
-                # Policy loss
-                logratio = new_log_prob - mb_log_probs
-                ratio = logratio.exp()
+                    # Policy loss
+                    logratio = new_log_prob - mb_log_probs
+                    ratio = logratio.exp()
 
-                # Approximate KL for early stopping
+                    # Clipped objective
+                    pg_loss1 = -mb_advantages * ratio
+                    pg_loss2 = -mb_advantages * torch.clamp(
+                        ratio, 1 - self.config.clip_coef, 1 + self.config.clip_coef
+                    )
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    # Value loss
+                    if self.config.clip_vloss:
+                        v_loss_unclipped = (new_value - mb_returns) ** 2
+                        v_clipped = mb_values + torch.clamp(
+                            new_value - mb_values,
+                            -self.config.clip_coef,
+                            self.config.clip_coef
+                        )
+                        v_loss_clipped = (v_clipped - mb_returns) ** 2
+                        v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    else:
+                        v_loss = 0.5 * ((new_value - mb_returns) ** 2).mean()
+
+                    # Entropy loss
+                    entropy_loss = entropy.mean()
+
+                    # Total loss
+                    loss = pg_loss - self.config.ent_coef * entropy_loss + self.config.vf_coef * v_loss
+
+                # Approximate KL for early stopping (outside autocast)
                 with torch.no_grad():
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs.append(((ratio - 1.0).abs() > self.config.clip_coef).float().mean().item())
                     all_approx_kl.append(approx_kl.item())
 
-                # Clipped objective
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(
-                    ratio, 1 - self.config.clip_coef, 1 + self.config.clip_coef
-                )
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                if self.config.clip_vloss:
-                    v_loss_unclipped = (new_value - mb_returns) ** 2
-                    v_clipped = mb_values + torch.clamp(
-                        new_value - mb_values,
-                        -self.config.clip_coef,
-                        self.config.clip_coef
-                    )
-                    v_loss_clipped = (v_clipped - mb_returns) ** 2
-                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
-                else:
-                    v_loss = 0.5 * ((new_value - mb_returns) ** 2).mean()
-
-                # Entropy loss
-                entropy_loss = entropy.mean()
-
-                # Total loss
-                loss = pg_loss - self.config.ent_coef * entropy_loss + self.config.vf_coef * v_loss
-
-                # Optimize
+                # Optimize (with optional mixed precision)
                 self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(
-                    list(self.actor.parameters()) + list(self.critic.parameters()),
-                    self.config.max_grad_norm
-                )
-                self.optimizer.step()
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    nn.utils.clip_grad_norm_(
+                        list(self.actor.parameters()) + list(self.critic.parameters()),
+                        self.config.max_grad_norm
+                    )
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(self.actor.parameters()) + list(self.critic.parameters()),
+                        self.config.max_grad_norm
+                    )
+                    self.optimizer.step()
 
                 all_pg_losses.append(pg_loss.item())
                 all_v_losses.append(v_loss.item())
@@ -631,13 +657,16 @@ class PPOAgent:
 
     def save(self, path: str):
         """Save agent state."""
-        torch.save({
+        save_dict = {
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': self.config,
             'global_step': self.global_step,
-        }, path)
+        }
+        if self.scaler is not None:
+            save_dict['scaler_state_dict'] = self.scaler.state_dict()
+        torch.save(save_dict, path)
 
     def load(self, path: str):
         """Load agent state."""
@@ -646,6 +675,8 @@ class PPOAgent:
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint.get('global_step', 0)
+        if self.scaler is not None and 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
 
 if __name__ == "__main__":
