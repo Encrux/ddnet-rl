@@ -12,6 +12,7 @@
 #include <atomic>
 
 #include "observation.h"
+#include "map_analysis.h"
 
 namespace rl {
 class ICommInterface;
@@ -30,6 +31,7 @@ public:
 	void OnShutdown() override;
 	void OnRender() override;
 	void OnReset() override;
+	void OnMapLoad() override;
 	
 	// Check if RL mode is enabled
 	bool IsEnabled() const { return m_Enabled; }
@@ -60,6 +62,11 @@ private:
 	bool m_Done;
 	int m_LastTick;
 	float m_AccumulatedReward;
+	float m_LastDistToCheckpoint; // Distance to next checkpoint (for dense reward)
+
+	// Map analysis for checkpoint navigation
+	rl::CMapAnalysis m_MapAnalysis;
+	bool m_MapAnalyzed;
 	// Console commands
 	static void ConRLEnable(IConsole::IResult *pResult, void *pUserData);
 	static void ConRLDisable(IConsole::IResult *pResult, void *pUserData);

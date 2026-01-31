@@ -12,6 +12,8 @@
 #include <base/vmath.h>
 #include <generated/protocol.h>
 #include <memory>
+#include <vector>
+#include <map>
 
 class CGameContext;
 class CPlayer;
@@ -78,20 +80,37 @@ private:
 	int m_NumBots;
 	int m_aClientIds[MAX_RL_BOTS];  // Client IDs assigned to bots
 
+	// Checkpoint data extracted from map
+	struct SCheckpoint
+	{
+		vec2 m_Pos;
+		int m_Index;
+	};
+
 	// Per-bot reward tracking state
 	struct SBotRewardState
 	{
 		float m_LastPosX;
 		float m_LastPosY;
-		float m_MaxPosX;
-		float m_SpawnPosX;
-		float m_SpawnPosY;
+		float m_LastDistToCheckpoint;
+		int m_CurrentCheckpointIndex;
 		int m_LastHookState;
 		int m_StuckCounter;
 		bool m_WasFrozen;
 		bool m_WasDead;
 	};
 	SBotRewardState m_aBotState[MAX_RL_BOTS];
+
+	// Map checkpoint data
+	std::vector<SCheckpoint> m_vCheckpoints;
+	vec2 m_SpawnPos;
+	vec2 m_FinishPos;
+	bool m_MapAnalyzed;
+
+	// Analyze map for checkpoints (called once on first tick)
+	void AnalyzeMap();
+	vec2 GetNextCheckpointPos(int CurrentIndex) const;
+	int GetCheckpointAtPos(vec2 Pos, float Radius = 48.0f) const;
 
 	// Input storage
 	CNetObj_PlayerInput m_aBotInputs[MAX_RL_BOTS];

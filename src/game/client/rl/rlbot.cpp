@@ -2,7 +2,9 @@
 #include "rlbot.h"
 #include "communication/shm_comm.h"
 #include "observation.h"
+#include "map_analysis.h"
 
+#include <base/vmath.h>
 #include <engine/graphics.h>
 #include <engine/shared/config.h>
 #include <game/client/gameclient.h>
@@ -31,6 +33,8 @@ CRLBot::CRLBot() :
 	m_Done(false),
 	m_LastTick(0),
 	m_AccumulatedReward(0.0f),
+	m_LastDistToCheckpoint(0.0f),
+	m_MapAnalyzed(false),
 	m_Enabled(false),
 	m_EnvId(0),
 	m_FrameWidth(640),
@@ -69,6 +73,27 @@ void CRLBot::OnConsoleInit()
 void CRLBot::OnInit()
 {
 	dbg_msg("rl", "RLBot component initialized");
+}
+
+void CRLBot::OnMapLoad()
+{
+	// Analyze the map for checkpoints when it loads
+	CGameClient *pGameClient = static_cast<CGameClient *>(GameClient());
+	if(pGameClient && pGameClient->Collision())
+	{
+		m_MapAnalysis.AnalyzeMap(pGameClient->Collision(), pGameClient->Layers());
+		m_MapAnalyzed = true;
+
+		// Update spawn position from map analysis
+		vec2 spawn = m_MapAnalysis.GetSpawnPos();
+		if(spawn.x != 0.0f || spawn.y != 0.0f)
+		{
+			m_SpawnPosX = spawn.x;
+			m_SpawnPosY = spawn.y;
+		}
+
+		dbg_msg("rl", "Map analyzed: %d checkpoints found", m_MapAnalysis.GetNumCheckpoints());
+	}
 }
 
 void CRLBot::OnShutdown()
@@ -531,7 +556,7 @@ void CRLBot::ExtractGameState(rl::SStructuredObservation *pObs)
 		pObs->m_aFlagAtStand[1] = (pObs->m_aFlagCarrier[1] == FLAG_ATSTAND);
 	}
 	
-	// Local tile grid around player (29x21)
+	// Local tile grid around player (43x31)
 	ExtractLocalTiles(pObs);
 
 	// Raycast observations
@@ -539,6 +564,24 @@ void CRLBot::ExtractGameState(rl::SStructuredObservation *pObs)
 
 	// Extra player state (grounded, jumps remaining, etc.)
 	ExtractPlayerExtras(pObs);
+
+	// Checkpoint navigation info
+	if(m_MapAnalyzed)
+	{
+		vec2 nextCp = m_MapAnalysis.GetNextCheckpointPos(m_CurrentCheckpointIndex);
+		pObs->m_NextCheckpointX = nextCp.x;
+		pObs->m_NextCheckpointY = nextCp.y;
+		pObs->m_CheckpointIndex = m_CurrentCheckpointIndex;
+		pObs->m_TotalCheckpoints = m_MapAnalysis.GetNumCheckpoints();
+	}
+	else
+	{
+		// Fallback: no checkpoints, point to right
+		pObs->m_NextCheckpointX = pObs->m_LocalPlayer.m_PosX + 1000.0f;
+		pObs->m_NextCheckpointY = pObs->m_LocalPlayer.m_PosY;
+		pObs->m_CheckpointIndex = -1;
+		pObs->m_TotalCheckpoints = 0;
+	}
 }
 
 void CRLBot::ExtractPlayerState(rl::SPlayerObs *pPlayerObs, int ClientId, bool IsLocal)
@@ -609,15 +652,17 @@ void CRLBot::ExtractLocalTiles(rl::SStructuredObservation *pObs)
 	int MapWidth = pCollision->GetWidth();
 	int MapHeight = pCollision->GetHeight();
 	
-	// Extract 29x21 grid centered on player
-	// Grid indices: x from -14 to +14, y from -10 to +10
+	// Extract 43x31 grid centered on player (1.5x original size)
+	// Grid indices: x from -21 to +21, y from -15 to +15
+	int HalfWidth = rl::TILE_GRID_WIDTH / 2;   // 21
+	int HalfHeight = rl::TILE_GRID_HEIGHT / 2; // 15
 	for(int gy = 0; gy < rl::TILE_GRID_HEIGHT; gy++)
 	{
 		for(int gx = 0; gx < rl::TILE_GRID_WIDTH; gx++)
 		{
 			// World tile coordinates
-			int TileX = PlayerTileX + (gx - 14);  // gx=0 -> -14, gx=14 -> 0, gx=28 -> +14
-			int TileY = PlayerTileY + (gy - 10);  // gy=0 -> -10, gy=10 -> 0, gy=20 -> +10
+			int TileX = PlayerTileX + (gx - HalfWidth);
+			int TileY = PlayerTileY + (gy - HalfHeight);
 			
 			uint8_t TileType = (uint8_t)rl::ETileType::EMPTY;
 			
@@ -840,22 +885,46 @@ float CRLBot::CalculateReward(const rl::SStructuredObservation *pObs)
 	if(!local.m_Active)
 		return 0.0f;
 
+	// Get next checkpoint position (direction-agnostic navigation)
+	vec2 nextCheckpointPos;
+	if(m_MapAnalyzed && m_MapAnalysis.GetNumCheckpoints() > 0)
+	{
+		nextCheckpointPos = m_MapAnalysis.GetNextCheckpointPos(m_CurrentCheckpointIndex);
+	}
+	else
+	{
+		// Fallback: use finish or just assume right direction
+		nextCheckpointPos = m_MapAnalysis.GetFinishPos();
+		if(nextCheckpointPos.x == 0.0f && nextCheckpointPos.y == 0.0f)
+		{
+			// No finish found, use max X progress as fallback
+			nextCheckpointPos = vec2(local.m_PosX + 1000.0f, local.m_PosY);
+		}
+	}
+
+	// Direction to next checkpoint
+	vec2 toCheckpoint = nextCheckpointPos - vec2(local.m_PosX, local.m_PosY);
+	float distToCheckpoint = length(toCheckpoint);
+	vec2 dirToCheckpoint = distToCheckpoint > 0.0f ? toCheckpoint / distToCheckpoint : vec2(1.0f, 0.0f);
+
 	// ===== DENSE REWARDS (every step) =====
 
-	// 1. Max-progress reward: only reward when reaching NEW furthest X position
-	// This doesn't penalize going left (which may be necessary to progress)
-	float newMaxProgress = local.m_PosX - m_MaxPosX;
-	if(newMaxProgress > 0)
+	// 1. Progress toward next checkpoint (direction-agnostic)
+	// Reward getting closer to next checkpoint, regardless of direction
+	float progress = m_LastDistToCheckpoint - distToCheckpoint;
+	if(m_LastDistToCheckpoint > 0.0f)  // Skip first frame
 	{
-		reward += (newMaxProgress / 32.0f) * 0.05f; // tiles of new progress
+		reward += progress / 100.0f;  // Normalized progress reward
 	}
 
 	// 2. Time penalty: encourage efficiency
 	reward -= 0.0005f;
 
-	// 3. Speed bonus: reward moving fast (regardless of direction)
-	float speed = std::sqrt(local.m_VelX * local.m_VelX + local.m_VelY * local.m_VelY);
-	reward += (speed / 100.0f) * 0.001f;
+	// 3. Velocity toward checkpoint bonus (direction-agnostic)
+	// Reward moving in the right direction
+	vec2 vel(local.m_VelX, local.m_VelY);
+	float velTowardCheckpoint = dot(vel, dirToCheckpoint);
+	reward += std::max(0.0f, velTowardCheckpoint) / 500.0f;
 
 	// ===== MECHANIC REWARDS =====
 
@@ -878,7 +947,7 @@ float CRLBot::CalculateReward(const rl::SStructuredObservation *pObs)
 
 	// ===== SPARSE MILESTONES =====
 
-	// 6. Checkpoint (detect by standing on checkpoint tile)
+	// 6. Checkpoint reached (using map analysis)
 	int centerX = rl::TILE_GRID_WIDTH / 2;
 	int centerY = rl::TILE_GRID_HEIGHT / 2;
 	int centerIdx = centerY * rl::TILE_GRID_WIDTH + centerX;
@@ -886,31 +955,38 @@ float CRLBot::CalculateReward(const rl::SStructuredObservation *pObs)
 
 	if(centerTile == (uint8_t)rl::ETileType::CHECKPOINT)
 	{
-		// Use position as checkpoint ID (quantized to tile)
-		int cpId = ((int)(local.m_PosX / 32.0f)) * 10000 + ((int)(local.m_PosY / 32.0f));
-		if(cpId != m_LastCheckpointIndex)
+		// Check if we've reached a new checkpoint
+		int cpAtPos = m_MapAnalysis.GetCheckpointAtPos(vec2(local.m_PosX, local.m_PosY), 48.0f);
+		if(cpAtPos > m_CurrentCheckpointIndex)
 		{
-			reward += 0.5f;
-			m_LastCheckpointIndex = cpId;
+			// Reached a new checkpoint!
+			reward += 10.0f;  // Significant reward for checkpoint
+			m_CurrentCheckpointIndex = cpAtPos;
+
+			// Update target to next checkpoint
+			nextCheckpointPos = m_MapAnalysis.GetNextCheckpointPos(m_CurrentCheckpointIndex);
+			distToCheckpoint = length(nextCheckpointPos - vec2(local.m_PosX, local.m_PosY));
+
+			dbg_msg("rl/reward", "Checkpoint %d reached! Reward: +10.0", cpAtPos);
 		}
 	}
 
 	// 7. Finish
 	if(centerTile == (uint8_t)rl::ETileType::FINISH)
 	{
-		reward += 5.0f;
+		reward += 100.0f;  // Large reward for finishing
 		m_Done = true;
+		dbg_msg("rl/reward", "FINISH reached! Reward: +100.0");
 	}
 
 	// ===== PENALTIES =====
 
-	// 8. Death detection (player becomes inactive or health drops)
-	// In DDNet, death is often indicated by respawn at spawn position
+	// 8. Death detection
 	bool possibleDeath = false;
 	float distFromLast = std::sqrt((local.m_PosX - m_LastPosX) * (local.m_PosX - m_LastPosX) +
 	                               (local.m_PosY - m_LastPosY) * (local.m_PosY - m_LastPosY));
 	// Large teleport back toward spawn suggests death
-	if(distFromLast > 500.0f && m_LastPosX > m_SpawnPosX + 100.0f)
+	if(distFromLast > 500.0f)
 	{
 		float distToSpawn = std::sqrt((local.m_PosX - m_SpawnPosX) * (local.m_PosX - m_SpawnPosX) +
 		                              (local.m_PosY - m_SpawnPosY) * (local.m_PosY - m_SpawnPosY));
@@ -920,7 +996,7 @@ float CRLBot::CalculateReward(const rl::SStructuredObservation *pObs)
 
 	if(possibleDeath && !m_WasDead)
 	{
-		reward -= 1.0f;
+		reward -= 5.0f;  // Significant penalty for death
 		m_WasDead = true;
 		m_Done = true;
 	}
@@ -929,10 +1005,10 @@ float CRLBot::CalculateReward(const rl::SStructuredObservation *pObs)
 		m_WasDead = false;
 	}
 
-	// 9. Freeze penalty
-	if(local.m_IsFrozen && !m_WasFrozen)
+	// 9. Freeze penalty (per tick while frozen)
+	if(local.m_IsFrozen)
 	{
-		reward -= 0.3f;
+		reward -= 0.1f;  // Small penalty per tick frozen
 	}
 
 	// 10. Stuck penalty (no progress for extended time)
@@ -957,8 +1033,9 @@ float CRLBot::CalculateReward(const rl::SStructuredObservation *pObs)
 	m_LastVelY = local.m_VelY;
 	m_LastHookState = local.m_HookState;
 	m_WasFrozen = local.m_IsFrozen;
+	m_LastDistToCheckpoint = distToCheckpoint;
 
-	// Update max position reached this episode
+	// Update max position reached this episode (for fallback)
 	if(local.m_PosX > m_MaxPosX)
 		m_MaxPosX = local.m_PosX;
 
@@ -985,6 +1062,17 @@ void CRLBot::ResetRewardState()
 	m_AccumulatedReward = 0.0f;
 	m_LastCommTick = -1; // Reset to communicate immediately after respawn
 	m_SkippedReward = 0.0f;
+
+	// Reset checkpoint distance tracking
+	if(m_MapAnalyzed)
+	{
+		vec2 firstCp = m_MapAnalysis.GetNextCheckpointPos(-1);
+		m_LastDistToCheckpoint = length(firstCp - vec2(m_SpawnPosX, m_SpawnPosY));
+	}
+	else
+	{
+		m_LastDistToCheckpoint = 0.0f;
+	}
 }
 
 void CRLBot::ReceiveAction()

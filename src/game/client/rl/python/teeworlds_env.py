@@ -33,11 +33,11 @@ class ObservationMode:
 MAX_OTHER_PLAYERS = 15
 MAX_PROJECTILES = 32
 MAX_PICKUPS = 16
-TILE_GRID_WIDTH = 29
-TILE_GRID_HEIGHT = 21
-TILE_GRID_SIZE = 609  # 29 * 21
+TILE_GRID_WIDTH = 43   # 21 left + 1 center + 21 right (1.5x original)
+TILE_GRID_HEIGHT = 31  # 15 up + 1 center + 15 down (1.5x original)
+TILE_GRID_SIZE = 1333  # 43 * 31
 NUM_RAYCASTS = 16
-STRUCTURED_OBS_SIZE = 2280  # Updated to include raycasts and extras
+STRUCTURED_OBS_SIZE = 3020  # Updated for larger tile grid + checkpoint info
 
 
 class TileType(IntEnum):
@@ -197,7 +197,7 @@ class ProjectileObs:
 
 @dataclass
 class StructuredObservation:
-    """Full structured observation (2280 bytes)"""
+    """Full structured observation (3020 bytes)"""
     tick: int
     game_flags: int
     game_state: int
@@ -209,7 +209,7 @@ class StructuredObservation:
     flag_pos: np.ndarray  # [2, 2] - [team][x/y]
     flag_carrier: Tuple[int, int]
     flag_at_stand: Tuple[bool, bool]
-    tile_grid: np.ndarray  # [21, 29] - local tile grid centered on player
+    tile_grid: np.ndarray  # [31, 43] - local tile grid centered on player (1.5x original)
     # New raycast observations
     raycast_solid: np.ndarray    # [16] - distance to solid in 16 directions
     raycast_death: np.ndarray    # [16] - distance to death tiles
@@ -218,16 +218,22 @@ class StructuredObservation:
     is_grounded: bool
     jumps_remaining: int
     can_hook: bool
+    # Checkpoint navigation
+    next_checkpoint_x: float = 0.0
+    next_checkpoint_y: float = 0.0
+    checkpoint_index: int = -1
+    total_checkpoints: int = 0
     
     def to_flat_array(self) -> np.ndarray:
         """Convert to a flat numpy array for RL training.
 
-        New layout (~150 features instead of ~700):
+        Layout:
         - Player state: 15 features
+        - Checkpoint info: 4 features
         - Raycasts: 48 features (16 dirs x 3 types)
         - Local tiles (7x7): 49 features
         - Other players: 25 features (5 players x 5 features)
-        Total: ~137 features
+        Total: ~141 features
         """
         features = []
 
@@ -250,6 +256,18 @@ class StructuredObservation:
             p.health / 10.0,
             p.armor / 10.0,
             float(p.jumped) / 3.0,            # Jump state normalized
+        ])
+
+        # Checkpoint navigation - 4 features (direction-agnostic, signed)
+        # Direction to next checkpoint (normalized, can be any direction)
+        cp_dx = self.next_checkpoint_x - p.pos_x
+        cp_dy = self.next_checkpoint_y - p.pos_y
+        max_dist = 2000.0  # Normalization factor
+        features.extend([
+            np.clip(cp_dx / max_dist, -1.0, 1.0),  # Signed direction X
+            np.clip(cp_dy / max_dist, -1.0, 1.0),  # Signed direction Y
+            float(self.checkpoint_index) / max(1, self.total_checkpoints),  # Progress
+            float(self.total_checkpoints) / 20.0,  # Total checkpoints (normalized)
         ])
 
         # Raycast observations - 48 features (already normalized 0-1)
@@ -284,6 +302,56 @@ class StructuredObservation:
             features.extend([0, 0, 0, 0, 0])
 
         return np.array(features, dtype=np.float32)
+
+    def to_dict_observation(self) -> Dict[str, np.ndarray]:
+        """Convert to dictionary observation for CNN-based policy.
+
+        Returns:
+            Dict with:
+                'tiles': (1, 31, 43) - Full tile grid for CNN
+                'player_state': (15,) - Player state vector
+                'checkpoint': (4,) - Checkpoint navigation info
+        """
+        p = self.local_player
+
+        # Player state - 15 features
+        player_state = np.array([
+            p.vel_x / 50.0,
+            p.vel_y / 50.0,
+            float(self.is_grounded),
+            float(self.jumps_remaining) / 2.0,
+            float(self.can_hook),
+            p.direction,
+            float(p.is_frozen),
+            float(p.hook_state == 0),
+            float(p.hook_state == 1),
+            float(p.hook_state == 2),
+            0.0, 0.0,  # Aim placeholder
+            p.health / 10.0,
+            p.armor / 10.0,
+            float(p.jumped) / 3.0,
+        ], dtype=np.float32)
+
+        # Checkpoint info - 4 features
+        cp_dx = self.next_checkpoint_x - p.pos_x
+        cp_dy = self.next_checkpoint_y - p.pos_y
+        max_dist = 2000.0
+        checkpoint = np.array([
+            np.clip(cp_dx / max_dist, -1.0, 1.0),
+            np.clip(cp_dy / max_dist, -1.0, 1.0),
+            float(self.checkpoint_index) / max(1, self.total_checkpoints),
+            float(self.total_checkpoints) / 20.0,
+        ], dtype=np.float32)
+
+        # Full tile grid normalized (1, H, W) for CNN
+        tiles = self.tile_grid.astype(np.float32) / 15.0
+        tiles = tiles.reshape(1, TILE_GRID_HEIGHT, TILE_GRID_WIDTH)
+
+        return {
+            'tiles': tiles,
+            'player_state': player_state,
+            'checkpoint': checkpoint,
+        }
 
     def to_flat_array_legacy(self) -> np.ndarray:
         """Legacy flat array for backwards compatibility (~700 features)."""
@@ -414,8 +482,12 @@ class StructuredObservation:
         is_grounded, jumps_remaining, can_hook, _ = struct.unpack_from('<BBBB', data, offset)
         offset += 4
 
-        # Reserved (27 bytes) - skip
-        # offset += 27
+        # Checkpoint info (16 bytes)
+        next_cp_x, next_cp_y, cp_index, total_cps = struct.unpack_from('<ffii', data, offset)
+        offset += 16
+
+        # Reserved (11 bytes) - skip
+        # offset += 11
 
         return cls(
             tick=tick,
@@ -436,6 +508,10 @@ class StructuredObservation:
             is_grounded=bool(is_grounded),
             jumps_remaining=jumps_remaining,
             can_hook=bool(can_hook),
+            next_checkpoint_x=next_cp_x,
+            next_checkpoint_y=next_cp_y,
+            checkpoint_index=cp_index,
+            total_checkpoints=total_cps,
         )
 
 

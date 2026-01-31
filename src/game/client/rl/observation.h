@@ -13,10 +13,10 @@ constexpr int MAX_PROJECTILES = 32;
 // Maximum number of pickups to track
 constexpr int MAX_PICKUPS = 16;
 
-// Local tile grid size (matches camera view)
-constexpr int TILE_GRID_WIDTH = 29;   // 14 left + 1 center + 14 right
-constexpr int TILE_GRID_HEIGHT = 21;  // 10 up + 1 center + 10 down
-constexpr int TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT; // 609
+// Local tile grid size (1.5x camera view for better lookahead)
+constexpr int TILE_GRID_WIDTH = 43;   // 21 left + 1 center + 21 right
+constexpr int TILE_GRID_HEIGHT = 31;  // 15 up + 1 center + 15 down
+constexpr int TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT; // 1333
 
 // Raycast configuration
 constexpr int NUM_RAYCASTS = 16;      // Rays cast in 16 directions (every 22.5 degrees)
@@ -146,9 +146,9 @@ struct SStructuredObservation
 	uint8_t m_aFlagAtStand[2]; // Is flag at stand?
 	uint8_t m_Padding[12];
 	
-	// Local tile grid - 29x21 = 609 bytes (matches camera view)
+	// Local tile grid - 43x31 = 1333 bytes (1.5x camera view)
 	// Row-major order, centered on player
-	// Index = (y + 10) * 29 + (x + 14) where x,y are relative to player
+	// Index = (y + 15) * 43 + (x + 21) where x,y are relative to player
 	uint8_t m_aTileGrid[TILE_GRID_SIZE];
 
 	// Raycast observations - distances normalized to [0,1]
@@ -163,16 +163,24 @@ struct SStructuredObservation
 	uint8_t m_CanHook;         // 1 if hook is available (not on cooldown)
 	uint8_t m_Reserved2;       // Alignment padding
 
+	// Checkpoint navigation info (16 bytes)
+	float m_NextCheckpointX;   // World X position of next checkpoint
+	float m_NextCheckpointY;   // World Y position of next checkpoint
+	int32_t m_CheckpointIndex; // Current checkpoint index (0-based, -1 if none reached)
+	int32_t m_TotalCheckpoints; // Total number of checkpoints in map
+
 	// Padding to align to nice size
-	uint8_t m_Reserved[27];
+	uint8_t m_Reserved[11];
 };
 #pragma pack(pop)
 
-// Total: 8+36+540+640+192+(16+4+12)+609 + (16*4*3) + 4 + 27 = 2284 bytes
+// Total: 8+36+540+640+192+(16+4+12)+1333 + (16*4*3) + 4 + 16 + 11 = 3020 bytes
+// Tile grid: 43x31 = 1333 bytes (1.5x original size)
 // Raycast addition: 16 floats * 3 types * 4 bytes = 192 bytes
 // Extra state: 4 bytes
-// New total: 2088 - 31 (old reserved) + 192 + 4 + 27 = 2280 bytes
-static_assert(sizeof(SStructuredObservation) == 2280, "SStructuredObservation must be 2280 bytes");
+// Checkpoint info: 16 bytes (2 floats + 2 int32)
+// Reserved: 11 bytes
+static_assert(sizeof(SStructuredObservation) == 3020, "SStructuredObservation must be 3020 bytes");
 
 } // namespace rl
 

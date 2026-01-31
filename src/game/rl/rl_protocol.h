@@ -28,10 +28,10 @@ constexpr int MAX_PROJECTILES = 32;
 // Maximum number of pickups to track
 constexpr int MAX_PICKUPS = 16;
 
-// Local tile grid size (matches camera view)
-constexpr int TILE_GRID_WIDTH = 29;   // 14 left + 1 center + 14 right
-constexpr int TILE_GRID_HEIGHT = 21;  // 10 up + 1 center + 10 down
-constexpr int TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT; // 609
+// Local tile grid size (1.5x camera view for better lookahead)
+constexpr int TILE_GRID_WIDTH = 43;   // 21 left + 1 center + 21 right
+constexpr int TILE_GRID_HEIGHT = 31;  // 15 up + 1 center + 15 down
+constexpr int TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT; // 1333
 
 // Raycast configuration
 constexpr int NUM_RAYCASTS = 16;      // Rays cast in 16 directions (every 22.5 degrees)
@@ -163,7 +163,7 @@ struct SStructuredObservation
 	uint8_t m_aFlagAtStand[2];
 	uint8_t m_FlagPadding[12];
 
-	// Local tile grid (609 bytes)
+	// Local tile grid (1333 bytes = 43x31)
 	uint8_t m_aTileGrid[TILE_GRID_SIZE];
 
 	// Raycast observations (192 bytes)
@@ -177,12 +177,18 @@ struct SStructuredObservation
 	uint8_t m_CanHook;
 	uint8_t m_Reserved2;
 
-	// Padding for alignment
+	// Checkpoint navigation info (16 bytes)
+	float m_NextCheckpointX;   // World X position of next checkpoint
+	float m_NextCheckpointY;   // World Y position of next checkpoint
+	int32_t m_CheckpointIndex; // Current checkpoint index (0-based, -1 if none reached)
+	int32_t m_TotalCheckpoints; // Total number of checkpoints in map
+
+	// Padding for alignment (27 bytes to reach 3020 total)
 	uint8_t m_Reserved[27];
 };
 #pragma pack(pop)
 
-static_assert(sizeof(SStructuredObservation) == 2280, "SStructuredObservation must be 2280 bytes");
+static_assert(sizeof(SStructuredObservation) == 3020, "SStructuredObservation must be 3020 bytes");
 
 // ============================================================================
 // Action (from Python to server/client)
@@ -231,19 +237,19 @@ static_assert(sizeof(SServerRLHeader) == 32, "SServerRLHeader must be 32 bytes")
 struct SBotData
 {
 	SAction m_Action;                    // 32 bytes - Python → Server
-	SStructuredObservation m_Observation; // 2280 bytes - Server → Python
+	SStructuredObservation m_Observation; // 3020 bytes - Server → Python
 	float m_Reward;                      // 4 bytes
 	int32_t m_Done;                      // 4 bytes
 	int32_t m_Truncated;                 // 4 bytes
 	int32_t m_BotClientId;               // 4 bytes - Which client ID this bot uses
-	uint8_t m_Padding[8];                // Alignment to 2336 bytes
+	uint8_t m_Padding[4];                // Alignment to 3072 bytes
 };
 #pragma pack(pop)
 
-static_assert(sizeof(SBotData) == 2336, "SBotData must be 2336 bytes (32 + 2280 + 16 + 8)");
+static_assert(sizeof(SBotData) == 3072, "SBotData must be 3072 bytes (32 + 3020 + 16 + 4)");
 
 // Full shared memory layout
-// Total size: 32 + 64 * 2336 = 149,536 bytes (~146 KB)
+// Total size: 32 + 64 * 3072 = 196,640 bytes (~192 KB)
 #pragma pack(push, 1)
 struct SServerRLSharedMemory
 {

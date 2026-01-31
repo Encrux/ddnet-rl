@@ -45,6 +45,8 @@ def parse_args():
                         help="Frame skip (1=no skip, 4=act every 4th tick)")
     parser.add_argument("--server-side", action="store_true",
                         help="Use server-side bots (much more efficient)")
+    parser.add_argument("--map", type=str, default="Tutorial",
+                        help="Map to train on (default: Tutorial)")
 
     # Training
     parser.add_argument("--total-timesteps", type=int, default=10_000_000,
@@ -106,6 +108,21 @@ def parse_args():
                         default="../../../../../build/DDNet-Server",
                         help="Path to DDNet-Server executable")
 
+    # CNN Policy
+    parser.add_argument("--use-cnn", action="store_true",
+                        help="Use CNN feature extractor for tile observations")
+
+    # Curriculum learning
+    parser.add_argument("--curriculum", type=str, default="none",
+                        choices=["none", "map", "segment", "both"],
+                        help="Curriculum learning mode")
+    parser.add_argument("--maps-dir", type=str, default=None,
+                        help="Path to ddnet-maps repository for curriculum learning")
+    parser.add_argument("--starting-category", type=str, default="novice",
+                        help="Starting difficulty category for curriculum")
+    parser.add_argument("--success-threshold", type=float, default=0.8,
+                        help="Success rate threshold to advance curriculum")
+
     return parser.parse_args()
 
 
@@ -141,10 +158,12 @@ def main():
     # Create environment
     if args.server_side:
         # Server-side bots (more efficient, single process)
-        print(f"\nCreating SERVER-SIDE environment with {args.num_envs} bots...")
+        print(f"\nCreating SERVER-SIDE environment with {args.num_envs} bots on map '{args.map}'...")
         server_config = ServerEnvConfig(
             sv_tickrate=args.sv_tickrate,
             max_episode_steps=args.max_episode_steps,
+            use_dict_obs=args.use_cnn,  # Enable dict observations for CNN
+            map_name=args.map,
         )
         # Use default server_path (resolved relative to teeworlds_server_env.py)
         env = TeeWorldsServerEnv(num_bots=args.num_envs, config=server_config)
@@ -163,7 +182,12 @@ def main():
     try:
         # Get observation dimension
         obs, _ = env.reset()
-        obs_dim = obs.shape[1]
+        if args.use_cnn:
+            # Dict observation
+            obs_dim = sum(np.prod(v.shape[1:]) for v in obs.values())
+            print(f"Dict observation - tiles: {obs['tiles'].shape}, player: {obs['player_state'].shape}, checkpoint: {obs['checkpoint'].shape}")
+        else:
+            obs_dim = obs.shape[1]
         print(f"Observation dimension: {obs_dim}")
 
         # Create PPO config
@@ -181,6 +205,7 @@ def main():
             target_kl=args.target_kl,
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
+            use_cnn=args.use_cnn,
         )
 
         # Create agent

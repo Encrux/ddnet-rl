@@ -40,11 +40,11 @@ from teeworlds_env import (
 MAX_RL_BOTS = 64
 SHM_PATH = "/dev/shm/ddnet_rl_server"
 
-# Struct sizes (must match C++)
+# Struct sizes (must match C++ rl_protocol.h)
 HEADER_SIZE = 32        # SServerRLHeader
 ACTION_SIZE = 32        # SAction
-OBS_SIZE = 2280         # SStructuredObservation
-BOT_DATA_SIZE = 2336    # SBotData (32 + 2280 + 16 + 8)
+OBS_SIZE = 3020         # SStructuredObservation (43x31 grid + checkpoint info)
+BOT_DATA_SIZE = 3072    # SBotData (32 + 3020 + 16 + 4)
 
 # Global reference for signal handler cleanup
 _active_server_env: Optional['TeeWorldsServerEnv'] = None
@@ -87,6 +87,10 @@ class ServerEnvConfig:
     max_episode_steps: int = 2000
     startup_wait: float = 3.0
     action_timeout: float = 0.1  # Timeout waiting for Python to provide actions
+    use_dict_obs: bool = False   # Return dict observations for CNN policy
+    map_name: str = "Tutorial"   # Map to load (use novice maps for training)
+    sv_name: str = "RL Training" # Server name
+    allow_spectators: bool = True  # Allow connecting to watch
 
     def __post_init__(self):
         if self.server_path is None:
@@ -297,6 +301,7 @@ class TeeWorldsServerEnv:
         self.num_envs = num_bots
         self.num_bots = num_bots
         self.config = config or ServerEnvConfig()
+        self.use_dict_obs = self.config.use_dict_obs
 
         # Process management
         self.server_proc: Optional[subprocess.Popen] = None
@@ -373,12 +378,17 @@ class TeeWorldsServerEnv:
         observations, _, _ = self.shm_client.read_observations_batch()
         valid_obs = [o for o in observations if o is not None]
         if valid_obs:
-            self.obs_dim = len(valid_obs[0].to_flat_array())
+            if self.use_dict_obs:
+                dict_obs = valid_obs[0].to_dict_observation()
+                self.obs_dim = sum(np.prod(v.shape) for v in dict_obs.values())
+            else:
+                self.obs_dim = len(valid_obs[0].to_flat_array())
         else:
             raise RuntimeError("No valid observations received")
 
         self._running = True
-        print(f"Environment ready. Observation dim: {self.obs_dim}")
+        mode_str = "dict (CNN)" if self.use_dict_obs else "flat"
+        print(f"Environment ready. Observation mode: {mode_str}, dim: {self.obs_dim}")
 
     def _cleanup_shared_memory(self):
         """Clean up stale shared memory files."""
@@ -401,13 +411,19 @@ class TeeWorldsServerEnv:
         os.makedirs(data_dir, exist_ok=True)
         with open(config_path, 'w') as f:
             f.write(f"# RL Training Config (auto-generated)\n")
+            f.write(f"sv_name \"{self.config.sv_name}\"\n")
             f.write(f"sv_port {self.config.server_port}\n")
+            f.write(f"sv_map \"{self.config.map_name}\"\n")
             f.write(f"sv_tickrate {self.config.sv_tickrate}\n")
             f.write(f"sv_max_clients 64\n")
             f.write(f"sv_rl_bots {self.num_bots}\n")
             f.write(f"sv_register 0\n")  # Don't register with master
-            f.write(f"sv_rcon_password p")
-            
+            f.write(f"sv_rcon_password p\n")
+            # Allow spectators to connect and watch
+            if self.config.allow_spectators:
+                f.write(f"sv_spectator_slots 16\n")
+                f.write(f"sv_max_clients_per_ip 4\n")
+
         server_cmd = [self.config.server_path]
 
         self.server_proc = subprocess.Popen(
@@ -417,10 +433,12 @@ class TeeWorldsServerEnv:
             stderr=subprocess.DEVNULL,
             cwd=server_dir,  # Run from server directory so it finds data/
         )
-        print(f"Server started (PID: {self.server_proc.pid}, tickrate: {self.config.sv_tickrate}, bots: {self.num_bots})")
+        print(f"Server started (PID: {self.server_proc.pid}, map: {self.config.map_name}, tickrate: {self.config.sv_tickrate}, bots: {self.num_bots})")
+        if self.config.allow_spectators:
+            print(f"  Connect with DDNet client to 127.0.0.1:{self.config.server_port} to watch")
         time.sleep(self.config.startup_wait)
 
-    def reset(self, seed: Optional[int] = None) -> Tuple[np.ndarray, Dict]:
+    def reset(self, seed: Optional[int] = None):
         """Reset all environments and return initial observations."""
         if not self._running:
             self.start()
@@ -441,17 +459,43 @@ class TeeWorldsServerEnv:
         # Read observations
         observations, _, _ = self.shm_client.read_observations_batch()
 
-        obs_array = []
-        for i, obs in enumerate(observations):
-            if obs is not None:
-                obs_array.append(obs.to_flat_array())
-            else:
-                obs_array.append(np.zeros(self.obs_dim, dtype=np.float32))
-
         self.episode_steps[:] = 0
         self.episode_rewards[:] = 0.0
 
-        return np.array(obs_array, dtype=np.float32), {}
+        if self.use_dict_obs:
+            return self._observations_to_dict(observations), {}
+        else:
+            obs_array = []
+            for i, obs in enumerate(observations):
+                if obs is not None:
+                    obs_array.append(obs.to_flat_array())
+                else:
+                    obs_array.append(np.zeros(self.obs_dim, dtype=np.float32))
+            return np.array(obs_array, dtype=np.float32), {}
+
+    def _observations_to_dict(self, observations: List[Optional[StructuredObservation]]) -> Dict[str, np.ndarray]:
+        """Convert list of observations to batched dict format for CNN."""
+        tiles_list = []
+        player_state_list = []
+        checkpoint_list = []
+
+        for obs in observations:
+            if obs is not None:
+                d = obs.to_dict_observation()
+                tiles_list.append(d['tiles'])
+                player_state_list.append(d['player_state'])
+                checkpoint_list.append(d['checkpoint'])
+            else:
+                # Zero observations for missing
+                tiles_list.append(np.zeros((1, TILE_GRID_HEIGHT, TILE_GRID_WIDTH), dtype=np.float32))
+                player_state_list.append(np.zeros(15, dtype=np.float32))
+                checkpoint_list.append(np.zeros(4, dtype=np.float32))
+
+        return {
+            'tiles': np.array(tiles_list, dtype=np.float32),
+            'player_state': np.array(player_state_list, dtype=np.float32),
+            'checkpoint': np.array(checkpoint_list, dtype=np.float32),
+        }
 
     def step(
         self,
@@ -491,16 +535,10 @@ class TeeWorldsServerEnv:
         # Read observations
         observations, rewards, dones = self.shm_client.read_observations_batch()
 
-        obs_array = []
         truncated = np.zeros(self.num_envs, dtype=bool)
         infos = []
 
         for i, obs in enumerate(observations):
-            if obs is not None:
-                obs_array.append(obs.to_flat_array())
-            else:
-                obs_array.append(np.zeros(self.obs_dim, dtype=np.float32))
-
             self.episode_steps[i] += 1
             self.episode_rewards[i] += rewards[i]
 
@@ -526,17 +564,28 @@ class TeeWorldsServerEnv:
         # Auto-reset environments that are done or truncated
         reset_mask = dones | truncated
         if np.any(reset_mask):
-            self._reset_envs(reset_mask, obs_array)
+            self._reset_envs_observations(reset_mask, observations)
+
+        if self.use_dict_obs:
+            obs_out = self._observations_to_dict(observations)
+        else:
+            obs_array = []
+            for i, obs in enumerate(observations):
+                if obs is not None:
+                    obs_array.append(obs.to_flat_array())
+                else:
+                    obs_array.append(np.zeros(self.obs_dim, dtype=np.float32))
+            obs_out = np.array(obs_array, dtype=np.float32)
 
         return (
-            np.array(obs_array, dtype=np.float32),
+            obs_out,
             rewards,
             dones,
             truncated,
             infos
         )
 
-    def _reset_envs(self, mask: np.ndarray, observations: List[np.ndarray]):
+    def _reset_envs_observations(self, mask: np.ndarray, observations: List[Optional[StructuredObservation]]):
         """Reset specific environments and update observations in place."""
         # Send reset for masked environments
         reset_actions = {
@@ -553,7 +602,7 @@ class TeeWorldsServerEnv:
             for i in np.where(mask)[0]:
                 obs, reward, done = self.shm_client.read_observation(i)
                 if obs:
-                    observations[i] = obs.to_flat_array()
+                    observations[i] = obs
 
         # Reset counters for masked environments
         for i in np.where(mask)[0]:

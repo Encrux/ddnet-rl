@@ -15,6 +15,7 @@
 
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 
 namespace rl {
 
@@ -24,6 +25,9 @@ CBotManager::CBotManager(CGameContext *pGameContext) :
 	m_Enabled(false),
 	m_PlayersCreated(false),
 	m_NumBots(0),
+	m_SpawnPos(0, 0),
+	m_FinishPos(0, 0),
+	m_MapAnalyzed(false),
 	m_LastTick(0)
 {
 	mem_zero(m_aClientIds, sizeof(m_aClientIds));
@@ -104,6 +108,8 @@ void CBotManager::Shutdown()
 	m_Enabled = false;
 	m_NumBots = 0;
 	mem_zero(m_aClientIds, sizeof(m_aClientIds));
+	m_vCheckpoints.clear();
+	m_MapAnalyzed = false;
 
 	dbg_msg("rl/bots", "Bot manager shutdown");
 }
@@ -337,6 +343,12 @@ void CBotManager::ExtractObservations()
 	if(!m_Enabled || !m_pShm)
 		return;
 
+	// Analyze map for checkpoints on first call
+	if(!m_MapAnalyzed && m_pCollision)
+	{
+		AnalyzeMap();
+	}
+
 	int CurrentTick = m_pGameContext->Server()->Tick();
 
 	for(int i = 0; i < m_NumBots; i++)
@@ -408,6 +420,22 @@ void CBotManager::ExtractObservations()
 				pObs->m_JumpsRemaining = 0;
 
 			pObs->m_CanHook = (pChar->Core()->m_HookState == HOOK_IDLE) ? 1 : 0;
+
+			// Checkpoint navigation info
+			int CurrentCpIdx = m_aBotState[i].m_CurrentCheckpointIndex;
+			vec2 NextCpPos = GetNextCheckpointPos(CurrentCpIdx);
+			pObs->m_NextCheckpointX = NextCpPos.x;
+			pObs->m_NextCheckpointY = NextCpPos.y;
+			pObs->m_CheckpointIndex = CurrentCpIdx;
+			pObs->m_TotalCheckpoints = (int)m_vCheckpoints.size();
+
+			// Check if bot reached a new checkpoint
+			vec2 CharPos = pChar->GetPos();
+			int CpAtPos = GetCheckpointAtPos(CharPos);
+			if(CpAtPos >= 0 && CpAtPos > CurrentCpIdx)
+			{
+				m_aBotState[i].m_CurrentCheckpointIndex = CpAtPos;
+			}
 
 			// Calculate reward
 			pBotData->m_Reward = CalculateReward(i, pObs);
@@ -484,12 +512,16 @@ void CBotManager::ExtractTileGrid(CCharacter *pChar, uint8_t *pGrid)
 	int MapWidth = m_pCollision->GetWidth();
 	int MapHeight = m_pCollision->GetHeight();
 
+	// Center offsets for the tile grid (player is at center)
+	const int HalfWidth = TILE_GRID_WIDTH / 2;   // 21 for 43-wide grid
+	const int HalfHeight = TILE_GRID_HEIGHT / 2; // 15 for 31-high grid
+
 	for(int gy = 0; gy < TILE_GRID_HEIGHT; gy++)
 	{
 		for(int gx = 0; gx < TILE_GRID_WIDTH; gx++)
 		{
-			int TileX = PlayerTileX + (gx - 14);
-			int TileY = PlayerTileY + (gy - 10);
+			int TileX = PlayerTileX + (gx - HalfWidth);
+			int TileY = PlayerTileY + (gy - HalfHeight);
 
 			uint8_t TileType = (uint8_t)ETileType::EMPTY;
 
@@ -587,19 +619,50 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 	if(!Local.m_Active)
 		return 0.0f;
 
-	// Max progress reward
-	float NewMaxProgress = Local.m_PosX - State.m_MaxPosX;
-	if(NewMaxProgress > 0)
+	vec2 Pos(Local.m_PosX, Local.m_PosY);
+	vec2 NextCp(pObs->m_NextCheckpointX, pObs->m_NextCheckpointY);
+
+	// Calculate distance to next checkpoint
+	vec2 ToCheckpoint = NextCp - Pos;
+	float DistToCheckpoint = length(ToCheckpoint);
+
+	// Progress toward next checkpoint (direction-agnostic dense reward)
+	float Progress = State.m_LastDistToCheckpoint - DistToCheckpoint;
+	Reward += Progress / 100.0f;
+
+	// Checkpoint reached (sparse but important)
+	if(State.m_CurrentCheckpointIndex > pObs->m_CheckpointIndex)
 	{
-		Reward += (NewMaxProgress / 32.0f) * 0.05f;
+		// This was already updated in ExtractObservations, so check against stored state
+	}
+	int CurrentCp = m_aBotState[BotIndex].m_CurrentCheckpointIndex;
+	static int s_aLastCp[MAX_RL_BOTS] = {-1};
+	if(CurrentCp > s_aLastCp[BotIndex])
+	{
+		Reward += 10.0f;
+		s_aLastCp[BotIndex] = CurrentCp;
+		// Reset distance tracking for new checkpoint
+		vec2 NewNextCp = GetNextCheckpointPos(CurrentCp);
+		State.m_LastDistToCheckpoint = length(NewNextCp - Pos);
 	}
 
-	// Time penalty
+	// Finish reached
+	if(m_FinishPos.x > 0 && distance(Pos, m_FinishPos) < 48.0f)
+	{
+		Reward += 100.0f;
+	}
+
+	// Time penalty (small)
 	Reward -= 0.0005f;
 
-	// Speed bonus
-	float Speed = std::sqrt(Local.m_VelX * Local.m_VelX + Local.m_VelY * Local.m_VelY);
-	Reward += (Speed / 100.0f) * 0.001f;
+	// Velocity bonus: reward movement TOWARD checkpoint
+	if(DistToCheckpoint > 0.1f)
+	{
+		vec2 DirToCheckpoint = ToCheckpoint / DistToCheckpoint;
+		vec2 Vel(Local.m_VelX, Local.m_VelY);
+		float VelTowardCp = dot(Vel, DirToCheckpoint);
+		Reward += std::clamp(VelTowardCp, 0.0f, 20.0f) / 500.0f;
+	}
 
 	// Hook success
 	if(Local.m_HookState == 2 && State.m_LastHookState != 2)
@@ -611,6 +674,10 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 	if(Local.m_IsFrozen && !State.m_WasFrozen)
 	{
 		Reward -= 0.3f;
+	}
+	if(Local.m_IsFrozen)
+	{
+		Reward -= 0.1f; // Per-tick penalty while frozen
 	}
 
 	// Stuck penalty
@@ -631,11 +698,9 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 	// Update state
 	State.m_LastPosX = Local.m_PosX;
 	State.m_LastPosY = Local.m_PosY;
+	State.m_LastDistToCheckpoint = DistToCheckpoint;
 	State.m_LastHookState = Local.m_HookState;
 	State.m_WasFrozen = Local.m_IsFrozen;
-
-	if(Local.m_PosX > State.m_MaxPosX)
-		State.m_MaxPosX = Local.m_PosX;
 
 	return Reward;
 }
@@ -643,11 +708,10 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 void CBotManager::ResetRewardState(int BotIndex)
 {
 	SBotRewardState &State = m_aBotState[BotIndex];
-	State.m_LastPosX = 0.0f;
-	State.m_LastPosY = 0.0f;
-	State.m_MaxPosX = 0.0f;
-	State.m_SpawnPosX = 0.0f;
-	State.m_SpawnPosY = 0.0f;
+	State.m_LastPosX = m_SpawnPos.x;
+	State.m_LastPosY = m_SpawnPos.y;
+	State.m_CurrentCheckpointIndex = -1;
+	State.m_LastDistToCheckpoint = 10000.0f; // Will be set properly on first tick
 	State.m_LastHookState = 0;
 	State.m_StuckCounter = 0;
 	State.m_WasFrozen = false;
@@ -681,6 +745,188 @@ vec2 CBotManager::GetSpawnPos()
 		m_pGameContext->m_pController->CanSpawn(0, &SpawnPos, -1);
 	}
 	return SpawnPos;
+}
+
+void CBotManager::AnalyzeMap()
+{
+	if(!m_pCollision)
+		return;
+
+	m_vCheckpoints.clear();
+	m_SpawnPos = vec2(0, 0);
+	m_FinishPos = vec2(0, 0);
+
+	int MapWidth = m_pCollision->GetWidth();
+	int MapHeight = m_pCollision->GetHeight();
+
+	// Maps: tile position -> checkpoint index
+	std::map<std::pair<int, int>, int> TileIndices;
+	std::vector<std::pair<int, int>> CheckpointTiles;
+
+	// Get front layer for time checkpoints
+	const CTile *pFront = m_pCollision->FrontLayer();
+
+	// Scan all tiles (both game layer and front layer)
+	for(int y = 0; y < MapHeight; y++)
+	{
+		for(int x = 0; x < MapWidth; x++)
+		{
+			int MapIndex = y * MapWidth + x;
+			int TileIdx = m_pCollision->GetTileIndex(MapIndex);
+
+			// Check game layer
+			if(TileIdx == TILE_START)
+			{
+				m_SpawnPos = vec2((x + 0.5f) * 32.0f, (y + 0.5f) * 32.0f);
+			}
+			else if(TileIdx == TILE_FINISH)
+			{
+				m_FinishPos = vec2((x + 0.5f) * 32.0f, (y + 0.5f) * 32.0f);
+			}
+			else if(TileIdx == TILE_CP || TileIdx == TILE_CP_F)
+			{
+				// Generic checkpoint (no index)
+				CheckpointTiles.push_back(std::make_pair(x, y));
+				TileIndices[std::make_pair(x, y)] = -1;
+			}
+			else if(TileIdx >= TILE_TIME_CHECKPOINT_FIRST && TileIdx <= TILE_TIME_CHECKPOINT_LAST)
+			{
+				// Time checkpoint with index (game layer)
+				CheckpointTiles.push_back(std::make_pair(x, y));
+				TileIndices[std::make_pair(x, y)] = TileIdx - TILE_TIME_CHECKPOINT_FIRST;
+			}
+
+			// Check front layer for time checkpoints
+			if(pFront)
+			{
+				int FrontIdx = pFront[MapIndex].m_Index;
+				if(FrontIdx >= TILE_TIME_CHECKPOINT_FIRST && FrontIdx <= TILE_TIME_CHECKPOINT_LAST)
+				{
+					auto Key = std::make_pair(x, y);
+					if(TileIndices.find(Key) == TileIndices.end())
+					{
+						CheckpointTiles.push_back(Key);
+						TileIndices[Key] = FrontIdx - TILE_TIME_CHECKPOINT_FIRST;
+					}
+				}
+			}
+		}
+	}
+
+	// Group adjacent tiles into checkpoints
+	std::vector<bool> Visited(CheckpointTiles.size(), false);
+
+	for(size_t i = 0; i < CheckpointTiles.size(); i++)
+	{
+		if(Visited[i])
+			continue;
+
+		// BFS to find connected tiles
+		std::vector<std::pair<int, int>> Group;
+		std::vector<size_t> Queue;
+		Queue.push_back(i);
+		Visited[i] = true;
+
+		while(!Queue.empty())
+		{
+			size_t Idx = Queue.back();
+			Queue.pop_back();
+			Group.push_back(CheckpointTiles[Idx]);
+
+			int cx = CheckpointTiles[Idx].first;
+			int cy = CheckpointTiles[Idx].second;
+
+			// Check adjacent tiles
+			for(size_t j = 0; j < CheckpointTiles.size(); j++)
+			{
+				if(Visited[j])
+					continue;
+
+				int dx = std::abs(CheckpointTiles[j].first - cx);
+				int dy = std::abs(CheckpointTiles[j].second - cy);
+
+				if(dx <= 1 && dy <= 1)
+				{
+					Visited[j] = true;
+					Queue.push_back(j);
+				}
+			}
+		}
+
+		// Calculate center and index of this checkpoint group
+		float SumX = 0, SumY = 0;
+		int MaxIndex = -1;
+
+		for(const auto &Tile : Group)
+		{
+			SumX += (Tile.first + 0.5f) * 32.0f;
+			SumY += (Tile.second + 0.5f) * 32.0f;
+
+			auto It = TileIndices.find(Tile);
+			if(It != TileIndices.end() && It->second > MaxIndex)
+			{
+				MaxIndex = It->second;
+			}
+		}
+
+		SCheckpoint Cp;
+		Cp.m_Pos = vec2(SumX / Group.size(), SumY / Group.size());
+		Cp.m_Index = MaxIndex;
+		m_vCheckpoints.push_back(Cp);
+	}
+
+	// Sort checkpoints by index
+	std::sort(m_vCheckpoints.begin(), m_vCheckpoints.end(),
+		[](const SCheckpoint &a, const SCheckpoint &b) {
+			return a.m_Index < b.m_Index;
+		});
+
+	// Re-assign sequential indices
+	for(size_t i = 0; i < m_vCheckpoints.size(); i++)
+	{
+		m_vCheckpoints[i].m_Index = (int)i;
+	}
+
+	m_MapAnalyzed = true;
+
+	dbg_msg("rl/bots", "Map analyzed: %d checkpoints, spawn (%.0f, %.0f), finish (%.0f, %.0f)",
+		(int)m_vCheckpoints.size(), m_SpawnPos.x, m_SpawnPos.y, m_FinishPos.x, m_FinishPos.y);
+}
+
+vec2 CBotManager::GetNextCheckpointPos(int CurrentIndex) const
+{
+	// If no checkpoints, target finish
+	if(m_vCheckpoints.empty())
+	{
+		return m_FinishPos.x > 0 ? m_FinishPos : m_SpawnPos;
+	}
+
+	// If before any checkpoint, target first
+	if(CurrentIndex < 0)
+	{
+		return m_vCheckpoints[0].m_Pos;
+	}
+
+	// If at or past last checkpoint, target finish
+	if(CurrentIndex >= (int)m_vCheckpoints.size() - 1)
+	{
+		return m_FinishPos.x > 0 ? m_FinishPos : m_vCheckpoints.back().m_Pos;
+	}
+
+	// Target next checkpoint
+	return m_vCheckpoints[CurrentIndex + 1].m_Pos;
+}
+
+int CBotManager::GetCheckpointAtPos(vec2 Pos, float Radius) const
+{
+	for(const auto &Cp : m_vCheckpoints)
+	{
+		if(distance(Pos, Cp.m_Pos) < Radius)
+		{
+			return Cp.m_Index;
+		}
+	}
+	return -1;
 }
 
 } // namespace rl
