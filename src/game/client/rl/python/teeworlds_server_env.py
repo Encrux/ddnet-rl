@@ -84,6 +84,7 @@ class ServerEnvConfig:
     server_path: str = None  # Will be resolved in __post_init__
     server_port: int = 8303
     sv_tickrate: int = 50
+    frame_skip: int = 1      # 1 = no skip, 4 = act every 4th tick (decision rate = tickrate/frame_skip)
     max_episode_steps: int = 2000
     startup_wait: float = 3.0
     action_timeout: float = 0.1  # Timeout waiting for Python to provide actions
@@ -175,6 +176,7 @@ class ServerShmClient:
             'server_ready': 0,
             'python_ready': 4,
             'shutdown': 8,
+            'paused': 12,
         }
         if field in offsets:
             self.shm_mmap.seek(offsets[field])
@@ -275,6 +277,16 @@ class ServerShmClient:
     def clear_actions_ready(self):
         """Clear the python_ready flag."""
         self._write_header_field('python_ready', 0)
+
+    def signal_pause(self):
+        """Signal to server to pause simulation (e.g., during PPO update)."""
+        self._write_header_field('paused', 1)
+        self.shm_mmap.flush()  # Ensure write is visible to server
+
+    def signal_unpause(self):
+        """Signal to server to resume simulation."""
+        self._write_header_field('paused', 0)
+        self.shm_mmap.flush()  # Ensure write is visible to server
 
 
 class TeeWorldsServerEnv:
@@ -417,11 +429,13 @@ class TeeWorldsServerEnv:
             f.write(f"sv_tickrate {self.config.sv_tickrate}\n")
             f.write(f"sv_max_clients 64\n")
             f.write(f"sv_rl_bots {self.num_bots}\n")
+            f.write(f"sv_rl_frame_skip {self.config.frame_skip}\n")
             f.write(f"sv_register 0\n")  # Don't register with master
             f.write(f"sv_rcon_password p\n")
             # Allow spectators to connect and watch
             if self.config.allow_spectators:
-                f.write(f"sv_spectator_slots 16\n")
+                # Reserve only 1 spectator slot to maximize bot capacity (64 - 1 = 63 active)
+                f.write(f"sv_spectator_slots 1\n")
                 f.write(f"sv_max_clients_per_ip 4\n")
 
         server_cmd = [self.config.server_path]
@@ -433,7 +447,8 @@ class TeeWorldsServerEnv:
             stderr=subprocess.DEVNULL,
             cwd=server_dir,  # Run from server directory so it finds data/
         )
-        print(f"Server started (PID: {self.server_proc.pid}, map: {self.config.map_name}, tickrate: {self.config.sv_tickrate}, bots: {self.num_bots})")
+        effective_rate = self.config.sv_tickrate // self.config.frame_skip
+        print(f"Server started (PID: {self.server_proc.pid}, map: {self.config.map_name}, tickrate: {self.config.sv_tickrate}, frame_skip: {self.config.frame_skip}, decision_rate: {effective_rate}Hz, bots: {self.num_bots})")
         if self.config.allow_spectators:
             print(f"  Connect with DDNet client to 127.0.0.1:{self.config.server_port} to watch")
         time.sleep(self.config.startup_wait)
@@ -608,6 +623,28 @@ class TeeWorldsServerEnv:
         for i in np.where(mask)[0]:
             self.episode_steps[i] = 0
             self.episode_rewards[i] = 0.0
+
+    def pause(self):
+        """
+        Signal the server to pause simulation.
+
+        Call this before PPO updates to prevent bots from taking actions
+        with stale policy during the update. The server will freeze physics
+        until unpause() is called.
+
+        Note: Requires sv_rl_allow_pause 1 on the server (default).
+        """
+        if self.shm_client:
+            self.shm_client.signal_pause()
+
+    def unpause(self):
+        """
+        Signal the server to resume simulation.
+
+        Call this after PPO updates to resume normal operation.
+        """
+        if self.shm_client:
+            self.shm_client.signal_unpause()
 
     def close(self):
         """Clean up all resources."""

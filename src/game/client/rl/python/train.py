@@ -45,6 +45,8 @@ def parse_args():
                         help="Frame skip (1=no skip, 4=act every 4th tick)")
     parser.add_argument("--server-side", action="store_true",
                         help="Use server-side bots (much more efficient)")
+    parser.add_argument("--no-sync-inference", action="store_true",
+                        help="Don't pause server during inference (faster but bots may stutter)")
     parser.add_argument("--map", type=str, default="Tutorial",
                         help="Map to train on (default: Tutorial)")
 
@@ -140,10 +142,10 @@ def main():
     device = get_device(args.device)
     print(f"Using device: {device}")
 
-    # Create run name
+    # Create run name (timestamp first for lexicographic sorting)
     if args.run_name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.run_name = f"teeworlds_ppo_{args.num_envs}env_{timestamp}"
+        args.run_name = f"{timestamp}_ppo_{args.num_envs}env"
 
     run_dir = os.path.join(args.log_dir, args.run_name)
     os.makedirs(run_dir, exist_ok=True)
@@ -161,6 +163,7 @@ def main():
         print(f"\nCreating SERVER-SIDE environment with {args.num_envs} bots on map '{args.map}'...")
         server_config = ServerEnvConfig(
             sv_tickrate=args.sv_tickrate,
+            frame_skip=args.frame_skip,
             max_episode_steps=args.max_episode_steps,
             use_dict_obs=args.use_cnn,  # Enable dict observations for CNN
             map_name=args.map,
@@ -229,6 +232,9 @@ def main():
         if args.frame_skip > 1:
             effective_rate = args.sv_tickrate / args.frame_skip
             print(f"Effective decision rate: {effective_rate:.0f} Hz")
+        if args.server_side:
+            sync_mode = "sync (pause during inference)" if not args.no_sync_inference else "async (may stutter)"
+            print(f"Inference mode: {sync_mode}")
         print("-" * 60)
 
         start_time = time.time()
@@ -253,8 +259,13 @@ def main():
             for step in range(args.num_steps):
                 global_step += args.num_envs
 
-                # Get action
+                # Get action (pause during inference to prevent bots from repeating stale actions)
+                sync_inference = args.server_side and not args.no_sync_inference
+                if sync_inference:
+                    env.pause()
                 action, log_prob, value = agent.get_action(obs)
+                if sync_inference:
+                    env.unpause()
 
                 # Environment step
                 next_obs, reward, done, truncated, infos = env.step(action)
@@ -270,8 +281,12 @@ def main():
                         episode_rewards.append(info['episode']['r'])
                         episode_lengths.append(info['episode']['l'])
 
-            # PPO update
+            # PPO update (pause simulation to prevent bots from acting with stale policy)
+            if args.server_side:
+                env.pause()
             stats = agent.update(obs, done | truncated)
+            if args.server_side:
+                env.unpause()
             agent.global_step = global_step
 
             # Logging

@@ -1,6 +1,7 @@
 /* Teeworlds RL Bot - Map Analysis Implementation */
 #include "map_analysis.h"
 
+#include <base/system.h>
 #include <game/collision.h>
 #include <game/layers.h>
 #include <game/mapitems.h>

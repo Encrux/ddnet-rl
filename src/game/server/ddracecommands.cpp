@@ -674,6 +674,99 @@ void CGameContext::ConRLStatus(IConsole::IResult *pResult, void *pUserData)
 		str_format(aBuf, sizeof(aBuf), "  Bot %d: ClientId=%d (%s)", i, ClientId, pStatus);
 		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
 	}
+
+	// Show frame skip and pause settings
+	int FrameSkip = pSelf->m_pBotManager->GetFrameSkip();
+	bool AllowPause = pSelf->m_pBotManager->GetAllowPause();
+	bool IsPaused = pSelf->m_pBotManager->IsPaused();
+	str_format(aBuf, sizeof(aBuf), "Frame skip: %d, Allow pause: %s%s",
+		FrameSkip, AllowPause ? "yes" : "no", IsPaused ? " (PAUSED)" : "");
+	pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+
+	int TotalTicks, MissedActions, MaxConsecutive;
+	int64_t MaxLatencyUs;
+	pSelf->m_pBotManager->GetStats(&TotalTicks, &MissedActions, &MaxConsecutive, &MaxLatencyUs);
+
+	if(TotalTicks > 0)
+	{
+		// TotalTicks counts all ticks, but misses only occur on decision ticks
+		int DecisionTicks = TotalTicks / FrameSkip;
+		if(DecisionTicks > 0)
+		{
+			float MissRate = (float)MissedActions / DecisionTicks * 100.0f;
+			str_format(aBuf, sizeof(aBuf), "Stats: %d/%d decision ticks missed (%.1f%%), max consecutive: %d",
+				MissedActions, DecisionTicks, MissRate, MaxConsecutive);
+			pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+
+			// Show max latency between successful exchanges
+			if(MaxLatencyUs > 0)
+			{
+				float ExpectedMs = 1000.0f * FrameSkip / pSelf->Server()->TickSpeed();
+				str_format(aBuf, sizeof(aBuf), "Max latency between successes: %.1fms (expected: %.1fms)",
+					MaxLatencyUs / 1000.0f, ExpectedMs);
+				pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+			}
+		}
+	}
+}
+
+void CGameContext::ConRLFrameSkip(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+
+	if(!pSelf->m_pBotManager || !pSelf->m_pBotManager->IsEnabled())
+	{
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", "RL bots not active");
+		return;
+	}
+
+	if(pResult->NumArguments() > 0)
+	{
+		int FrameSkip = pResult->GetInteger(0);
+		if(FrameSkip < 1 || FrameSkip > 100)
+		{
+			pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", "Frame skip must be between 1 and 100");
+			return;
+		}
+		pSelf->m_pBotManager->SetFrameSkip(FrameSkip);
+
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "Frame skip set to %d", FrameSkip);
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+	}
+	else
+	{
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "Current frame skip: %d", pSelf->m_pBotManager->GetFrameSkip());
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+	}
+}
+
+void CGameContext::ConRLAllowPause(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+
+	if(!pSelf->m_pBotManager || !pSelf->m_pBotManager->IsEnabled())
+	{
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", "RL bots not active");
+		return;
+	}
+
+	if(pResult->NumArguments() > 0)
+	{
+		bool Allow = pResult->GetInteger(0) != 0;
+		pSelf->m_pBotManager->SetAllowPause(Allow);
+
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "Allow pause: %s", Allow ? "enabled" : "disabled");
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+	}
+	else
+	{
+		char aBuf[128];
+		str_format(aBuf, sizeof(aBuf), "Allow pause: %s", pSelf->m_pBotManager->GetAllowPause() ? "enabled" : "disabled");
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+	}
 }
 
 void CGameContext::ConDumpLog(IConsole::IResult *pResult, void *pUserData)

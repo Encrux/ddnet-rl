@@ -170,11 +170,11 @@ struct SStructuredObservation
 	int32_t m_TotalCheckpoints; // Total number of checkpoints in map
 
 	// Padding to align to nice size
-	uint8_t m_Reserved[11];
+	uint8_t m_Reserved[27];
 };
 #pragma pack(pop)
 
-// Total: 8+36+540+640+192+(16+4+12)+1333 + (16*4*3) + 4 + 16 + 11 = 3020 bytes
+// Total: 8+36+540+640+192+32+1333+192+4+16+27 = 3020 bytes
 // Tile grid: 43x31 = 1333 bytes (1.5x original size)
 // Raycast addition: 16 floats * 3 types * 4 bytes = 192 bytes
 // Extra state: 4 bytes

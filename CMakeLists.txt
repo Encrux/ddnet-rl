@@ -2489,6 +2489,8 @@ if(CLIENT)
     rl/communication/comm_interface.h
     rl/communication/shm_comm.cpp
     rl/communication/shm_comm.h
+    rl/map_analysis.cpp
+    rl/map_analysis.h
     rl/rlbot.cpp
     rl/rlbot.h
     sixup_translate_connless.cpp

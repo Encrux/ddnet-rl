@@ -173,6 +173,8 @@ class CGameContext : public IGameServer
 	static void ConAntibot(IConsole::IResult *pResult, void *pUserData);
 	static void ConRLBots(IConsole::IResult *pResult, void *pUserData);
 	static void ConRLStatus(IConsole::IResult *pResult, void *pUserData);
+	static void ConRLFrameSkip(IConsole::IResult *pResult, void *pUserData);
+	static void ConRLAllowPause(IConsole::IResult *pResult, void *pUserData);
 	static void ConchainSpecialMotdupdate(IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData);
 	static void ConchainSettingUpdate(IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData);
 	static void ConchainPracticeByDefaultUpdate(IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData);

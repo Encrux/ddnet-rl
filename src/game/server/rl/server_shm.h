@@ -42,6 +42,7 @@ public:
 	bool AreActionsReady();          // Check if Python has written actions
 	void ClearActionsReady();        // Clear for next tick
 	bool IsShutdownRequested();      // Check if Python requested shutdown
+	bool IsPauseRequested();         // Check if Python requested simulation pause
 
 	// Wait for actions with timeout (returns false on timeout)
 	bool WaitForActions(int TimeoutMs);

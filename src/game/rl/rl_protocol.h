@@ -221,7 +221,7 @@ struct SServerRLHeader
 	int32_t m_ServerReady;    // Server has written observations
 	int32_t m_PythonReady;    // Python has written actions
 	int32_t m_Shutdown;       // Shutdown signal
-	int32_t m_Padding1;
+	int32_t m_Paused;         // Python requests simulation pause (e.g., during PPO update)
 
 	// Configuration
 	int32_t m_NumBots;        // Number of active bots

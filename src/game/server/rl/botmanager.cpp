@@ -28,11 +28,22 @@ CBotManager::CBotManager(CGameContext *pGameContext) :
 	m_SpawnPos(0, 0),
 	m_FinishPos(0, 0),
 	m_MapAnalyzed(false),
-	m_LastTick(0)
+	m_LastTick(0),
+	m_FrameSkip(1),
+	m_FrameSkipCounter(0),
+	m_AllowPause(true),
+	m_WasPaused(false),
+	m_TotalTicks(0),
+	m_MissedActions(0),
+	m_ConsecutiveMisses(0),
+	m_MaxConsecutiveMisses(0),
+	m_LastSuccessTime(0),
+	m_MaxLatencyUs(0)
 {
 	mem_zero(m_aClientIds, sizeof(m_aClientIds));
 	mem_zero(m_aBotState, sizeof(m_aBotState));
 	mem_zero(m_aBotInputs, sizeof(m_aBotInputs));
+	mem_zero(m_aAccumulatedRewards, sizeof(m_aAccumulatedRewards));
 }
 
 CBotManager::~CBotManager()
@@ -151,7 +162,7 @@ bool CBotManager::CreateBotPlayers()
 		{
 			// Initialize bot client state with a name BEFORE creating player
 			char aBotName[MAX_NAME_LENGTH];
-			str_format(aBotName, sizeof(aBotName), "RL Bot %d", i);
+			str_format(aBotName, sizeof(aBotName), "RL Bot %02d", i);
 			m_pGameContext->Server()->InitBotClient(NextClientId, aBotName);
 
 			// Use CreatePlayer which handles the pool allocation and UniqueClientId
@@ -208,6 +219,21 @@ void CBotManager::Tick()
 	if(!m_Enabled || !m_pShm)
 		return;
 
+	// Skip tick processing when paused (e.g., during PPO updates)
+	// This prevents counting misses and incrementing tick counters during pause
+	if(IsPaused())
+	{
+		m_WasPaused = true;
+		return;
+	}
+
+	// Reset latency timer after unpausing to avoid counting pause time
+	if(m_WasPaused)
+	{
+		m_LastSuccessTime = 0;  // Will be set on next successful exchange
+		m_WasPaused = false;
+	}
+
 	// Deferred player creation: create actual players once controller is ready
 	if(!m_PlayersCreated && m_pGameContext->m_pController)
 	{
@@ -221,7 +247,7 @@ void CBotManager::Tick()
 			{
 				// Initialize bot client state with a name BEFORE creating player
 				char aBotName[MAX_NAME_LENGTH];
-				str_format(aBotName, sizeof(aBotName), "RL Bot %d", i);
+				str_format(aBotName, sizeof(aBotName), "RL Bot %02d", i);
 				m_pGameContext->Server()->InitBotClient(ClientId, aBotName);
 
 				CPlayer *pPlayer = m_pGameContext->CreatePlayer(ClientId, 0, false, -1);
@@ -251,15 +277,41 @@ void CBotManager::Tick()
 		return;
 	}
 
-	// Check if Python has actions ready (non-blocking)
-	// We use a very short timeout to avoid blocking the server's network processing
-	// This allows real clients to connect and watch the bots
+	m_TotalTicks++;
+
+	// Frame skip: only exchange with Python on decision ticks
+	// On non-decision ticks, previous inputs are automatically reused
+	m_FrameSkipCounter++;
+	if(m_FrameSkipCounter < m_FrameSkip)
+	{
+		// Not a decision tick - skip Python exchange, use previous inputs
+		return;
+	}
+	m_FrameSkipCounter = 0; // Reset counter for next cycle
+
+	// Decision tick: check if Python has actions ready (non-blocking)
+	int64_t Now = time_get();
 	if(!m_pShm->AreActionsReady())
 	{
 		// No actions ready - use previous inputs
 		// Don't block - the server needs to process network events
+		m_MissedActions++;
+		m_ConsecutiveMisses++;
+		if(m_ConsecutiveMisses > m_MaxConsecutiveMisses)
+			m_MaxConsecutiveMisses = m_ConsecutiveMisses;
 		return;
 	}
+
+	// Track latency since last successful exchange
+	if(m_LastSuccessTime > 0)
+	{
+		int64_t LatencyUs = (Now - m_LastSuccessTime) * 1000000 / time_freq();
+		if(LatencyUs > m_MaxLatencyUs)
+			m_MaxLatencyUs = LatencyUs;
+	}
+	m_LastSuccessTime = Now;
+
+	m_ConsecutiveMisses = 0; // Reset on success
 
 	// Inject inputs
 	InjectBotInputs();
@@ -343,6 +395,10 @@ void CBotManager::ExtractObservations()
 	if(!m_Enabled || !m_pShm)
 		return;
 
+	// Skip during pause (no observations to extract, physics frozen)
+	if(IsPaused())
+		return;
+
 	// Analyze map for checkpoints on first call
 	if(!m_MapAnalyzed && m_pCollision)
 	{
@@ -350,6 +406,11 @@ void CBotManager::ExtractObservations()
 	}
 
 	int CurrentTick = m_pGameContext->Server()->Tick();
+
+	// Check if this is a decision tick (when we'll signal Python)
+	// m_FrameSkipCounter was already incremented and potentially reset in Tick()
+	// So if it's 0, we just reset it, meaning this is a decision tick
+	bool IsDecisionTick = (m_FrameSkipCounter == 0);
 
 	for(int i = 0; i < m_NumBots; i++)
 	{
@@ -359,105 +420,151 @@ void CBotManager::ExtractObservations()
 		if(!pBotData)
 			continue;
 
-		SStructuredObservation *pObs = &pBotData->m_Observation;
-		mem_zero(pObs, sizeof(SStructuredObservation));
-
-		pObs->m_Tick = CurrentTick;
-
 		// Check if we have a real player with character
 		CPlayer *pPlayer = m_pGameContext->m_apPlayers[ClientId];
 		CCharacter *pChar = pPlayer ? pPlayer->GetCharacter() : nullptr;
 
+		float TickReward = 0.0f;
+		bool IsDone = false;
+
 		if(pChar && pChar->IsAlive())
 		{
-			// Extract local player state
-			ExtractPlayerObs(pChar, &pObs->m_LocalPlayer, true);
-
-			// Extract tile grid
-			ExtractTileGrid(pChar, pObs->m_aTileGrid);
-
-			// Extract raycasts
-			ExtractRaycasts(pChar, pObs);
-
-			// Extract other players
-			int OtherIdx = 0;
-			for(int j = 0; j < MAX_CLIENTS && OtherIdx < MAX_OTHER_PLAYERS; j++)
+			// On decision ticks, extract full observation
+			// On non-decision ticks, we still need to calculate reward for accumulation
+			if(IsDecisionTick)
 			{
-				if(j == ClientId)
-					continue;
+				SStructuredObservation *pObs = &pBotData->m_Observation;
+				mem_zero(pObs, sizeof(SStructuredObservation));
 
-				CPlayer *pOther = m_pGameContext->m_apPlayers[j];
-				if(pOther && pOther->GetCharacter())
+				pObs->m_Tick = CurrentTick;
+
+				// Extract local player state
+				ExtractPlayerObs(pChar, &pObs->m_LocalPlayer, true);
+
+				// Extract tile grid
+				ExtractTileGrid(pChar, pObs->m_aTileGrid);
+
+				// Extract raycasts
+				ExtractRaycasts(pChar, pObs);
+
+				// Extract other players
+				int OtherIdx = 0;
+				for(int j = 0; j < MAX_CLIENTS && OtherIdx < MAX_OTHER_PLAYERS; j++)
 				{
-					ExtractPlayerObs(pOther->GetCharacter(), &pObs->m_aOtherPlayers[OtherIdx], false);
-					OtherIdx++;
+					if(j == ClientId)
+						continue;
+
+					CPlayer *pOther = m_pGameContext->m_apPlayers[j];
+					if(pOther && pOther->GetCharacter())
+					{
+						ExtractPlayerObs(pOther->GetCharacter(), &pObs->m_aOtherPlayers[OtherIdx], false);
+						OtherIdx++;
+					}
 				}
+				pObs->m_NumActivePlayers = OtherIdx + 1;
+
+				// Extra state
+				vec2 Pos = pChar->GetPos();
+				int TileX = (int)(Pos.x / 32.0f);
+				int TileY = (int)((Pos.y + 16.0f) / 32.0f); // Check below feet
+
+				pObs->m_IsGrounded = 0;
+				if(m_pCollision && TileX >= 0 && TileX < m_pCollision->GetWidth() &&
+				   TileY >= 0 && TileY < m_pCollision->GetHeight())
+				{
+					int MapIndex = TileY * m_pCollision->GetWidth() + TileX;
+					int TileIdx = m_pCollision->GetTileIndex(MapIndex);
+					if(TileIdx == TILE_SOLID)
+						pObs->m_IsGrounded = 1;
+				}
+
+				// Jumps remaining
+				int Jumped = pChar->Core()->m_Jumped;
+				if(Jumped == 0)
+					pObs->m_JumpsRemaining = 2;
+				else if(Jumped == 1)
+					pObs->m_JumpsRemaining = 1;
+				else
+					pObs->m_JumpsRemaining = 0;
+
+				pObs->m_CanHook = (pChar->Core()->m_HookState == HOOK_IDLE) ? 1 : 0;
+
+				// Checkpoint navigation info
+				int CurrentCpIdx = m_aBotState[i].m_CurrentCheckpointIndex;
+				vec2 NextCpPos = GetNextCheckpointPos(CurrentCpIdx);
+				pObs->m_NextCheckpointX = NextCpPos.x;
+				pObs->m_NextCheckpointY = NextCpPos.y;
+				pObs->m_CheckpointIndex = CurrentCpIdx;
+				pObs->m_TotalCheckpoints = (int)m_vCheckpoints.size();
+
+				// Check if bot reached a new checkpoint
+				vec2 CharPos = pChar->GetPos();
+				int CpAtPos = GetCheckpointAtPos(CharPos);
+				if(CpAtPos >= 0 && CpAtPos > CurrentCpIdx)
+				{
+					m_aBotState[i].m_CurrentCheckpointIndex = CpAtPos;
+				}
+
+				// Calculate reward for this tick
+				TickReward = CalculateReward(i, pObs);
 			}
-			pObs->m_NumActivePlayers = OtherIdx + 1;
-
-			// Extra state
-			vec2 Pos = pChar->GetPos();
-			int TileX = (int)(Pos.x / 32.0f);
-			int TileY = (int)((Pos.y + 16.0f) / 32.0f); // Check below feet
-
-			pObs->m_IsGrounded = 0;
-			if(m_pCollision && TileX >= 0 && TileX < m_pCollision->GetWidth() &&
-			   TileY >= 0 && TileY < m_pCollision->GetHeight())
-			{
-				int MapIndex = TileY * m_pCollision->GetWidth() + TileX;
-				int TileIdx = m_pCollision->GetTileIndex(MapIndex);
-				if(TileIdx == TILE_SOLID)
-					pObs->m_IsGrounded = 1;
-			}
-
-			// Jumps remaining
-			int Jumped = pChar->Core()->m_Jumped;
-			if(Jumped == 0)
-				pObs->m_JumpsRemaining = 2;
-			else if(Jumped == 1)
-				pObs->m_JumpsRemaining = 1;
 			else
-				pObs->m_JumpsRemaining = 0;
-
-			pObs->m_CanHook = (pChar->Core()->m_HookState == HOOK_IDLE) ? 1 : 0;
-
-			// Checkpoint navigation info
-			int CurrentCpIdx = m_aBotState[i].m_CurrentCheckpointIndex;
-			vec2 NextCpPos = GetNextCheckpointPos(CurrentCpIdx);
-			pObs->m_NextCheckpointX = NextCpPos.x;
-			pObs->m_NextCheckpointY = NextCpPos.y;
-			pObs->m_CheckpointIndex = CurrentCpIdx;
-			pObs->m_TotalCheckpoints = (int)m_vCheckpoints.size();
-
-			// Check if bot reached a new checkpoint
-			vec2 CharPos = pChar->GetPos();
-			int CpAtPos = GetCheckpointAtPos(CharPos);
-			if(CpAtPos >= 0 && CpAtPos > CurrentCpIdx)
 			{
-				m_aBotState[i].m_CurrentCheckpointIndex = CpAtPos;
-			}
+				// Non-decision tick: still calculate reward for accumulation
+				// Need a temporary observation for reward calculation
+				SStructuredObservation TempObs;
+				mem_zero(&TempObs, sizeof(TempObs));
+				ExtractPlayerObs(pChar, &TempObs.m_LocalPlayer, true);
 
-			// Calculate reward
-			pBotData->m_Reward = CalculateReward(i, pObs);
-			pBotData->m_Done = 0;
+				// Checkpoint tracking
+				int CurrentCpIdx = m_aBotState[i].m_CurrentCheckpointIndex;
+				vec2 NextCpPos = GetNextCheckpointPos(CurrentCpIdx);
+				TempObs.m_NextCheckpointX = NextCpPos.x;
+				TempObs.m_NextCheckpointY = NextCpPos.y;
+				TempObs.m_CheckpointIndex = CurrentCpIdx;
+
+				vec2 CharPos = pChar->GetPos();
+				int CpAtPos = GetCheckpointAtPos(CharPos);
+				if(CpAtPos >= 0 && CpAtPos > CurrentCpIdx)
+				{
+					m_aBotState[i].m_CurrentCheckpointIndex = CpAtPos;
+				}
+
+				TickReward = CalculateReward(i, &TempObs);
+			}
 		}
 		else
 		{
 			// Character dead or not spawned
-			pBotData->m_Reward = -1.0f; // Death penalty
-			pBotData->m_Done = 1;
+			TickReward = -1.0f; // Death penalty
+			IsDone = true;
+		}
+
+		// Accumulate reward
+		m_aAccumulatedRewards[i] += TickReward;
+
+		// On decision tick, write accumulated reward to shared memory and reset
+		if(IsDecisionTick)
+		{
+			pBotData->m_Reward = m_aAccumulatedRewards[i];
+			pBotData->m_Done = IsDone ? 1 : 0;
+			m_aAccumulatedRewards[i] = 0.0f; // Reset for next cycle
 		}
 	}
 
-	// Update header tick
-	SServerRLHeader *pHeader = m_pShm->GetHeader();
-	if(pHeader)
+	// Only signal observations on decision ticks
+	if(IsDecisionTick)
 	{
-		pHeader->m_ServerTick = CurrentTick;
-	}
+		// Update header tick
+		SServerRLHeader *pHeader = m_pShm->GetHeader();
+		if(pHeader)
+		{
+			pHeader->m_ServerTick = CurrentTick;
+		}
 
-	// Signal observations are ready
-	m_pShm->SignalObservationsReady();
+		// Signal observations are ready
+		m_pShm->SignalObservationsReady();
+	}
 
 	m_LastTick = CurrentTick;
 }
@@ -927,6 +1034,40 @@ int CBotManager::GetCheckpointAtPos(vec2 Pos, float Radius) const
 		}
 	}
 	return -1;
+}
+
+void CBotManager::GetStats(int *pTotalTicks, int *pMissedActions, int *pMaxConsecutive, int64_t *pMaxLatencyUs) const
+{
+	if(pTotalTicks)
+		*pTotalTicks = m_TotalTicks;
+	if(pMissedActions)
+		*pMissedActions = m_MissedActions;
+	if(pMaxConsecutive)
+		*pMaxConsecutive = m_MaxConsecutiveMisses;
+	if(pMaxLatencyUs)
+		*pMaxLatencyUs = m_MaxLatencyUs;
+}
+
+void CBotManager::SetFrameSkip(int FrameSkip)
+{
+	if(FrameSkip < 1)
+		FrameSkip = 1;
+	if(FrameSkip > 100)
+		FrameSkip = 100;
+
+	m_FrameSkip = FrameSkip;
+	m_FrameSkipCounter = 0; // Reset counter
+	mem_zero(m_aAccumulatedRewards, sizeof(m_aAccumulatedRewards)); // Clear accumulated rewards
+
+	dbg_msg("rl/bots", "Frame skip set to %d (decision rate: server_tickrate/%d)", FrameSkip, FrameSkip);
+}
+
+bool CBotManager::IsPaused() const
+{
+	if(!m_Enabled || !m_pShm || !m_AllowPause)
+		return false;
+
+	return m_pShm->IsPauseRequested();
 }
 
 } // namespace rl

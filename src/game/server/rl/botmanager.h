@@ -41,6 +41,15 @@ public:
 	bool IsEnabled() const { return m_Enabled; }
 	int NumBots() const { return m_NumBots; }
 
+	// Frame skip configuration
+	void SetFrameSkip(int FrameSkip);
+	int GetFrameSkip() const { return m_FrameSkip; }
+
+	// Pause support (for PPO updates)
+	void SetAllowPause(bool Allow) { m_AllowPause = Allow; }
+	bool GetAllowPause() const { return m_AllowPause; }
+	bool IsPaused() const;  // Returns true if Python requested pause AND allow_pause is enabled
+
 	// Get bot client ID
 	int GetBotClientId(int BotIndex) const;
 
@@ -117,6 +126,27 @@ private:
 
 	// Tick tracking
 	int m_LastTick;
+
+	// Frame skip (only exchange with Python every N ticks)
+	int m_FrameSkip;
+	int m_FrameSkipCounter;
+	float m_aAccumulatedRewards[MAX_RL_BOTS];
+
+	// Pause support
+	bool m_AllowPause;
+	bool m_WasPaused;  // Track pause state transitions for latency reset
+
+	// Diagnostic stats
+	int m_TotalTicks;
+	int m_MissedActions;
+	int m_ConsecutiveMisses;
+	int m_MaxConsecutiveMisses;
+	int64_t m_LastSuccessTime;
+	int64_t m_MaxLatencyUs;
+
+public:
+	// Get diagnostic stats
+	void GetStats(int *pTotalTicks, int *pMissedActions, int *pMaxConsecutive, int64_t *pMaxLatencyUs) const;
 };
 
 } // namespace rl

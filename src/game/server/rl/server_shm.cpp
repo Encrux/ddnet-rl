@@ -206,6 +206,18 @@ bool CServerShm::IsShutdownRequested()
 	return pHeader->m_Shutdown != 0;
 }
 
+bool CServerShm::IsPauseRequested()
+{
+	if(!m_pShmPtr)
+		return false;
+
+	// Memory barrier to ensure we see the latest value from Python
+	__sync_synchronize();
+
+	const SServerRLHeader *pHeader = GetHeader();
+	return pHeader->m_Paused != 0;
+}
+
 bool CServerShm::WaitForActions(int TimeoutMs)
 {
 	if(!m_pShmPtr)
