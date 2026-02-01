@@ -30,15 +30,42 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 
-# Import observation parsing from existing client code
-from teeworlds_env import (
-    StructuredObservation, PlayerObs, ProjectileObs,
-    STRUCTURED_OBS_SIZE, MAX_OTHER_PLAYERS, MAX_PROJECTILES, MAX_PICKUPS,
-    TILE_GRID_SIZE, TILE_GRID_WIDTH, TILE_GRID_HEIGHT, NUM_RAYCASTS
-)
+# Try to import numba for JIT acceleration
+try:
+    from numba import jit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    # Fallback: define a no-op jit decorator
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    prange = range
 
-# Re-define locally for vectorized parsing
-_TILE_GRID_SIZE = TILE_GRID_SIZE  # 1333
+# Tile grid constants (match C++ rl_protocol.h)
+TILE_GRID_WIDTH = 43   # 21 left + 1 center + 21 right
+TILE_GRID_HEIGHT = 31  # 15 up + 1 center + 15 down
+TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT  # 1333
+
+
+def _warmup_numba_jit():
+    """Pre-compile Numba JIT functions to avoid compilation delay during training."""
+    if not NUMBA_AVAILABLE:
+        return
+
+    # Create tiny dummy arrays to trigger JIT compilation
+    n = 2
+    raw = np.zeros(n * 1448, dtype=np.uint8)
+    features = np.zeros((n, 68), dtype=np.float32)
+    player_state = np.zeros((n, 15), dtype=np.float32)
+    checkpoint = np.zeros((n, 4), dtype=np.float32)
+    rewards = np.zeros(n, dtype=np.float32)
+    dones = np.zeros(n, dtype=np.bool_)
+
+    # Trigger compilation (first call compiles, subsequent calls are fast)
+    _parse_flat_obs_numba(raw, n, features, rewards, dones)
+    _parse_cnn_obs_numba(raw, n, player_state, checkpoint, rewards, dones)
 
 # Constants matching C++ rl_protocol.h
 MAX_RL_BOTS = 128
@@ -53,8 +80,8 @@ def get_shm_path(server_index: int = 0) -> str:
 # Struct sizes (must match C++ rl_protocol.h)
 HEADER_SIZE = 32        # SServerRLHeader
 ACTION_SIZE = 32        # SAction
-OBS_SIZE = 3020         # SStructuredObservation (43x31 grid + checkpoint info)
-BOT_DATA_SIZE = 3072    # SBotData (32 + 3020 + 16 + 4)
+OBS_SIZE = 1400         # SStructuredObservation (CNN-optimized: tiles + player + checkpoint)
+BOT_DATA_SIZE = 1448    # SBotData (32 + 1400 + 16)
 
 # Global reference for signal handler cleanup
 _active_server_env: Optional['TeeWorldsServerEnv'] = None
@@ -102,10 +129,202 @@ class ServerEnvConfig:
     map_name: str = "Tutorial"   # Map to load (use novice maps for training)
     sv_name: str = "RL Training" # Server name
     allow_spectators: bool = True  # Allow connecting to watch
+    debug_timing: bool = False   # Print step timing debug info
 
     def __post_init__(self):
         if self.server_path is None:
             self.server_path = _get_default_server_path()
+
+
+# Numba-accelerated CNN observation parsing
+@jit(nopython=True, cache=True, parallel=True)
+def _parse_flat_obs_numba(raw_arr: np.ndarray, n: int,
+                           features: np.ndarray,  # (n, 68) - player(15) + checkpoint(4) + tiles(49)
+                           rewards: np.ndarray,
+                           dones: np.ndarray) -> None:
+    """Parse flat observations for MLP policy - optimized for speed.
+
+    Only extracts what's needed: player state, checkpoint, and 7x7 center tile crop.
+    Much faster than CNN parsing since we skip the full 43x31 tile grid.
+    """
+    # Offsets within SBotData (1448 bytes per bot)
+    OBS_START = 32  # After SAction
+    LOCAL_PLAYER = OBS_START + 8  # After 8-byte header
+    TILES = LOCAL_PLAYER + 36     # After SPlayerObs
+    EXTRA_STATE = TILES + 1333    # After tile grid
+    CHECKPOINT = EXTRA_STATE + 4  # After extra state
+    REWARD_OFF = OBS_START + 1400 # After observation
+    DONE_OFF = REWARD_OFF + 4
+    BOT_SIZE = 1448
+
+    # Tile grid center offsets (player is at center of 43x31 grid)
+    # Center is at (21, 15), so 7x7 crop is (18:25, 12:19)
+    TILE_CENTER_X = 21
+    TILE_CENTER_Y = 15
+
+    for i in prange(n):
+        base = i * BOT_SIZE
+
+        # Reward and done
+        rewards[i] = raw_arr[base + REWARD_OFF:base + REWARD_OFF + 4].view(np.float32)[0]
+        dones[i] = raw_arr[base + DONE_OFF:base + DONE_OFF + 4].view(np.int32)[0] != 0
+
+        # Local player floats (pos_x, pos_y, vel_x, vel_y)
+        pf = raw_arr[base + LOCAL_PLAYER:base + LOCAL_PLAYER + 16].view(np.float32)
+        pos_x, pos_y, vel_x, vel_y = pf[0], pf[1], pf[2], pf[3]
+
+        # Single-byte fields from SPlayerObs
+        direction = np.int8(raw_arr[base + LOCAL_PLAYER + 16])
+        jumped = raw_arr[base + LOCAL_PLAYER + 17]
+        hook_state = raw_arr[base + LOCAL_PLAYER + 18]
+        is_frozen = raw_arr[base + LOCAL_PLAYER + 30]
+        health = raw_arr[base + LOCAL_PLAYER + 32]
+        armor = raw_arr[base + LOCAL_PLAYER + 33]
+
+        # Extra state
+        is_grounded = raw_arr[base + EXTRA_STATE]
+        jumps_remaining = raw_arr[base + EXTRA_STATE + 1]
+        can_hook = raw_arr[base + EXTRA_STATE + 2]
+
+        # Player state (15 features) - indices 0-14
+        features[i, 0] = vel_x / 50.0
+        features[i, 1] = vel_y / 50.0
+        features[i, 2] = float(is_grounded)
+        features[i, 3] = float(jumps_remaining) / 2.0
+        features[i, 4] = float(can_hook)
+        features[i, 5] = float(direction)
+        features[i, 6] = float(is_frozen)
+        features[i, 7] = 1.0 if hook_state == 0 else 0.0
+        features[i, 8] = 1.0 if hook_state == 1 else 0.0
+        features[i, 9] = 1.0 if hook_state == 2 else 0.0
+        features[i, 10] = 0.0  # aim placeholder
+        features[i, 11] = 0.0  # aim placeholder
+        features[i, 12] = float(health) / 10.0
+        features[i, 13] = float(armor) / 10.0
+        features[i, 14] = float(jumped) / 3.0
+
+        # Checkpoint (4 features) - indices 15-18
+        cp_floats = raw_arr[base + CHECKPOINT:base + CHECKPOINT + 8].view(np.float32)
+        cp_ints = raw_arr[base + CHECKPOINT + 8:base + CHECKPOINT + 16].view(np.int32)
+        cp_x, cp_y = cp_floats[0], cp_floats[1]
+        cp_idx, total_cp = float(cp_ints[0]), float(cp_ints[1])
+
+        features[i, 15] = max(-1.0, min(1.0, (cp_x - pos_x) / 2000.0))
+        features[i, 16] = max(-1.0, min(1.0, (cp_y - pos_y) / 2000.0))
+        features[i, 17] = cp_idx / max(1.0, total_cp)
+        features[i, 18] = total_cp / 20.0
+
+        # 7x7 center tile crop (49 features) - indices 19-67
+        for ty in range(7):
+            for tx in range(7):
+                grid_y = TILE_CENTER_Y - 3 + ty  # 12 to 18
+                grid_x = TILE_CENTER_X - 3 + tx  # 18 to 24
+                tile_offset = base + TILES + grid_y * 43 + grid_x
+                features[i, 19 + ty * 7 + tx] = float(raw_arr[tile_offset]) / 15.0
+
+
+@jit(nopython=True, cache=True, parallel=True)
+def _parse_cnn_obs_numba(raw_arr: np.ndarray, n: int,
+                          player_state: np.ndarray, # (n, 15)
+                          checkpoint: np.ndarray,   # (n, 4)
+                          rewards: np.ndarray,
+                          dones: np.ndarray) -> None:
+    """Parse CNN observations (except tiles) from raw bytes using Numba JIT.
+
+    Tiles are parsed separately using numpy vectorized ops for speed.
+    """
+    # Offsets within SBotData (1448 bytes per bot)
+    OBS_START = 32  # After SAction
+    LOCAL_PLAYER = OBS_START + 8  # After 8-byte header
+    TILES = LOCAL_PLAYER + 36     # After SPlayerObs
+    EXTRA_STATE = TILES + 1333    # After tile grid
+    CHECKPOINT = EXTRA_STATE + 4  # After extra state
+    REWARD_OFF = OBS_START + 1400 # After observation
+    DONE_OFF = REWARD_OFF + 4
+    BOT_SIZE = 1448
+
+    for i in prange(n):
+        base = i * BOT_SIZE
+
+        # Reward and done
+        rewards[i] = raw_arr[base + REWARD_OFF:base + REWARD_OFF + 4].view(np.float32)[0]
+        dones[i] = raw_arr[base + DONE_OFF:base + DONE_OFF + 4].view(np.int32)[0] != 0
+
+        # Local player floats (pos_x, pos_y, vel_x, vel_y)
+        pf = raw_arr[base + LOCAL_PLAYER:base + LOCAL_PLAYER + 16].view(np.float32)
+        pos_x, pos_y, vel_x, vel_y = pf[0], pf[1], pf[2], pf[3]
+
+        # Single-byte fields from SPlayerObs
+        direction = np.int8(raw_arr[base + LOCAL_PLAYER + 16])
+        jumped = raw_arr[base + LOCAL_PLAYER + 17]
+        hook_state = raw_arr[base + LOCAL_PLAYER + 18]
+        is_frozen = raw_arr[base + LOCAL_PLAYER + 30]
+        health = raw_arr[base + LOCAL_PLAYER + 32]
+        armor = raw_arr[base + LOCAL_PLAYER + 33]
+
+        # Extra state
+        is_grounded = raw_arr[base + EXTRA_STATE]
+        jumps_remaining = raw_arr[base + EXTRA_STATE + 1]
+        can_hook = raw_arr[base + EXTRA_STATE + 2]
+
+        # Player state (15 features)
+        player_state[i, 0] = vel_x / 50.0
+        player_state[i, 1] = vel_y / 50.0
+        player_state[i, 2] = float(is_grounded)
+        player_state[i, 3] = float(jumps_remaining) / 2.0
+        player_state[i, 4] = float(can_hook)
+        player_state[i, 5] = float(direction)
+        player_state[i, 6] = float(is_frozen)
+        player_state[i, 7] = 1.0 if hook_state == 0 else 0.0
+        player_state[i, 8] = 1.0 if hook_state == 1 else 0.0
+        player_state[i, 9] = 1.0 if hook_state == 2 else 0.0
+        player_state[i, 10] = 0.0  # aim placeholder
+        player_state[i, 11] = 0.0  # aim placeholder
+        player_state[i, 12] = float(health) / 10.0
+        player_state[i, 13] = float(armor) / 10.0
+        player_state[i, 14] = float(jumped) / 3.0
+
+        # Checkpoint (4 features)
+        cp_floats = raw_arr[base + CHECKPOINT:base + CHECKPOINT + 8].view(np.float32)
+        cp_ints = raw_arr[base + CHECKPOINT + 8:base + CHECKPOINT + 16].view(np.int32)
+        cp_x, cp_y = cp_floats[0], cp_floats[1]
+        cp_idx, total_cp = float(cp_ints[0]), float(cp_ints[1])
+
+        checkpoint[i, 0] = max(-1.0, min(1.0, (cp_x - pos_x) / 2000.0))
+        checkpoint[i, 1] = max(-1.0, min(1.0, (cp_y - pos_y) / 2000.0))
+        checkpoint[i, 2] = cp_idx / max(1.0, total_cp)
+        checkpoint[i, 3] = total_cp / 20.0
+
+
+def _parse_tiles_vectorized(raw_arr: np.ndarray, n: int, tiles: np.ndarray) -> None:
+    """Parse tile grids using numpy strided view (no Python loops).
+
+    Uses as_strided to view non-contiguous tile data as a single array,
+    then processes all bots at once with vectorized operations.
+    """
+    from numpy.lib.stride_tricks import as_strided
+
+    BOT_SIZE = 1448
+    TILES_OFFSET = 32 + 8 + 36  # OBS_START + header + LocalPlayer = 76
+    TILE_SIZE = 1333  # 31 * 43
+
+    # Use strided view to access all tile data at once without copying
+    # Each bot's tiles are at offset (i * BOT_SIZE + TILES_OFFSET)
+    # Stride between bots is BOT_SIZE, stride within tiles is 1
+    tile_view = as_strided(
+        raw_arr[TILES_OFFSET:],  # Start at first bot's tiles
+        shape=(n, TILE_SIZE),
+        strides=(BOT_SIZE, 1),
+        writeable=False
+    )
+
+    # Single vectorized operation for all bots: convert to float, normalize, reshape
+    # This is ~100x faster than a Python loop
+    tiles[:, 0, :, :] = tile_view.astype(np.float32).reshape(n, 31, 43) * (1.0 / 15.0)
+
+
+# Pre-compile Numba functions at module load (avoids compilation delay in threads)
+_warmup_numba_jit()
 
 
 class ServerShmClient:
@@ -291,58 +510,185 @@ class ServerShmClient:
         return observations, rewards, dones
 
     def read_observations_batch_fast(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Read all observations as flat arrays directly (optimized with views).
+        """Read all observations as flat arrays directly (for MLP policy).
+
+        Optimized for speed - only parses what's needed for MLP:
+        - Player state (15 features)
+        - Checkpoint (4 features)
+        - 7x7 center tile crop (49 features)
 
         Returns:
-            observations: np.ndarray of shape (num_bots, 141)
+            observations: np.ndarray of shape (num_bots, 68)
             rewards: np.ndarray of shape (num_bots,)
             dones: np.ndarray of shape (num_bots,)
         """
         n = self.num_bots
 
-        # Read ALL bot data at once (single memcpy) - keep as bytes object
+        # Read ALL bot data at once (single memcpy)
         start_offset = HEADER_SIZE
         total_size = n * BOT_DATA_SIZE
         self.shm_mmap.seek(start_offset)
         raw = self.shm_mmap.read(total_size)
 
-        # Create 1D numpy view of raw bytes (no copy)
+        # Create numpy array from bytes (copy needed for Numba)
+        raw_arr = np.frombuffer(raw, dtype=np.uint8).copy()
+
+        # Pre-allocate outputs - 68 features (15 + 4 + 49)
+        features = np.zeros((n, 68), dtype=np.float32)
+        rewards = np.zeros(n, dtype=np.float32)
+        dones = np.zeros(n, dtype=np.bool_)
+
+        # Use Numba-accelerated parsing if available
+        if NUMBA_AVAILABLE:
+            _parse_flat_obs_numba(raw_arr, n, features, rewards, dones)
+        else:
+            self._parse_observations_flat_python(raw, raw_arr, n, features, rewards, dones)
+
+        # Sanitize NaN/inf (fast in-place operation)
+        np.nan_to_num(features, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        return features, rewards, dones
+
+    def read_observations_batch_cnn(self) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
+        """Read all observations as dict for CNN policy.
+
+        Uses pure numpy with strided views for maximum speed (no Numba, no loops).
+        """
+        from numpy.lib.stride_tricks import as_strided
+        import struct
+
+        n = self.num_bots
+
+        # Read ALL bot data at once
+        self.shm_mmap.seek(HEADER_SIZE)
+        raw = self.shm_mmap.read(n * BOT_DATA_SIZE)
         raw_arr = np.frombuffer(raw, dtype=np.uint8)
 
-        # Pre-allocate output
-        features = np.zeros((n, 141), dtype=np.float32)
+        # Offsets within SBotData (1448 bytes)
+        OBS_START = 32
+        LOCAL_PLAYER = OBS_START + 8  # 40
+        TILES = LOCAL_PLAYER + 36      # 76
+        EXTRA_STATE = TILES + 1333     # 1409
+        CHECKPOINT = EXTRA_STATE + 4   # 1413
+        REWARD_OFF = OBS_START + 1400  # 1432
+        DONE_OFF = REWARD_OFF + 4      # 1436
 
-        # Offsets within SBotData
-        OBS_START = ACTION_SIZE  # 32
-        LOCAL_PLAYER = OBS_START + 8
-        OTHER_PLAYERS = LOCAL_PLAYER + 36
-        TILES = OBS_START + 1452
-        RAYCASTS = OBS_START + 2785
-        EXTRA_STATE = OBS_START + 2977
-        CHECKPOINT = OBS_START + 2981
-        REWARD_OFF = OBS_START + OBS_SIZE  # 3052
-        DONE_OFF = REWARD_OFF + 4
+        # Pre-allocate outputs
+        tiles = np.empty((n, 1, 31, 43), dtype=np.float32)
+        player_state = np.empty((n, 15), dtype=np.float32)
+        checkpoint = np.empty((n, 4), dtype=np.float32)
+        rewards = np.empty(n, dtype=np.float32)
+        dones = np.empty(n, dtype=np.bool_)
 
-        # Build index arrays for strided access (computed once, reused)
+        # ===== TILES: strided view, no loop =====
+        tile_view = as_strided(raw_arr[TILES:], shape=(n, 31, 43), strides=(BOT_DATA_SIZE, 43, 1), writeable=False)
+        np.multiply(tile_view, 1.0/15.0, out=tiles[:, 0, :, :], casting='unsafe')
+
+        # ===== REWARDS & DONES: extract using struct (strided view can't reinterpret dtype) =====
+        for i in range(n):
+            base = i * BOT_DATA_SIZE
+            rewards[i] = struct.unpack_from('<f', raw, base + REWARD_OFF)[0]
+            dones[i] = struct.unpack_from('<i', raw, base + DONE_OFF)[0] != 0
+
+        # ===== PLAYER STATE: byte fields via strided view, float fields via struct =====
         bot_offsets = np.arange(n) * BOT_DATA_SIZE
 
-        # Extract rewards (4 bytes each, stride=BOT_DATA_SIZE)
-        reward_indices = bot_offsets + REWARD_OFF
-        rewards = np.array([struct.unpack_from('<f', raw, int(idx))[0] for idx in reward_indices], dtype=np.float32)
+        # Float fields (vel_x, vel_y, pos_x, pos_y) - use struct for float reinterpretation
+        pos_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER)[0] for o in bot_offsets], dtype=np.float32)
+        pos_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 4)[0] for o in bot_offsets], dtype=np.float32)
+        vel_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 8)[0] for o in bot_offsets], dtype=np.float32)
+        vel_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 12)[0] for o in bot_offsets], dtype=np.float32)
 
-        # Extract dones
-        done_indices = bot_offsets + DONE_OFF
-        dones = np.array([struct.unpack_from('<i', raw, int(idx))[0] != 0 for idx in done_indices], dtype=bool)
+        # Byte fields via strided view (fast vectorized)
+        def byte_col(offset):
+            return as_strided(raw_arr[offset:], shape=(n,), strides=(BOT_DATA_SIZE,), writeable=False)
 
-        # === Vectorized float extraction using stride tricks ===
-        # Local player floats: pos_x, pos_y, vel_x, vel_y at LOCAL_PLAYER
-        player_float_offsets = bot_offsets + LOCAL_PLAYER
-        pos_x = np.array([struct.unpack_from('<f', raw, int(o))[0] for o in player_float_offsets])
-        pos_y = np.array([struct.unpack_from('<f', raw, int(o)+4)[0] for o in player_float_offsets])
-        vel_x = np.array([struct.unpack_from('<f', raw, int(o)+8)[0] for o in player_float_offsets])
-        vel_y = np.array([struct.unpack_from('<f', raw, int(o)+12)[0] for o in player_float_offsets])
+        direction = byte_col(LOCAL_PLAYER + 16).astype(np.int8).astype(np.float32)
+        jumped = byte_col(LOCAL_PLAYER + 17).astype(np.float32)
+        hook_state = byte_col(LOCAL_PLAYER + 18).astype(np.float32)
+        is_frozen = byte_col(LOCAL_PLAYER + 30).astype(np.float32)
+        health = byte_col(LOCAL_PLAYER + 32).astype(np.float32)
+        armor = byte_col(LOCAL_PLAYER + 33).astype(np.float32)
+        is_grounded = byte_col(EXTRA_STATE).astype(np.float32)
+        jumps_remaining = byte_col(EXTRA_STATE + 1).astype(np.float32)
+        can_hook = byte_col(EXTRA_STATE + 2).astype(np.float32)
 
-        # Single-byte fields using raw array indexing (very fast)
+        player_state[:, 0] = vel_x / 50.0
+        player_state[:, 1] = vel_y / 50.0
+        player_state[:, 2] = is_grounded
+        player_state[:, 3] = jumps_remaining / 2.0
+        player_state[:, 4] = can_hook
+        player_state[:, 5] = direction
+        player_state[:, 6] = is_frozen
+        player_state[:, 7] = (hook_state == 0).astype(np.float32)
+        player_state[:, 8] = (hook_state == 1).astype(np.float32)
+        player_state[:, 9] = (hook_state == 2).astype(np.float32)
+        player_state[:, 10] = 0.0
+        player_state[:, 11] = 0.0
+        player_state[:, 12] = health / 10.0
+        player_state[:, 13] = armor / 10.0
+        player_state[:, 14] = jumped / 3.0
+
+        # ===== CHECKPOINT =====
+        cp_x = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT)[0] for o in bot_offsets], dtype=np.float32)
+        cp_y = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT + 4)[0] for o in bot_offsets], dtype=np.float32)
+        cp_idx = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 8)[0] for o in bot_offsets], dtype=np.float32)
+        total_cp = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 12)[0] for o in bot_offsets], dtype=np.float32)
+
+        checkpoint[:, 0] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
+        checkpoint[:, 1] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
+        checkpoint[:, 2] = cp_idx / np.maximum(1.0, total_cp)
+        checkpoint[:, 3] = total_cp / 20.0
+
+        # Sanitize NaN/inf
+        np.nan_to_num(player_state, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+        np.nan_to_num(checkpoint, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        return {'tiles': tiles, 'player_state': player_state, 'checkpoint': checkpoint}, rewards, dones
+
+    def _parse_observations_cnn_python(self, raw: bytes, raw_arr: np.ndarray, n: int,
+                                         tiles: np.ndarray, player_state: np.ndarray,
+                                         checkpoint: np.ndarray, rewards: np.ndarray,
+                                         dones: np.ndarray) -> None:
+        """Fallback Python parsing for CNN observations when Numba is not available.
+
+        New struct layout (1448 bytes per bot):
+        - SAction: 32 bytes
+        - SStructuredObservation: 1400 bytes
+          - Header: 8 bytes (tick, flags, state, reserved)
+          - LocalPlayer: 36 bytes
+          - TileGrid: 1333 bytes (43x31)
+          - ExtraState: 4 bytes
+          - Checkpoint: 16 bytes
+          - Reserved: 3 bytes
+        - Reward: 4 bytes
+        - Done: 4 bytes
+        - Truncated: 4 bytes
+        - BotClientId: 4 bytes
+        """
+        # Offsets within SBotData (1448 bytes per bot)
+        OBS_START = 32  # After SAction
+        LOCAL_PLAYER = OBS_START + 8  # After 8-byte header
+        TILES = LOCAL_PLAYER + 36     # After SPlayerObs
+        EXTRA_STATE = TILES + 1333    # After tile grid
+        CHECKPOINT = EXTRA_STATE + 4  # After extra state
+        REWARD_OFF = OBS_START + 1400 # After observation
+        DONE_OFF = REWARD_OFF + 4
+
+        bot_offsets = np.arange(n) * BOT_DATA_SIZE
+
+        # Extract rewards and dones
+        for i, off in enumerate(bot_offsets):
+            rewards[i] = struct.unpack_from('<f', raw, int(off) + REWARD_OFF)[0]
+            dones[i] = struct.unpack_from('<i', raw, int(off) + DONE_OFF)[0] != 0
+
+        # Extract player floats
+        pos_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER)[0] for o in bot_offsets])
+        pos_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 4)[0] for o in bot_offsets])
+        vel_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 8)[0] for o in bot_offsets])
+        vel_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 12)[0] for o in bot_offsets])
+
+        # Single-byte fields
         direction = raw_arr[bot_offsets + LOCAL_PLAYER + 16].astype(np.int8).astype(np.float32)
         jumped = raw_arr[bot_offsets + LOCAL_PLAYER + 17].astype(np.float32)
         hook_state = raw_arr[bot_offsets + LOCAL_PLAYER + 18].astype(np.float32)
@@ -353,7 +699,82 @@ class ServerShmClient:
         jumps_remaining = raw_arr[bot_offsets + EXTRA_STATE + 1].astype(np.float32)
         can_hook = raw_arr[bot_offsets + EXTRA_STATE + 2].astype(np.float32)
 
-        # Build features array
+        # Player state (15 features)
+        player_state[:, 0] = vel_x / 50.0
+        player_state[:, 1] = vel_y / 50.0
+        player_state[:, 2] = is_grounded
+        player_state[:, 3] = jumps_remaining / 2.0
+        player_state[:, 4] = can_hook
+        player_state[:, 5] = direction
+        player_state[:, 6] = is_frozen
+        player_state[:, 7] = (hook_state == 0).astype(np.float32)
+        player_state[:, 8] = (hook_state == 1).astype(np.float32)
+        player_state[:, 9] = (hook_state == 2).astype(np.float32)
+        player_state[:, 10] = 0.0  # aim placeholder
+        player_state[:, 11] = 0.0  # aim placeholder
+        player_state[:, 12] = health / 10.0
+        player_state[:, 13] = armor / 10.0
+        player_state[:, 14] = jumped / 3.0
+
+        # Checkpoint (4 features)
+        cp_x = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT)[0] for o in bot_offsets])
+        cp_y = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT + 4)[0] for o in bot_offsets])
+        cp_idx = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 8)[0] for o in bot_offsets], dtype=np.float32)
+        total_cp = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 12)[0] for o in bot_offsets], dtype=np.float32)
+
+        checkpoint[:, 0] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
+        checkpoint[:, 1] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
+        checkpoint[:, 2] = cp_idx / np.maximum(1.0, total_cp)
+        checkpoint[:, 3] = total_cp / 20.0
+
+        # Full tile grid (31, 43) - normalized by 15
+        for i in range(n):
+            tile_base = int(bot_offsets[i]) + TILES
+            for ty in range(31):
+                for tx in range(43):
+                    tiles[i, 0, ty, tx] = float(raw_arr[tile_base + ty * 43 + tx]) / 15.0
+
+    def _parse_observations_flat_python(self, raw: bytes, raw_arr: np.ndarray, n: int,
+                                         features: np.ndarray, rewards: np.ndarray,
+                                         dones: np.ndarray) -> None:
+        """Fallback Python parsing for flat MLP observations when Numba is not available."""
+        OBS_START = 32
+        LOCAL_PLAYER = OBS_START + 8
+        TILES = LOCAL_PLAYER + 36
+        EXTRA_STATE = TILES + 1333
+        CHECKPOINT = EXTRA_STATE + 4
+        REWARD_OFF = OBS_START + 1400
+        DONE_OFF = REWARD_OFF + 4
+
+        # Tile grid center
+        TILE_CENTER_X = 21
+        TILE_CENTER_Y = 15
+
+        bot_offsets = np.arange(n) * BOT_DATA_SIZE
+
+        # Extract rewards and dones
+        for i, off in enumerate(bot_offsets):
+            rewards[i] = struct.unpack_from('<f', raw, int(off) + REWARD_OFF)[0]
+            dones[i] = struct.unpack_from('<i', raw, int(off) + DONE_OFF)[0] != 0
+
+        # Extract player floats
+        pos_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER)[0] for o in bot_offsets])
+        pos_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 4)[0] for o in bot_offsets])
+        vel_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 8)[0] for o in bot_offsets])
+        vel_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 12)[0] for o in bot_offsets])
+
+        # Single-byte fields
+        direction = raw_arr[bot_offsets + LOCAL_PLAYER + 16].astype(np.int8).astype(np.float32)
+        jumped = raw_arr[bot_offsets + LOCAL_PLAYER + 17].astype(np.float32)
+        hook_state = raw_arr[bot_offsets + LOCAL_PLAYER + 18].astype(np.float32)
+        is_frozen = raw_arr[bot_offsets + LOCAL_PLAYER + 30].astype(np.float32)
+        health = raw_arr[bot_offsets + LOCAL_PLAYER + 32].astype(np.float32)
+        armor = raw_arr[bot_offsets + LOCAL_PLAYER + 33].astype(np.float32)
+        is_grounded = raw_arr[bot_offsets + EXTRA_STATE].astype(np.float32)
+        jumps_remaining = raw_arr[bot_offsets + EXTRA_STATE + 1].astype(np.float32)
+        can_hook = raw_arr[bot_offsets + EXTRA_STATE + 2].astype(np.float32)
+
+        # Player state (15 features) - indices 0-14
         features[:, 0] = vel_x / 50.0
         features[:, 1] = vel_y / 50.0
         features[:, 2] = is_grounded
@@ -364,59 +785,30 @@ class ServerShmClient:
         features[:, 7] = (hook_state == 0).astype(np.float32)
         features[:, 8] = (hook_state == 1).astype(np.float32)
         features[:, 9] = (hook_state == 2).astype(np.float32)
+        features[:, 10] = 0.0
+        features[:, 11] = 0.0
         features[:, 12] = health / 10.0
         features[:, 13] = armor / 10.0
         features[:, 14] = jumped / 3.0
 
-        # Checkpoint floats
-        cp_offsets = bot_offsets + CHECKPOINT
-        cp_x = np.array([struct.unpack_from('<f', raw, int(o))[0] for o in cp_offsets])
-        cp_y = np.array([struct.unpack_from('<f', raw, int(o)+4)[0] for o in cp_offsets])
-        cp_idx = np.array([struct.unpack_from('<i', raw, int(o)+8)[0] for o in cp_offsets], dtype=np.float32)
-        total_cp = np.array([struct.unpack_from('<i', raw, int(o)+12)[0] for o in cp_offsets], dtype=np.float32)
+        # Checkpoint (4 features) - indices 15-18
+        cp_x = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT)[0] for o in bot_offsets])
+        cp_y = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT + 4)[0] for o in bot_offsets])
+        cp_idx = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 8)[0] for o in bot_offsets], dtype=np.float32)
+        total_cp = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 12)[0] for o in bot_offsets], dtype=np.float32)
 
         features[:, 15] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
         features[:, 16] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
         features[:, 17] = cp_idx / np.maximum(1.0, total_cp)
         features[:, 18] = total_cp / 20.0
 
-        # Raycasts - 48 floats per bot
-        for i in range(n):
-            base = int(bot_offsets[i]) + RAYCASTS
-            features[i, 19:67] = struct.unpack_from('<48f', raw, base)
-
-        # Tiles 7x7 center - extract using byte indexing
-        # Center of 43x31 grid is (21, 15), we want 7x7 around it: rows 12-18, cols 18-24
+        # 7x7 center tile crop (49 features) - indices 19-67
         for ty in range(7):
             for tx in range(7):
-                tile_row = 12 + ty
-                tile_col = 18 + tx
-                tile_local_offset = tile_row * 43 + tile_col
-                tile_indices = bot_offsets + TILES + tile_local_offset
-                features[:, 67 + ty * 7 + tx] = raw_arr[tile_indices].astype(np.float32) / 15.0
-
-        # Other players (5 players x 5 features) - simplified, just extract if active
-        for j in range(5):
-            op_local = OTHER_PLAYERS + j * 36
-            op_active = raw_arr[bot_offsets + op_local + 29]
-            active_mask = op_active > 0
-
-            if np.any(active_mask):
-                for i in np.where(active_mask)[0]:
-                    base = int(bot_offsets[i]) + op_local
-                    op_px, op_py, op_vx, op_vy = struct.unpack_from('<ffff', raw, base)
-                    op_hook = raw[base + 18]
-                    feat_base = 116 + j * 5
-                    features[i, feat_base] = (op_px - pos_x[i]) / 1000.0
-                    features[i, feat_base + 1] = (op_py - pos_y[i]) / 1000.0
-                    features[i, feat_base + 2] = op_vx / 50.0
-                    features[i, feat_base + 3] = op_vy / 50.0
-                    features[i, feat_base + 4] = float(op_hook) / 2.0
-
-        # Sanitize NaN/inf
-        np.nan_to_num(features, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        return features, rewards, dones
+                grid_y = TILE_CENTER_Y - 3 + ty
+                grid_x = TILE_CENTER_X - 3 + tx
+                tile_idx = grid_y * 43 + grid_x
+                features[:, 19 + ty * 7 + tx] = raw_arr[bot_offsets + TILES + tile_idx].astype(np.float32) / 15.0
 
     def wait_for_observations(self, timeout: float = 1.0) -> bool:
         """Wait for server to signal observations are ready."""
@@ -493,6 +885,7 @@ class TeeWorldsServerEnv:
         # Track state
         self._running = False
         self._closed = False
+        self._shutting_down = False  # Fast exit flag for threads
 
         # Thread pool for parallel shm I/O (GIL is released during mmap operations)
         self._executor = ThreadPoolExecutor(max_workers=min(32, self.num_servers))
@@ -547,27 +940,58 @@ class TeeWorldsServerEnv:
         # Clean up stale shared memory for all servers
         self._cleanup_shared_memory()
 
-        # Start servers with RL bots
+        # Start ALL servers in parallel (no waiting between them)
+        print(f"Launching {self.num_servers} servers in parallel...")
         for server_idx in range(self.num_servers):
-            self._start_server(server_idx)
+            self._start_server_noblock(server_idx)
 
-        # Connect to shared memory for each server
-        for server_idx in range(self.num_servers):
+        # Single wait for all servers to initialize
+        print(f"Waiting {self.config.startup_wait}s for servers to initialize...")
+        time.sleep(self.config.startup_wait)
+
+        # Connect to shared memory for all servers in parallel
+        print("Connecting to shared memory...")
+        def connect_shm(server_idx):
             shm_client = ServerShmClient(self.num_bots_per_server, server_idx)
-            if not shm_client.connect():
+            if not shm_client.connect(max_retries=30, retry_delay=0.2):
+                return None, server_idx
+            return shm_client, server_idx
+
+        with ThreadPoolExecutor(max_workers=min(32, self.num_servers)) as executor:
+            futures = [executor.submit(connect_shm, idx) for idx in range(self.num_servers)]
+            results = [f.result() for f in futures]
+
+        # Sort by server index and check for failures
+        results.sort(key=lambda x: x[1])
+        for shm_client, server_idx in results:
+            if shm_client is None:
                 raise RuntimeError(f"Failed to connect to server {server_idx} shared memory")
             self.shm_clients.append(shm_client)
 
-        # Wait for first observations from all servers
+        # Wait for first observations from all servers in parallel
         print("Waiting for initial observations...")
-        for server_idx, shm_client in enumerate(self.shm_clients):
-            if not shm_client.wait_for_observations(timeout=10.0):
-                raise RuntimeError(f"Timeout waiting for initial observations from server {server_idx}")
+        def wait_obs(args):
+            shm_client, idx = args
+            success = shm_client.wait_for_observations(timeout=10.0)
+            return success, idx
 
-        # Set observation dimension (fast path always returns 141)
-        self.obs_dim = 141
+        with ThreadPoolExecutor(max_workers=min(32, self.num_servers)) as executor:
+            futures = [executor.submit(wait_obs, (c, i)) for i, c in enumerate(self.shm_clients)]
+            for f in futures:
+                success, idx = f.result()
+                if not success:
+                    raise RuntimeError(f"Timeout waiting for initial observations from server {idx}")
+
+        # Set observation dimension
+        # Flat MLP mode: 68 features (15 player + 4 checkpoint + 49 tiles)
+        # CNN mode: dict with tiles(1,31,43), player_state(15), checkpoint(4)
+        self.obs_dim = 68 if not self.use_dict_obs else None
         self._running = True
-        print(f"Environment ready. Observation dim: {self.obs_dim}")
+        numba_status = "enabled (JIT)" if NUMBA_AVAILABLE else "disabled (install numba for 5-10x faster parsing)"
+        if self.use_dict_obs:
+            print(f"Environment ready. CNN observation mode, Numba: {numba_status}")
+        else:
+            print(f"Environment ready. Observation dim: {self.obs_dim}, Numba: {numba_status}")
 
     def _cleanup_shared_memory(self):
         """Clean up stale shared memory files and config files for all servers."""
@@ -650,10 +1074,50 @@ class TeeWorldsServerEnv:
         self.server_procs.append(server_proc)
 
         effective_rate = self.config.sv_tickrate // self.config.frame_skip
-        print(f"Server {server_idx} started (PID: {server_proc.pid}, port: {server_port}, map: {self.config.map_name}, tickrate: {self.config.sv_tickrate}, decision_rate: {effective_rate}Hz, bots: {self.num_bots_per_server})")
-        if self.config.allow_spectators:
-            print(f"  Connect with DDNet client to 127.0.0.1:{server_port} to watch")
+        print(f"  Server {server_idx}: PID={server_proc.pid}, port={server_port}")
         time.sleep(self.config.startup_wait)
+
+    def _start_server_noblock(self, server_idx: int = 0):
+        """Start a DDNet server without blocking (for parallel startup)."""
+        server_dir = os.path.dirname(os.path.abspath(self.config.server_path))
+        server_port = self.config.server_port + server_idx
+
+        if self.num_servers > 1:
+            sv_name = f"{self.config.sv_name} #{server_idx}"
+        else:
+            sv_name = self.config.sv_name
+
+        server_cmd = [
+            self.config.server_path,
+            f"sv_name \"{sv_name}\"",
+            f"sv_port {server_port}",
+            f"sv_map \"{self.config.map_name}\"",
+            f"sv_tickrate {self.config.sv_tickrate}",
+            f"sv_max_clients 128",
+            f"sv_register 0",
+            f"sv_rcon_password rltraining",
+        ]
+
+        if self.config.allow_spectators:
+            server_cmd.extend([
+                f"sv_spectator_slots 1",
+                f"sv_max_clients_per_ip 4",
+            ])
+
+        server_cmd.extend([
+            f"sv_rl_frame_skip {self.config.frame_skip}",
+            f"sv_rl_bots {self.num_bots_per_server} {server_idx}",
+        ])
+
+        server_proc = subprocess.Popen(
+            server_cmd,
+            preexec_fn=os.setsid,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=server_dir,
+        )
+        self.server_procs.append(server_proc)
+        print(f"  Server {server_idx}: PID={server_proc.pid}, port={server_port}")
 
     def reset(self, seed: Optional[int] = None):
         """Reset all environments and return initial observations."""
@@ -675,17 +1139,32 @@ class TeeWorldsServerEnv:
             if not shm_client.wait_for_observations(timeout=2.0):
                 print(f"Warning: Timeout waiting for reset observations from server {server_idx}")
 
-        # Read observations from all servers using fast path
-        all_observations = []
-        for shm_client in self.shm_clients:
-            observations, _, _ = shm_client.read_observations_batch_fast()
-            all_observations.append(observations)
-
         self.episode_steps[:] = 0
         self.episode_rewards[:] = 0.0
 
-        obs_out = np.vstack(all_observations)  # (total_bots, 141)
-        return obs_out, {}
+        # Read observations from all servers
+        if self.use_dict_obs:
+            # CNN mode: return dict observations
+            all_tiles = []
+            all_player_state = []
+            all_checkpoint = []
+            for shm_client in self.shm_clients:
+                obs_dict, _, _ = shm_client.read_observations_batch_cnn()
+                all_tiles.append(obs_dict['tiles'])
+                all_player_state.append(obs_dict['player_state'])
+                all_checkpoint.append(obs_dict['checkpoint'])
+            return {
+                'tiles': np.vstack(all_tiles),
+                'player_state': np.vstack(all_player_state),
+                'checkpoint': np.vstack(all_checkpoint),
+            }, {}
+        else:
+            # MLP mode: return flat observations
+            all_observations = []
+            for shm_client in self.shm_clients:
+                observations, _, _ = shm_client.read_observations_batch_fast()
+                all_observations.append(observations)
+            return np.vstack(all_observations), {}  # (total_bots, 68)
 
     def _observations_to_dict(self, observations: List[Optional[StructuredObservation]]) -> Dict[str, np.ndarray]:
         """Convert list of observations to batched dict format for CNN."""
@@ -732,8 +1211,11 @@ class TeeWorldsServerEnv:
         if not shm_client.wait_for_observations(timeout=self.config.action_timeout):
             return server_idx, None, None, None, True, 0.0, 0.0  # timeout_occurred=True
         t_wait = time.perf_counter()
-        # Use fast path - returns flat arrays directly
-        observations, rewards, dones = shm_client.read_observations_batch_fast()
+        # Use CNN or fast path depending on config
+        if self.use_dict_obs:
+            observations, rewards, dones = shm_client.read_observations_batch_cnn()
+        else:
+            observations, rewards, dones = shm_client.read_observations_batch_fast()
         t_read = time.perf_counter()
         wait_ms = (t_wait - t_start) * 1000
         read_ms = (t_read - t_wait) * 1000
@@ -808,20 +1290,20 @@ class TeeWorldsServerEnv:
             self._server_read_times[i] += rt
 
         if self._step_count % 10 == 0:
-            avg_write = self._timing_write / 10 * 1000  # ms
-            avg_read = self._timing_read / 10 * 1000    # ms
-            avg_total = self._timing_total / 10 * 1000  # ms
-            budget = 20.0  # 50Hz = 20ms per tick
+            if self.config.debug_timing:
+                avg_write = self._timing_write / 10 * 1000  # ms
+                avg_read = self._timing_read / 10 * 1000    # ms
+                avg_total = self._timing_total / 10 * 1000  # ms
 
-            # Show per-server wait and read times
-            wait_avgs = [wt / 10 for wt in self._server_wait_times]
-            read_avgs = [rt / 10 for rt in self._server_read_times]
-            max_wait = max(wait_avgs)
-            max_read = max(read_avgs)
-            sum_read = sum(read_avgs)
+                # Show per-server wait and read times
+                wait_avgs = [wt / 10 for wt in self._server_wait_times]
+                read_avgs = [rt / 10 for rt in self._server_read_times]
+                max_wait = max(wait_avgs)
+                max_read = max(read_avgs)
+                sum_read = sum(read_avgs)
 
-            print(f"Step (ms): write={avg_write:.1f}, wait+read={avg_read:.1f}, total={avg_total:.1f} | "
-                  f"server: max_wait={max_wait:.1f}, max_read={max_read:.1f}, sum_read={sum_read:.0f}")
+                print(f"Step (ms): write={avg_write:.1f}, wait+read={avg_read:.1f}, total={avg_total:.1f} | "
+                      f"server: max_wait={max_wait:.1f}, max_read={max_read:.1f}, sum_read={sum_read:.0f}")
 
             self._timing_write = 0.0
             self._timing_wait = 0.0
@@ -831,23 +1313,48 @@ class TeeWorldsServerEnv:
             self._server_read_times = [0.0] * self.num_servers
 
         # Aggregate results from all servers (handles partial timeouts gracefully)
-        # Fast path returns numpy arrays directly: obs is (num_bots, 141), rew is (num_bots,), done is (num_bots,)
-        all_observations = []
         all_rewards = []
         all_dones = []
-        for obs, rew, done in results:
-            if obs is not None:
-                all_observations.append(obs)  # numpy array (num_bots, 141)
-                all_rewards.append(rew)
-                all_dones.append(done)
-            else:
-                # Handle timeout case - append zeros
-                all_observations.append(np.zeros((self.num_bots_per_server, 141), dtype=np.float32))
-                all_rewards.append(np.zeros(self.num_bots_per_server, dtype=np.float32))
-                all_dones.append(np.zeros(self.num_bots_per_server, dtype=bool))
 
-        # Stack all observations into single array
-        obs_out = np.vstack(all_observations)  # (total_bots, 141)
+        if self.use_dict_obs:
+            # CNN mode: aggregate dict observations
+            all_tiles = []
+            all_player_state = []
+            all_checkpoint = []
+            for obs, rew, done in results:
+                if obs is not None:
+                    all_tiles.append(obs['tiles'])
+                    all_player_state.append(obs['player_state'])
+                    all_checkpoint.append(obs['checkpoint'])
+                    all_rewards.append(rew)
+                    all_dones.append(done)
+                else:
+                    # Handle timeout case - append zeros
+                    all_tiles.append(np.zeros((self.num_bots_per_server, 1, TILE_GRID_HEIGHT, TILE_GRID_WIDTH), dtype=np.float32))
+                    all_player_state.append(np.zeros((self.num_bots_per_server, 15), dtype=np.float32))
+                    all_checkpoint.append(np.zeros((self.num_bots_per_server, 4), dtype=np.float32))
+                    all_rewards.append(np.zeros(self.num_bots_per_server, dtype=np.float32))
+                    all_dones.append(np.zeros(self.num_bots_per_server, dtype=bool))
+            obs_out = {
+                'tiles': np.vstack(all_tiles),
+                'player_state': np.vstack(all_player_state),
+                'checkpoint': np.vstack(all_checkpoint),
+            }
+        else:
+            # MLP mode: aggregate flat observations
+            all_observations = []
+            for obs, rew, done in results:
+                if obs is not None:
+                    all_observations.append(obs)  # numpy array (num_bots, 68)
+                    all_rewards.append(rew)
+                    all_dones.append(done)
+                else:
+                    # Handle timeout case - append zeros
+                    all_observations.append(np.zeros((self.num_bots_per_server, 68), dtype=np.float32))
+                    all_rewards.append(np.zeros(self.num_bots_per_server, dtype=np.float32))
+                    all_dones.append(np.zeros(self.num_bots_per_server, dtype=bool))
+            obs_out = np.vstack(all_observations)  # (total_bots, 68)
+
         rewards = np.concatenate(all_rewards)
         dones = np.concatenate(all_dones)
         truncated = np.zeros(self.num_envs, dtype=bool)
@@ -889,8 +1396,13 @@ class TeeWorldsServerEnv:
             infos
         )
 
-    def _reset_envs_fast(self, mask: np.ndarray, observations: np.ndarray):
-        """Reset specific environments and update observations in place (fast numpy version)."""
+    def _reset_envs_fast(self, mask: np.ndarray, observations):
+        """Reset specific environments and update observations in place.
+
+        Args:
+            mask: Boolean mask of environments to reset
+            observations: Either numpy array (MLP mode) or dict of arrays (CNN mode)
+        """
         # Split mask across servers and send reset for masked environments
         for server_idx, shm_client in enumerate(self.shm_clients):
             start_idx = server_idx * self.num_bots_per_server
@@ -919,11 +1431,20 @@ class TeeWorldsServerEnv:
 
             if shm_client.wait_for_observations(timeout=0.1):
                 # Read fresh observations for reset environments
-                fresh_obs, _, _ = shm_client.read_observations_batch_fast()
-                # Update only masked environments
-                for local_i in np.where(server_mask)[0]:
-                    global_i = start_idx + local_i
-                    observations[global_i] = fresh_obs[local_i]
+                if self.use_dict_obs:
+                    fresh_obs, _, _ = shm_client.read_observations_batch_cnn()
+                    # Update only masked environments
+                    for local_i in np.where(server_mask)[0]:
+                        global_i = start_idx + local_i
+                        observations['tiles'][global_i] = fresh_obs['tiles'][local_i]
+                        observations['player_state'][global_i] = fresh_obs['player_state'][local_i]
+                        observations['checkpoint'][global_i] = fresh_obs['checkpoint'][local_i]
+                else:
+                    fresh_obs, _, _ = shm_client.read_observations_batch_fast()
+                    # Update only masked environments
+                    for local_i in np.where(server_mask)[0]:
+                        global_i = start_idx + local_i
+                        observations[global_i] = fresh_obs[local_i]
 
         # Reset counters for masked environments
         for i in np.where(mask)[0]:
@@ -998,31 +1519,34 @@ class TeeWorldsServerEnv:
         if self._closed:
             return
         self._closed = True
+        self._shutting_down = True  # Signal threads to exit fast
+        self._running = False
 
         print("Closing server environment...")
 
-        # Shutdown thread pool
-        if hasattr(self, '_executor'):
-            self._executor.shutdown(wait=False)
-
-        # Disconnect from all shared memory clients
-        for server_idx, shm_client in enumerate(self.shm_clients):
+        # Kill all servers first (fast, parallel) - this makes shm operations fail quickly
+        for server_proc in self.server_procs:
             try:
-                shm_client.disconnect()
-            except:
-                pass
-        self.shm_clients = []
-
-        # Terminate all servers
-        for server_idx, server_proc in enumerate(self.server_procs):
-            try:
-                print(f"  Terminating server {server_idx}...")
                 os.killpg(os.getpgid(server_proc.pid), signal.SIGKILL)
             except:
                 pass
         self.server_procs = []
 
-        self._running = False
+        # Shutdown thread pool without waiting
+        if hasattr(self, '_executor'):
+            self._executor.shutdown(wait=False, cancel_futures=True)
+
+        # Close shared memory (don't bother with clean disconnect - servers are dead)
+        for shm_client in self.shm_clients:
+            try:
+                if shm_client.shm_mmap:
+                    shm_client.shm_mmap.close()
+                if shm_client.shm_file:
+                    shm_client.shm_file.close()
+            except:
+                pass
+        self.shm_clients = []
+
         print("Server environment closed")
 
     def __enter__(self):

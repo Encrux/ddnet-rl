@@ -34,6 +34,7 @@ CBotManager::CBotManager(CGameContext *pGameContext) :
 	m_AllowPause(true),
 	m_WasPaused(false),
 	m_ShouldSignalObservations(false),
+	m_InitialObservationsSent(false),
 	m_TotalTicks(0),
 	m_MissedActions(0),
 	m_ConsecutiveMisses(0),
@@ -447,27 +448,10 @@ void CBotManager::ExtractObservations()
 				// Extract local player state
 				ExtractPlayerObs(pChar, &pObs->m_LocalPlayer, true);
 
-				// Extract tile grid
+				// Extract tile grid (full 43x31 for CNN)
 				ExtractTileGrid(pChar, pObs->m_aTileGrid);
 
-				// Extract raycasts
-				ExtractRaycasts(pChar, pObs);
-
-				// Extract other players
-				int OtherIdx = 0;
-				for(int j = 0; j < MAX_CLIENTS && OtherIdx < MAX_OTHER_PLAYERS; j++)
-				{
-					if(j == ClientId)
-						continue;
-
-					CPlayer *pOther = m_pGameContext->m_apPlayers[j];
-					if(pOther && pOther->GetCharacter())
-					{
-						ExtractPlayerObs(pOther->GetCharacter(), &pObs->m_aOtherPlayers[OtherIdx], false);
-						OtherIdx++;
-					}
-				}
-				pObs->m_NumActivePlayers = OtherIdx + 1;
+				// Note: Raycasts and other players removed for solo race CNN training
 
 				// Extra state
 				vec2 Pos = pChar->GetPos();
@@ -558,9 +542,11 @@ void CBotManager::ExtractObservations()
 		}
 	}
 
-	// Only signal observations when we actually processed new actions from Python
-	// This prevents overwriting observations while Python is still reading
-	if(IsDecisionTick && m_ShouldSignalObservations)
+	// Signal observations when:
+	// 1. First tick (initial observations for Python to start)
+	// 2. After successfully processing actions from Python
+	bool ShouldSignal = IsDecisionTick && (m_ShouldSignalObservations || !m_InitialObservationsSent);
+	if(ShouldSignal)
 	{
 		// Update header tick
 		SServerRLHeader *pHeader = m_pShm->GetHeader();
@@ -572,6 +558,7 @@ void CBotManager::ExtractObservations()
 		// Signal observations are ready
 		m_pShm->SignalObservationsReady();
 		m_ShouldSignalObservations = false;  // Reset until next successful action read
+		m_InitialObservationsSent = true;
 	}
 
 	m_LastTick = CurrentTick;
@@ -675,56 +662,6 @@ void CBotManager::ExtractTileGrid(CCharacter *pChar, uint8_t *pGrid)
 	}
 }
 
-void CBotManager::ExtractRaycasts(CCharacter *pChar, SStructuredObservation *pObs)
-{
-	if(!pChar)
-		return;
-
-	vec2 Pos = pChar->GetPos();
-
-	for(int i = 0; i < NUM_RAYCASTS; i++)
-	{
-		float Angle = (float)i * (2.0f * 3.14159265f / NUM_RAYCASTS);
-		vec2 Dir(std::cos(Angle), std::sin(Angle));
-
-		pObs->m_aRaycastSolid[i] = CastRay(Pos, Dir, RAYCAST_MAX_DIST, 1);
-		pObs->m_aRaycastDeath[i] = CastRay(Pos, Dir, RAYCAST_MAX_DIST, 2);
-		pObs->m_aRaycastHookable[i] = CastRay(Pos, Dir, RAYCAST_MAX_DIST, 4);
-	}
-}
-
-float CBotManager::CastRay(vec2 Start, vec2 Dir, float MaxDist, int TileMask)
-{
-	if(!m_pCollision)
-		return 1.0f;
-
-	int MapWidth = m_pCollision->GetWidth();
-	int MapHeight = m_pCollision->GetHeight();
-
-	const float Step = 16.0f;
-	for(float Dist = Step; Dist < MaxDist; Dist += Step)
-	{
-		vec2 Pos = Start + Dir * Dist;
-		int TileX = (int)(Pos.x / 32.0f);
-		int TileY = (int)(Pos.y / 32.0f);
-
-		if(TileX < 0 || TileX >= MapWidth || TileY < 0 || TileY >= MapHeight)
-			return Dist / MaxDist;
-
-		int MapIndex = TileY * MapWidth + TileX;
-		int TileIdx = m_pCollision->GetTileIndex(MapIndex);
-
-		if((TileMask & 1) && TileIdx == TILE_SOLID)
-			return Dist / MaxDist;
-		if((TileMask & 2) && TileIdx == TILE_DEATH)
-			return Dist / MaxDist;
-		if((TileMask & 4) && (TileIdx == TILE_SOLID || TileIdx == TILE_NOHOOK))
-			return Dist / MaxDist;
-	}
-
-	return 1.0f;
-}
-
 float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *pObs)
 {
 	float Reward = 0.0f;
@@ -741,9 +678,15 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 	vec2 ToCheckpoint = NextCp - Pos;
 	float DistToCheckpoint = length(ToCheckpoint);
 
-	// Progress toward next checkpoint (direction-agnostic dense reward)
-	float Progress = State.m_LastDistToCheckpoint - DistToCheckpoint;
-	Reward += Progress / 100.0f;
+	// Progress reward using high water mark - only reward NEW progress, don't penalize backtracking
+	// This allows agents to backtrack to set up jumps without being punished
+	if(DistToCheckpoint < State.m_BestDistToCheckpoint)
+	{
+		float Progress = State.m_BestDistToCheckpoint - DistToCheckpoint;
+		Reward += Progress / 100.0f;
+		State.m_BestDistToCheckpoint = DistToCheckpoint;
+	}
+	// No penalty for backtracking - just 0 reward
 
 	// Checkpoint reached (sparse but important)
 	if(State.m_CurrentCheckpointIndex > pObs->m_CheckpointIndex)
@@ -758,7 +701,9 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 		s_aLastCp[BotIndex] = CurrentCp;
 		// Reset distance tracking for new checkpoint
 		vec2 NewNextCp = GetNextCheckpointPos(CurrentCp);
-		State.m_LastDistToCheckpoint = length(NewNextCp - Pos);
+		float NewDist = length(NewNextCp - Pos);
+		State.m_LastDistToCheckpoint = NewDist;
+		State.m_BestDistToCheckpoint = NewDist;  // Reset high water mark for new checkpoint
 	}
 
 	// Finish reached
@@ -827,6 +772,7 @@ void CBotManager::ResetRewardState(int BotIndex)
 	State.m_LastPosY = m_SpawnPos.y;
 	State.m_CurrentCheckpointIndex = -1;
 	State.m_LastDistToCheckpoint = 10000.0f; // Will be set properly on first tick
+	State.m_BestDistToCheckpoint = 10000.0f; // High water mark for progress
 	State.m_LastHookState = 0;
 	State.m_StuckCounter = 0;
 	State.m_WasFrozen = false;

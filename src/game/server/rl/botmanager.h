@@ -70,8 +70,6 @@ private:
 	// Observation extraction helpers
 	void ExtractPlayerObs(CCharacter *pChar, SPlayerObs *pObs, bool IsLocal);
 	void ExtractTileGrid(CCharacter *pChar, uint8_t *pGrid);
-	void ExtractRaycasts(CCharacter *pChar, SStructuredObservation *pObs);
-	float CastRay(vec2 Start, vec2 Dir, float MaxDist, int TileMask);
 
 	// Reward calculation
 	float CalculateReward(int BotIndex, const SStructuredObservation *pObs);
@@ -102,6 +100,7 @@ private:
 		float m_LastPosX;
 		float m_LastPosY;
 		float m_LastDistToCheckpoint;
+		float m_BestDistToCheckpoint;  // High water mark - closest we've ever been
 		int m_CurrentCheckpointIndex;
 		int m_LastHookState;
 		int m_StuckCounter;
@@ -138,6 +137,7 @@ private:
 
 	// Sync flag: only signal observations when we actually processed new actions
 	bool m_ShouldSignalObservations;
+	bool m_InitialObservationsSent;  // Track if initial observations have been sent
 
 	// Diagnostic stats
 	int m_TotalTicks;

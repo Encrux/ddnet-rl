@@ -26,6 +26,9 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+# Enable TF32 for faster matmul on Ampere+ GPUs (RTX 30xx/40xx)
+torch.set_float32_matmul_precision('high')
+
 from teeworlds_vec_env import TeeWorldsVecEnv, EnvConfig
 from teeworlds_server_env import TeeWorldsServerEnv, ServerEnvConfig
 from ppo_hybrid import PPOAgent, PPOConfig
@@ -117,6 +120,8 @@ def parse_args():
     # CNN Policy
     parser.add_argument("--use-cnn", action="store_true",
                         help="Use CNN feature extractor for tile observations")
+    parser.add_argument("--debug-timing", action="store_true",
+                        help="Print step timing debug info")
 
     # Curriculum learning
     parser.add_argument("--curriculum", type=str, default="none",
@@ -175,6 +180,7 @@ def main():
             max_episode_steps=args.max_episode_steps,
             use_dict_obs=args.use_cnn,  # Enable dict observations for CNN
             map_name=args.map,
+            debug_timing=args.debug_timing,
         )
         # Use default server_path (resolved relative to teeworlds_server_env.py)
         env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)
@@ -204,11 +210,6 @@ def main():
             obs_dim = obs.shape[1]
         print(f"Observation dimension: {obs_dim}")
 
-        # Force use_cnn=False for fast path (flat observations)
-        # TODO: Re-enable CNN support with dict observations if needed
-        if args.use_cnn:
-            print("Warning: --use-cnn is not supported with fast observation path, using MLP")
-
         # Create PPO config
         ppo_config = PPOConfig(
             learning_rate=args.learning_rate,
@@ -224,7 +225,7 @@ def main():
             target_kl=args.target_kl,
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
-            use_cnn=False,  # Always use MLP with fast flat observations
+            use_cnn=args.use_cnn,
         )
 
         # Create agent
@@ -263,7 +264,7 @@ def main():
         episode_lengths = []
 
         for update in range(1, num_updates + 1):
-            update_start_time = time.time()
+            rollout_start = time.time()
 
             # Anneal learning rate (linear decay)
             if args.total_timesteps > 0:
@@ -298,11 +299,14 @@ def main():
                         episode_lengths.append(info['episode']['l'])
 
             # PPO update (optionally pause to prevent bots from acting with stale policy)
+            rollout_time = time.time() - rollout_start
+            update_start = time.time()
             if args.server_side and args.sync_update:
                 env.pause()
             stats = agent.update(obs, done | truncated)
             if args.server_side and args.sync_update:
                 env.unpause()
+            update_time = time.time() - update_start
             agent.global_step = global_step
 
             # Logging
@@ -329,13 +333,15 @@ def main():
                           f"FPS {fps:6.0f} | "
                           f"Reward {mean_reward:7.2f} | "
                           f"Length {mean_length:6.0f} | "
-                          f"PG Loss {stats['policy_loss']:7.4f} | "
-                          f"Entropy {stats['entropy']:.4f}")
+                          f"PG {stats['policy_loss']:6.3f} | "
+                          f"Ent {stats['entropy']:.3f} | "
+                          f"R/U {rollout_time:.1f}/{update_time:.1f}s")
                 else:
                     print(f"Update {update:5d} | Step {global_step:9,d} | "
                           f"FPS {fps:6.0f} | "
-                          f"PG Loss {stats['policy_loss']:7.4f} | "
-                          f"Entropy {stats['entropy']:.4f}")
+                          f"PG {stats['policy_loss']:6.3f} | "
+                          f"Ent {stats['entropy']:.3f} | "
+                          f"R/U {rollout_time:.1f}/{update_time:.1f}s")
 
             # Save checkpoint
             if update % args.save_freq == 0:

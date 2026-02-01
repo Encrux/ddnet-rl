@@ -55,6 +55,9 @@ class PPOConfig:
     # Mixed precision training (2-3x speedup on modern GPUs)
     use_amp: bool = True
 
+    # torch.compile for faster forward/backward passes (PyTorch 2.0+)
+    use_compile: bool = True
+
 
 def layer_init(layer: nn.Module, std: float = np.sqrt(2), bias_const: float = 0.0) -> nn.Module:
     """Initialize layer with orthogonal weights."""
@@ -350,6 +353,15 @@ class PPOAgent:
         # Create networks
         self.actor = HybridActor(obs_dim, self.config).to(self.device)
         self.critic = Critic(obs_dim, self.config).to(self.device)
+
+        # Compile models for faster execution (PyTorch 2.0+)
+        if self.config.use_compile and hasattr(torch, 'compile'):
+            try:
+                self.actor = torch.compile(self.actor, mode="reduce-overhead")
+                self.critic = torch.compile(self.critic, mode="reduce-overhead")
+                print("Models compiled with torch.compile (reduce-overhead mode)")
+            except Exception as e:
+                print(f"torch.compile failed, using eager mode: {e}")
 
         # Optimizer
         self.optimizer = optim.Adam(
