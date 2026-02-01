@@ -68,17 +68,23 @@ class MultiServerManager:
             env["DDNET_RL_SHM_NAME"] = shm_name
 
             # Add ONNX Runtime and CUDA libraries to LD_LIBRARY_PATH
-            nvidia_base = "/home/encrux/anaconda3/envs/ddnet-rl/lib/python3.14/site-packages/nvidia"
-            extra_lib_paths = [
-                "/tmp/onnxruntime-linux-x64-gpu-1.19.2/lib",
-                f"{nvidia_base}/cuda_runtime/lib",
-                f"{nvidia_base}/cublas/lib",
-                f"{nvidia_base}/cudnn/lib",
-                f"{nvidia_base}/cufft/lib",
-                f"{nvidia_base}/curand/lib",
-                f"{nvidia_base}/cusparse/lib",
-                f"{nvidia_base}/nccl/lib",
-            ]
+            # Auto-detect paths based on current environment
+            conda_prefix = os.environ.get("CONDA_PREFIX", "")
+            nvidia_base = os.path.join(conda_prefix, "lib/python3.14/site-packages/nvidia") if conda_prefix else ""
+            onnx_root = os.environ.get("ONNXRUNTIME_ROOT", "")
+            extra_lib_paths = []
+            if onnx_root:
+                extra_lib_paths.append(os.path.join(onnx_root, "lib"))
+            if nvidia_base and os.path.exists(nvidia_base):
+                extra_lib_paths.extend([
+                    f"{nvidia_base}/cuda_runtime/lib",
+                    f"{nvidia_base}/cublas/lib",
+                    f"{nvidia_base}/cudnn/lib",
+                    f"{nvidia_base}/cufft/lib",
+                    f"{nvidia_base}/curand/lib",
+                    f"{nvidia_base}/cusparse/lib",
+                    f"{nvidia_base}/nccl/lib",
+                ])
             existing_ld_path = env.get("LD_LIBRARY_PATH", "")
             env["LD_LIBRARY_PATH"] = ":".join(extra_lib_paths) + (":" + existing_ld_path if existing_ld_path else "")
 

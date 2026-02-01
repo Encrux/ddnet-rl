@@ -143,3 +143,10 @@ tags
 *.user
 *.vcxproj
 *.zip
+
+# RL training
+*.onnx
+deps/
+models/
+runs/
+backups/
