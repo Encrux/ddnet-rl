@@ -39,7 +39,8 @@ public:
 		bool m_UseInference = true;                  // Use C++ inference (false = random actions)
 		bool m_Deterministic = false;                // Use deterministic policy (for evaluation)
 		float m_RewardScale = 1.0f;                  // Reward scaling factor
-		int m_MaxEpisodeLength = 10000;              // Max steps before truncation
+		int m_MaxEpisodeLength = 0;                  // Max steps before truncation (0 = disabled, use stuck detection)
+		int m_StuckThreshold = 500;                  // Reset after N ticks without progress (~10 sec at 50Hz)
 		int m_FrameSkip = 1;                         // Only act every N frames (1 = every frame)
 		const char *m_pModelPath = nullptr;          // Path to ONNX model
 		const char *m_pShmName = nullptr;            // Shared memory name (null = disabled)
@@ -58,6 +59,10 @@ public:
 		float m_PrevHealth = 0;
 		float m_PrevArmor = 0;
 		int m_PrevCheckpoint = 0;
+
+		// Progress tracking for stuck detection
+		float m_BestProgress = 0.0f;                 // High water mark (best X position reached)
+		int m_StuckCounter = 0;                      // Ticks without progress
 
 		// Last action (for transition logging)
 		rl::SAction m_LastAction;

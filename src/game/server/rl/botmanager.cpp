@@ -265,8 +265,12 @@ void CRLBotManager::Tick()
 		Bot.m_EpisodeStep++;
 		m_TotalSteps++;
 
-		// Check for truncation
-		bool Truncated = Bot.m_EpisodeStep >= m_Config.m_MaxEpisodeLength;
+		// Check for reset conditions:
+		// 1. Stuck detection: no progress for too long
+		// 2. Optional max episode length (if configured > 0)
+		bool IsStuck = Bot.m_StuckCounter >= m_Config.m_StuckThreshold;
+		bool MaxLengthReached = (m_Config.m_MaxEpisodeLength > 0) && (Bot.m_EpisodeStep >= m_Config.m_MaxEpisodeLength);
+		bool ShouldReset = IsStuck || MaxLengthReached;
 
 		// Debug: Log episode progress periodically
 		static int s_DebugCounter = 0;
@@ -275,6 +279,7 @@ void CRLBotManager::Tick()
 			s_DebugCounter = 0;
 			int MaxStep = 0;
 			int TotalSteps = 0;
+			float MaxProgress = 0;
 			for(int b = 0; b < (int)m_aBots.size(); b++)
 			{
 				if(m_aBots[b].m_Active)
@@ -282,24 +287,34 @@ void CRLBotManager::Tick()
 					TotalSteps += m_aBots[b].m_EpisodeStep;
 					if(m_aBots[b].m_EpisodeStep > MaxStep)
 						MaxStep = m_aBots[b].m_EpisodeStep;
+					if(m_aBots[b].m_BestProgress > MaxProgress)
+						MaxProgress = m_aBots[b].m_BestProgress;
 				}
 			}
-			log_info("rl/botmanager", "Episode progress: maxStep=%d totalEpisodes=%u avgSteps=%d maxLen=%d frameSkip=%d",
-				MaxStep, m_TotalEpisodes, m_ActiveBotCount > 0 ? TotalSteps / m_ActiveBotCount : 0, m_Config.m_MaxEpisodeLength, m_Config.m_FrameSkip);
+			log_info("rl/botmanager", "Progress: maxStep=%d maxX=%.0f totalEpisodes=%u avgSteps=%d stuckThresh=%d frameSkip=%d",
+				MaxStep, MaxProgress, m_TotalEpisodes, m_ActiveBotCount > 0 ? TotalSteps / m_ActiveBotCount : 0, m_Config.m_StuckThreshold, m_Config.m_FrameSkip);
 		}
 
 		// Write transition to shared memory (only on inference frames)
 		if(DoInference && m_pTrainingShm)
 		{
-			WriteTransition(BotIndex, Bot.m_AccumulatedReward, false, Truncated);
+			WriteTransition(BotIndex, Bot.m_AccumulatedReward, false, ShouldReset);
 			Bot.m_AccumulatedReward = 0.0f;  // Reset accumulated reward
 		}
 
-		// Handle truncation
-		if(Truncated)
+		// Handle reset (stuck or max length)
+		if(ShouldReset)
 		{
-			log_info("rl/botmanager", "Truncating bot %d at step %d (max=%d)",
-				BotIndex, Bot.m_EpisodeStep, m_Config.m_MaxEpisodeLength);
+			if(IsStuck)
+			{
+				log_info("rl/botmanager", "Bot %d stuck at step %d (no progress for %d ticks, bestX=%.0f)",
+					BotIndex, Bot.m_EpisodeStep, Bot.m_StuckCounter, Bot.m_BestProgress);
+			}
+			else
+			{
+				log_info("rl/botmanager", "Bot %d max length at step %d (max=%d)",
+					BotIndex, Bot.m_EpisodeStep, m_Config.m_MaxEpisodeLength);
+			}
 			// Write final transition if we haven't already (on non-inference frame)
 			if(!DoInference && m_pTrainingShm)
 			{
@@ -642,20 +657,38 @@ float CRLBotManager::CalculateReward(int BotIndex)
 
 	float Reward = 0.0f;
 	const CCharacterCore *pCore = pChar->Core();
+	float CurrentX = pCore->m_Pos.x;
 
-	// Progress reward (horizontal movement towards goal)
-	// This is a simple heuristic - real reward would depend on game mode
-	float DeltaX = pCore->m_Pos.x - Bot.m_PrevPos.x;
-	Reward += DeltaX * 0.001f; // Small reward for moving right
+	// Progress reward using high water mark - only reward NEW progress
+	// This allows agents to backtrack for jumps without penalty
+	if(CurrentX > Bot.m_BestProgress)
+	{
+		float Progress = CurrentX - Bot.m_BestProgress;
+		Reward += Progress * 0.01f;  // Reward for new progress
+		Bot.m_BestProgress = CurrentX;
+	}
 
-	// Velocity reward (encourage movement)
-	float Speed = length(pCore->m_Vel);
-	Reward += Speed * 0.0001f;
+	// Stuck detection: check if we're making progress (within tolerance)
+	// Use 32 units (1 tile) tolerance to account for physics oscillations
+	bool MadeProgress = (CurrentX >= Bot.m_BestProgress - 32.0f);
+	if(MadeProgress)
+	{
+		Bot.m_StuckCounter = 0;
+	}
+	else
+	{
+		Bot.m_StuckCounter++;
+	}
 
-	// Small negative reward per step to encourage efficiency
-	Reward -= 0.001f;
+	// Velocity bonus: reward movement in positive X direction
+	float VelX = pCore->m_Vel.x;
+	Reward += std::max(0.0f, VelX) * 0.0001f;
 
-	// Checkpoint/progress reward would be added here based on race position
+	// Small time penalty to encourage efficiency
+	Reward -= 0.0005f;
+
+	// Update previous position
+	Bot.m_PrevPos = pCore->m_Pos;
 
 	return Reward;
 }
@@ -689,12 +722,28 @@ void CRLBotManager::HandleEpisodeEnd(int BotIndex, bool Truncated, bool Transiti
 	// Reset episode state
 	Bot.m_EpisodeStep = 0;
 	Bot.m_EpisodeReward = 0.0f;
+	Bot.m_AccumulatedReward = 0.0f;
+	Bot.m_BestProgress = 0.0f;
+	Bot.m_StuckCounter = 0;
 
 	// Respawn the character
 	CPlayer *pPlayer = GetBotPlayer(BotIndex);
 	if(pPlayer)
 	{
+		// Kill current character if alive
+		if(pPlayer->GetCharacter())
+		{
+			pPlayer->KillCharacter(WEAPON_GAME, false);
+		}
 		pPlayer->Respawn();
+
+		// Reset best progress to spawn position
+		CCharacter *pNewChar = pPlayer->GetCharacter();
+		if(pNewChar)
+		{
+			Bot.m_BestProgress = pNewChar->Core()->m_Pos.x;
+			Bot.m_PrevPos = pNewChar->Core()->m_Pos;
+		}
 	}
 }
 

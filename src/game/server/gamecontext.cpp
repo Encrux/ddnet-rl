@@ -4324,7 +4324,8 @@ void CGameContext::OnInit(const void *pPersistentData)
 		BotConfig.m_UseInference = true;
 		BotConfig.m_Deterministic = false;
 		BotConfig.m_RewardScale = 1.0f;
-		BotConfig.m_MaxEpisodeLength = 1000;  // Reduced for faster episode turnover
+		BotConfig.m_MaxEpisodeLength = 0;     // Disabled - use stuck detection instead
+		BotConfig.m_StuckThreshold = 500;     // Reset after ~10 sec without progress (at 50Hz)
 		BotConfig.m_pModelPath = pModelPath;
 		// Use environment variables for configuration
 		const char *pShmName = getenv("DDNET_RL_SHM_NAME");
