@@ -295,6 +295,16 @@ public:
 	virtual const char *GetMapName() const = 0;
 
 	virtual bool IsSixup(int ClientId) const = 0;
+
+#ifdef CONF_RL_ONNX
+	// RL Bot support - creates a fake client for bot control
+	// Returns the ClientId on success, -1 on failure
+	virtual int CreateBotClient(const char *pName) = 0;
+	// Removes a bot client created with CreateBotClient
+	virtual void RemoveBotClient(int ClientId) = 0;
+	// Check if a client is a bot
+	virtual bool IsBotClient(int ClientId) const = 0;
+#endif
 };
 
 class IGameServer : public IInterface

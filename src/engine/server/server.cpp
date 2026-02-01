@@ -4603,3 +4603,116 @@ void CServer::SetLoggers(std::shared_ptr<ILogger> &&pFileLogger, std::shared_ptr
 	m_pFileLogger = pFileLogger;
 	m_pStdoutLogger = pStdoutLogger;
 }
+
+
+#ifdef CONF_RL_ONNX
+int CServer::CreateBotClient(const char *pName)
+{
+	// Find free client slot (starting from end to avoid conflicts with real players)
+	int ClientId = -1;
+	for(int i = MaxClients() - 1; i >= 0; i--)
+	{
+		if(m_aClients[i].m_State == CClient::STATE_EMPTY)
+		{
+			ClientId = i;
+			break;
+		}
+	}
+
+	if(ClientId < 0)
+	{
+		return -1;
+	}
+
+	// Initialize the client slot (similar to NewClientCallback)
+	CClient &Client = m_aClients[ClientId];
+
+	Client.m_State = CClient::STATE_CONNECTING;
+	Client.m_aName[0] = 0;
+	Client.m_aClan[0] = 0;
+	Client.m_Country = -1;
+	Client.m_AuthKey = -1;
+	Client.m_AuthTries = 0;
+	Client.m_AuthHidden = false;
+	Client.m_pRconCmdToSend = nullptr;
+	Client.m_MaplistEntryToSend = CClient::MAPLIST_UNINITIALIZED;
+	Client.m_ShowIps = false;
+	Client.m_DebugDummy = true; // Mark as dummy/bot
+	Client.m_ForceHighBandwidthOnSpectate = false;
+	Client.m_DDNetVersion = VERSION_DDNET_OLD;
+	Client.m_GotDDNetVersionPacket = true;
+	Client.m_DDNetVersionSettled = true;
+	Client.Reset();
+
+	// Set up fake address (similar to debug dummies)
+	Client.m_DebugDummyAddr.type = NETTYPE_IPV6;
+	Client.m_DebugDummyAddr.ip[0] = 0xfd;
+	// Global ID (40 bits): use "rlbot" identifier
+	Client.m_DebugDummyAddr.ip[1] = 'r';
+	Client.m_DebugDummyAddr.ip[2] = 'l';
+	Client.m_DebugDummyAddr.ip[3] = 'b';
+	Client.m_DebugDummyAddr.ip[4] = 'o';
+	Client.m_DebugDummyAddr.ip[5] = 't';
+	// Subnet ID (16 bits)
+	Client.m_DebugDummyAddr.ip[6] = 0x00;
+	Client.m_DebugDummyAddr.ip[7] = 0x01;
+	// Interface ID (64 bits): set to client ID
+	Client.m_DebugDummyAddr.ip[8] = 0x00;
+	Client.m_DebugDummyAddr.ip[9] = 0x00;
+	Client.m_DebugDummyAddr.ip[10] = 0x00;
+	Client.m_DebugDummyAddr.ip[11] = 0x00;
+	uint_to_bytes_be(&Client.m_DebugDummyAddr.ip[12], ClientId);
+	// Port
+	Client.m_DebugDummyAddr.port = 12345 + ClientId;
+	net_addr_str(&Client.m_DebugDummyAddr, Client.m_aDebugDummyAddrString.data(), Client.m_aDebugDummyAddrString.size(), true);
+	net_addr_str(&Client.m_DebugDummyAddr, Client.m_aDebugDummyAddrStringNoPort.data(), Client.m_aDebugDummyAddrStringNoPort.size(), false);
+
+	// Notify game server of new client
+	GameServer()->OnClientConnected(ClientId, nullptr);
+
+	// Set to ingame state
+	Client.m_State = CClient::STATE_INGAME;
+
+	// Set name
+	if(pName && pName[0])
+	{
+		str_copy(Client.m_aName, pName, sizeof(Client.m_aName));
+	}
+	else
+	{
+		str_format(Client.m_aName, sizeof(Client.m_aName), "RL Bot %d", ClientId);
+	}
+
+	// Notify game server that client is entering
+	GameServer()->OnClientEnter(ClientId);
+
+	return ClientId;
+}
+
+void CServer::RemoveBotClient(int ClientId)
+{
+	if(ClientId < 0 || ClientId >= MAX_CLIENTS)
+		return;
+
+	CClient &Client = m_aClients[ClientId];
+	if(Client.m_State == CClient::STATE_EMPTY || !Client.m_DebugDummy)
+		return;
+
+	// Use the same mechanism as DelClientCallback
+	GameServer()->OnClientDrop(ClientId, "RL Bot removed");
+
+	Client.m_State = CClient::STATE_EMPTY;
+	Client.m_aName[0] = 0;
+	Client.m_aClan[0] = 0;
+	Client.m_Country = -1;
+	Client.m_DebugDummy = false;
+	Client.m_Snapshots.PurgeAll();
+}
+
+bool CServer::IsBotClient(int ClientId) const
+{
+	if(ClientId < 0 || ClientId >= MAX_CLIENTS)
+		return false;
+	return m_aClients[ClientId].m_DebugDummy;
+}
+#endif

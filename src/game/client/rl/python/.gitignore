@@ -1,0 +1,19 @@
+# TensorBoard logs
+runs/
+
+# Backups of previous runs
+backups/
+
+# Model files
+*.onnx
+*.onnx.data
+*.pt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/

@@ -103,6 +103,7 @@ option(INFORM_UPDATE "Inform about available updates" ON)
 option(VIDEORECORDER "Enable video recording support via FFmpeg" ON)
 option(UPNP "Enable UPnP support" OFF)
 option(ANTIBOT "Enable support for a dynamic anticheat library (not provided, see src/antibot for interface if you want to implement your own)" OFF)
+option(RL_ONNX "Enable RL inference with ONNX Runtime for server-side bots" OFF)
 option(HEADLESS_CLIENT "Build the client without graphics" OFF)
 option(CLIENT "Compile client" ON)
 option(SERVER "Compile server" ON)
@@ -525,6 +526,9 @@ if(MYSQL)
 else()
   set(MYSQL_LIBRARIES)
 endif()
+if(RL_ONNX)
+  find_package(ONNXRuntime)
+endif()
 find_package(Ogg)
 find_package(Opus)
 find_package(Opusfile)
@@ -614,6 +618,9 @@ if(UPNP)
 endif()
 if(MYSQL)
   show_dependency_status("MySQL" MYSQL)
+endif()
+if(RL_ONNX)
+  show_dependency_status("ONNXRuntime" ONNXRUNTIME)
 endif()
 show_dependency_status("Ogg" OGG)
 show_dependency_status("OpenSSL Crypto" CRYPTO)
@@ -2832,6 +2839,8 @@ if(SERVER)
     mutes.cpp
     player.cpp
     player.h
+    rl/botmanager.cpp
+    rl/botmanager.h
     save.cpp
     save.h
     score.cpp
@@ -2850,7 +2859,21 @@ if(SERVER)
     "src/generated/server_data.h"
     "src/generated/wordlist.h"
   )
-  set(SERVER_SRC ${ENGINE_SERVER_WITHOUT_MAIN} ${GAME_SERVER} ${GAME_GENERATED_SERVER})
+
+  # RL ONNX sources (shared between server and potentially client)
+  if(RL_ONNX AND ONNXRUNTIME_FOUND)
+    set_src(GAME_RL GLOB src/game/rl
+      inference.cpp
+      inference.h
+      rl_protocol.h
+      training_shm.cpp
+      training_shm.h
+    )
+  else()
+    set(GAME_RL)
+  endif()
+
+  set(SERVER_SRC ${ENGINE_SERVER_WITHOUT_MAIN} ${GAME_SERVER} ${GAME_GENERATED_SERVER} ${GAME_RL})
   if(TARGET_OS STREQUAL "windows")
     set(VERSION_EXECUTABLE "${SERVER_EXECUTABLE}")
     set(VERSION_COMPANY "${CLIENT_EXECUTABLE} Team")
@@ -2870,9 +2893,15 @@ if(SERVER)
   endif()
 
   # Libraries
+  if(RL_ONNX AND ONNXRUNTIME_FOUND)
+    set(RL_ONNX_LIBS ${ONNXRUNTIME_LIBRARIES})
+  else()
+    set(RL_ONNX_LIBS)
+  endif()
   set(LIBS_SERVER
     ${MINIUPNPC_LIBRARIES}
     ${MYSQL_LIBRARIES}
+    ${RL_ONNX_LIBS}
     ${TARGET_ANTIBOT}
     rust_engine_shared
 
@@ -3741,6 +3770,11 @@ foreach(target ${TARGETS_OWN})
   if(MYSQL)
     target_compile_definitions(${target} PRIVATE CONF_MYSQL)
     target_include_directories(${target} SYSTEM PRIVATE ${MYSQL_INCLUDE_DIRS})
+  endif()
+  if(RL_ONNX AND ONNXRUNTIME_FOUND)
+    target_compile_definitions(${target} PRIVATE CONF_RL_ONNX)
+    target_include_directories(${target} SYSTEM PRIVATE ${ONNXRUNTIME_INCLUDE_DIRS})
+    target_link_libraries(${target} ${ONNXRUNTIME_LIBRARIES})
   endif()
   if(TEST_MYSQL)
     target_compile_definitions(${target} PRIVATE CONF_TEST_MYSQL)

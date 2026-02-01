@@ -7,6 +7,10 @@
 #include "gameworld.h"
 #include "teehistorian.h"
 
+#ifdef CONF_RL_ONNX
+class CRLBotManager;
+#endif
+
 #include <engine/console.h>
 #include <engine/server.h>
 
@@ -619,9 +623,17 @@ private:
 
 	void LogEvent(const char *Description, int ClientId);
 
+#ifdef CONF_RL_ONNX
+	// RL Bot Manager for C++ inference
+	CRLBotManager *m_pRLBotManager = nullptr;
+#endif
+
 public:
 	CLayers *Layers() { return &m_Layers; }
 	CScore *Score() { return m_pScore; }
+#ifdef CONF_RL_ONNX
+	CRLBotManager *RLBotManager() { return m_pRLBotManager; }
+#endif
 
 	enum
 	{

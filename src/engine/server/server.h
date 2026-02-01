@@ -528,6 +528,13 @@ public:
 
 	void SetLoggers(std::shared_ptr<ILogger> &&pFileLogger, std::shared_ptr<ILogger> &&pStdoutLogger);
 
+#ifdef CONF_RL_ONNX
+	// RL Bot support
+	int CreateBotClient(const char *pName) override;
+	void RemoveBotClient(int ClientId) override;
+	bool IsBotClient(int ClientId) const override;
+#endif
+
 #ifdef CONF_FAMILY_UNIX
 	enum CONN_LOGGING_CMD
 	{

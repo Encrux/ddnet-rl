@@ -2,6 +2,10 @@
 /* If you are missing that file, acquire a complete release at teeworlds.com.                */
 #include "gamecontext.h"
 
+#ifdef CONF_RL_ONNX
+#include "rl/botmanager.h"
+#endif
+
 #include "entities/character.h"
 #include "gamemodes/ddnet.h"
 #include "gamemodes/mod.h"
@@ -1136,6 +1140,14 @@ void CGameContext::OnTick()
 		if(pPlayer)
 			pPlayer->PostPostTick();
 	}
+
+#ifdef CONF_RL_ONNX
+	// RL bot manager tick (runs inference and applies actions)
+	if(m_pRLBotManager)
+	{
+		m_pRLBotManager->Tick();
+	}
+#endif
 
 	// update voting
 	if(m_VoteCloseTime)
@@ -4299,6 +4311,49 @@ void CGameContext::OnInit(const void *pPersistentData)
 	CreateAllEntities(true);
 
 	m_pAntibot->RoundStart(this);
+
+#ifdef CONF_RL_ONNX
+	// Initialize RL bot manager if model file exists
+	// This auto-initializes for testing - in production, use console commands
+	const char *pModelPath = "model.onnx";
+	if(Storage()->FileExists(pModelPath, IStorage::TYPE_ALL))
+	{
+		m_pRLBotManager = new CRLBotManager(this);
+		CRLBotManager::SBotConfig BotConfig;
+		BotConfig.m_MaxBots = 63;  // Max clients - 1 (for potential human player)
+		BotConfig.m_UseInference = true;
+		BotConfig.m_Deterministic = false;
+		BotConfig.m_RewardScale = 1.0f;
+		BotConfig.m_MaxEpisodeLength = 1000;  // Reduced for faster episode turnover
+		BotConfig.m_pModelPath = pModelPath;
+		// Use environment variable for shm name to support multi-server training
+		const char *pShmName = getenv("DDNET_RL_SHM_NAME");
+		BotConfig.m_pShmName = pShmName ? pShmName : "/ddnet_rl_training";
+
+		if(m_pRLBotManager->Init(BotConfig))
+		{
+			log_info("gamecontext", "RL Bot Manager initialized with model: %s", pModelPath);
+			// Spawn all bots
+			for(int i = 0; i < BotConfig.m_MaxBots; i++)
+			{
+				int BotIdx = m_pRLBotManager->SpawnBot();
+				if(BotIdx >= 0)
+					log_info("gamecontext", "Spawned RL bot %d", BotIdx);
+			}
+		}
+		else
+		{
+			log_error("gamecontext", "Failed to initialize RL Bot Manager");
+			delete m_pRLBotManager;
+			m_pRLBotManager = nullptr;
+		}
+	}
+	else
+	{
+		log_info("gamecontext", "RL model not found at '%s', bot manager disabled", pModelPath);
+		m_pRLBotManager = nullptr;
+	}
+#endif
 }
 
 void CGameContext::CreateAllEntities(bool Initial)
@@ -4552,6 +4607,16 @@ void CGameContext::OnShutdown(void *pPersistentData)
 	}
 
 	Antibot()->RoundEnd();
+
+#ifdef CONF_RL_ONNX
+	// Shutdown RL bot manager
+	if(m_pRLBotManager)
+	{
+		m_pRLBotManager->Shutdown();
+		delete m_pRLBotManager;
+		m_pRLBotManager = nullptr;
+	}
+#endif
 
 	if(m_TeeHistorianActive)
 	{
