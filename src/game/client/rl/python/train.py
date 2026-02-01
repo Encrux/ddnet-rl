@@ -241,6 +241,10 @@ def main():
             print(f"Resuming from: {args.resume}")
             agent.load(args.resume)
 
+        # Warmup torch.compile with actual observation shapes
+        # This triggers CUDA graph capture for reduce-overhead mode
+        agent.warmup(obs, num_iters=10)
+
         # Training loop
         num_updates = args.total_timesteps // (args.num_steps * args.num_envs)
         print(f"\nStarting training for {args.total_timesteps:,} timesteps ({num_updates} updates)")
@@ -259,6 +263,10 @@ def main():
         global_step = agent.global_step
         starting_global_step = global_step  # Track starting point for FPS calculation
 
+        # Calculate starting update number for LR annealing when resuming
+        batch_size = args.num_steps * args.num_envs
+        starting_update = global_step // batch_size
+
         # Episode tracking
         episode_rewards = []
         episode_lengths = []
@@ -266,9 +274,11 @@ def main():
         for update in range(1, num_updates + 1):
             rollout_start = time.time()
 
-            # Anneal learning rate (linear decay)
+            # Anneal learning rate (linear decay) - use global update count for resuming
             if args.total_timesteps > 0:
-                frac = 1.0 - (update - 1) / num_updates
+                effective_update = starting_update + update
+                frac = 1.0 - (effective_update - 1) / num_updates
+                frac = max(frac, 0.0)  # Clamp to 0 if past total_timesteps
                 lr = frac * args.learning_rate
                 for param_group in agent.optimizer.param_groups:
                     param_group['lr'] = lr
@@ -280,7 +290,11 @@ def main():
                 # Get action (optionally pause during inference to prevent stale actions)
                 if args.server_side and args.sync_inference:
                     env.pause()
+                t_inf_start = time.time()
                 action, log_prob, value = agent.get_action(obs)
+                t_inf = time.time() - t_inf_start
+                if t_inf > 0.5:  # Log slow inference (>500ms)
+                    print(f"  [SLOW] Inference took {t_inf*1000:.0f}ms at step {step}")
                 if args.server_side and args.sync_inference:
                     env.unpause()
 

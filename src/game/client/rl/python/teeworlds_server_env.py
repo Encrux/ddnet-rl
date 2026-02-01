@@ -886,6 +886,7 @@ class TeeWorldsServerEnv:
         self._running = False
         self._closed = False
         self._shutting_down = False  # Fast exit flag for threads
+        self._server_log = None  # Log file for server 0
 
         # Thread pool for parallel shm I/O (GIL is released during mmap operations)
         self._executor = ThreadPoolExecutor(max_workers=min(32, self.num_servers))
@@ -1064,13 +1065,24 @@ class TeeWorldsServerEnv:
             f"sv_rl_bots {self.num_bots_per_server} {server_idx}",
         ])
 
-        server_proc = subprocess.Popen(
-            server_cmd,
-            preexec_fn=os.setsid,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=server_dir,  # Run from server directory so it finds data/
-        )
+        # Server 0 logs to /tmp/rl_server.log for debugging (tail -f /tmp/rl_server.log)
+        if server_idx == 0:
+            self._server_log = open("/tmp/rl_server.log", "w")
+            server_proc = subprocess.Popen(
+                server_cmd,
+                preexec_fn=os.setsid,
+                stdout=self._server_log,
+                stderr=subprocess.STDOUT,
+                cwd=server_dir,
+            )
+        else:
+            server_proc = subprocess.Popen(
+                server_cmd,
+                preexec_fn=os.setsid,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=server_dir,
+            )
         self.server_procs.append(server_proc)
 
         effective_rate = self.config.sv_tickrate // self.config.frame_skip
@@ -1109,13 +1121,24 @@ class TeeWorldsServerEnv:
             f"sv_rl_bots {self.num_bots_per_server} {server_idx}",
         ])
 
-        server_proc = subprocess.Popen(
-            server_cmd,
-            preexec_fn=os.setsid,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=server_dir,
-        )
+        # Server 0 logs to /tmp/rl_server.log for debugging (tail -f /tmp/rl_server.log)
+        if server_idx == 0:
+            self._server_log = open("/tmp/rl_server.log", "w")
+            server_proc = subprocess.Popen(
+                server_cmd,
+                preexec_fn=os.setsid,
+                stdout=self._server_log,
+                stderr=subprocess.STDOUT,
+                cwd=server_dir,
+            )
+        else:
+            server_proc = subprocess.Popen(
+                server_cmd,
+                preexec_fn=os.setsid,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=server_dir,
+            )
         self.server_procs.append(server_proc)
         print(f"  Server {server_idx}: PID={server_proc.pid}, port={server_port}")
 
@@ -1531,6 +1554,13 @@ class TeeWorldsServerEnv:
             except:
                 pass
         self.server_procs = []
+
+        # Close server log file if open
+        if hasattr(self, '_server_log') and self._server_log:
+            try:
+                self._server_log.close()
+            except:
+                pass
 
         # Shutdown thread pool without waiting
         if hasattr(self, '_executor'):

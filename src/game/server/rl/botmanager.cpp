@@ -164,7 +164,7 @@ bool CBotManager::CreateBotPlayers()
 		{
 			// Initialize bot client state with a name BEFORE creating player
 			char aBotName[MAX_NAME_LENGTH];
-			str_format(aBotName, sizeof(aBotName), "RL Bot %02d", i);
+			str_format(aBotName, sizeof(aBotName), "RL Bot %03d", i);
 			m_pGameContext->Server()->InitBotClient(NextClientId, aBotName);
 
 			// Use CreatePlayer which handles the pool allocation and UniqueClientId
@@ -249,7 +249,7 @@ void CBotManager::Tick()
 			{
 				// Initialize bot client state with a name BEFORE creating player
 				char aBotName[MAX_NAME_LENGTH];
-				str_format(aBotName, sizeof(aBotName), "RL Bot %02d", i);
+				str_format(aBotName, sizeof(aBotName), "RL Bot %03d", i);
 				m_pGameContext->Server()->InitBotClient(ClientId, aBotName);
 
 				CPlayer *pPlayer = m_pGameContext->CreatePlayer(ClientId, 0, false, -1);
@@ -528,6 +528,15 @@ void CBotManager::ExtractObservations()
 			// Character dead or not spawned
 			TickReward = -1.0f; // Death penalty
 			IsDone = true;
+			dbg_msg("rl/done", "Bot %d: dead/not spawned", i);
+		}
+
+		// Hard reset if no progress for too long (~10 seconds)
+		// Long enough to cover mandatory freeze sections (typically 1-3 sec)
+		if(m_aBotState[i].m_StuckCounter > 500)
+		{
+			IsDone = true;
+			dbg_msg("rl/done", "Bot %d: stuck > 500", i);
 		}
 
 		// Accumulate reward
@@ -689,16 +698,11 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 	// No penalty for backtracking - just 0 reward
 
 	// Checkpoint reached (sparse but important)
-	if(State.m_CurrentCheckpointIndex > pObs->m_CheckpointIndex)
-	{
-		// This was already updated in ExtractObservations, so check against stored state
-	}
-	int CurrentCp = m_aBotState[BotIndex].m_CurrentCheckpointIndex;
-	static int s_aLastCp[MAX_RL_BOTS] = {-1};
-	if(CurrentCp > s_aLastCp[BotIndex])
+	int CurrentCp = State.m_CurrentCheckpointIndex;
+	if(CurrentCp > State.m_LastCheckpointRewarded)
 	{
 		Reward += 10.0f;
-		s_aLastCp[BotIndex] = CurrentCp;
+		State.m_LastCheckpointRewarded = CurrentCp;
 		// Reset distance tracking for new checkpoint
 		vec2 NewNextCp = GetNextCheckpointPos(CurrentCp);
 		float NewDist = length(NewNextCp - Pos);
@@ -740,20 +744,27 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 		Reward -= 0.1f; // Per-tick penalty while frozen
 	}
 
-	// Stuck penalty
-	if(std::abs(Local.m_PosX - State.m_LastPosX) < 1.0f &&
-	   std::abs(Local.m_PosY - State.m_LastPosY) < 1.0f)
-	{
-		State.m_StuckCounter++;
-		if(State.m_StuckCounter > 100)
-		{
-			Reward -= 0.01f;
-		}
-	}
-	else
+	// Stuck detection based on lack of progress (not lack of movement)
+	// If we're at or near our best distance, we made progress recently
+	// Use generous tolerance (32 units = 1 tile) to account for physics oscillations
+	bool MadeProgress = (DistToCheckpoint <= State.m_BestDistToCheckpoint + 32.0f);
+
+	if(MadeProgress)
 	{
 		State.m_StuckCounter = 0;
 	}
+	else
+	{
+		State.m_StuckCounter++;
+		// Debug: Log when stuck counter is high
+		if(State.m_StuckCounter == 100 || State.m_StuckCounter == 300 || State.m_StuckCounter == 500)
+		{
+			dbg_msg("rl/stuck", "Bot %d: stuck=%d, dist=%.1f, best=%.1f, diff=%.1f",
+				BotIndex, State.m_StuckCounter, DistToCheckpoint, State.m_BestDistToCheckpoint,
+				DistToCheckpoint - State.m_BestDistToCheckpoint);
+		}
+	}
+	// Note: Hard reset (Done=1) is handled in ExtractObservations where pBotData is accessible
 
 	// Update state
 	State.m_LastPosX = Local.m_PosX;
@@ -771,6 +782,7 @@ void CBotManager::ResetRewardState(int BotIndex)
 	State.m_LastPosX = m_SpawnPos.x;
 	State.m_LastPosY = m_SpawnPos.y;
 	State.m_CurrentCheckpointIndex = -1;
+	State.m_LastCheckpointRewarded = -1;  // Reset so checkpoints give rewards again
 	State.m_LastDistToCheckpoint = 10000.0f; // Will be set properly on first tick
 	State.m_BestDistToCheckpoint = 10000.0f; // High water mark for progress
 	State.m_LastHookState = 0;

@@ -102,6 +102,7 @@ private:
 		float m_LastDistToCheckpoint;
 		float m_BestDistToCheckpoint;  // High water mark - closest we've ever been
 		int m_CurrentCheckpointIndex;
+		int m_LastCheckpointRewarded;  // Last checkpoint that gave bonus (reset on respawn)
 		int m_LastHookState;
 		int m_StuckCounter;
 		bool m_WasFrozen;

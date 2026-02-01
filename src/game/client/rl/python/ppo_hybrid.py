@@ -355,11 +355,13 @@ class PPOAgent:
         self.critic = Critic(obs_dim, self.config).to(self.device)
 
         # Compile models for faster execution (PyTorch 2.0+)
+        # Use "default" mode - reduce-overhead (CUDA graphs) causes recompilation
+        # when batch sizes change between inference and PPO update
         if self.config.use_compile and hasattr(torch, 'compile'):
             try:
-                self.actor = torch.compile(self.actor, mode="reduce-overhead")
-                self.critic = torch.compile(self.critic, mode="reduce-overhead")
-                print("Models compiled with torch.compile (reduce-overhead mode)")
+                self.actor = torch.compile(self.actor, mode="default")
+                self.critic = torch.compile(self.critic, mode="default")
+                print("Models compiled with torch.compile (default mode)")
             except Exception as e:
                 print(f"torch.compile failed, using eager mode: {e}")
 
@@ -426,6 +428,20 @@ class PPOAgent:
             }
         else:
             return torch.from_numpy(obs).float().to(self.device)
+
+    def warmup(self, obs: Union[np.ndarray, Dict[str, np.ndarray]], num_iters: int = 10):
+        """
+        Warmup torch.compile by running inference passes.
+        This triggers CUDA graph capture for reduce-overhead mode.
+        Call this before training with a representative observation batch.
+        """
+        print(f"Warming up torch.compile ({num_iters} iterations)...")
+        import time
+        start = time.time()
+        for i in range(num_iters):
+            _ = self.get_action(obs)
+        elapsed = time.time() - start
+        print(f"Warmup complete in {elapsed:.1f}s (avg {elapsed/num_iters*1000:.0f}ms/iter)")
 
     @torch.no_grad()
     def get_action(
@@ -683,8 +699,23 @@ class PPOAgent:
     def load(self, path: str):
         """Load agent state."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+
+        # Handle torch.compile prefix mismatch
+        # Compiled models have "_orig_mod." prefix, uncompiled don't
+        def fix_state_dict(state_dict, target_module):
+            ckpt_has_prefix = any(k.startswith('_orig_mod.') for k in state_dict.keys())
+            model_has_prefix = any(k.startswith('_orig_mod.') for k in target_module.state_dict().keys())
+
+            if ckpt_has_prefix and not model_has_prefix:
+                # Strip prefix: loading compiled checkpoint into uncompiled model
+                return {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+            elif not ckpt_has_prefix and model_has_prefix:
+                # Add prefix: loading uncompiled checkpoint into compiled model
+                return {'_orig_mod.' + k: v for k, v in state_dict.items()}
+            return state_dict
+
+        self.actor.load_state_dict(fix_state_dict(checkpoint['actor_state_dict'], self.actor))
+        self.critic.load_state_dict(fix_state_dict(checkpoint['critic_state_dict'], self.critic))
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint.get('global_step', 0)
         if self.scaler is not None and 'scaler_state_dict' in checkpoint:
