@@ -128,8 +128,14 @@ void CRLBotManager::Tick()
 	if(!m_Initialized || m_ActiveBotCount == 0)
 		return;
 
-	// Check for model updates
-	if(m_pInference && m_pTrainingShm)
+	// Frame skip logic - only do full inference every N frames
+	m_FrameCounter++;
+	bool DoInference = (m_FrameCounter >= m_Config.m_FrameSkip);
+	if(DoInference)
+		m_FrameCounter = 0;
+
+	// Check for model updates (only on inference frames)
+	if(DoInference && m_pInference && m_pTrainingShm)
 	{
 		rl::SModelReloadSignal *pSignal = m_pTrainingShm->Get().GetModelSignal();
 		if(m_pInference->CheckAndReloadModel(pSignal))
@@ -182,8 +188,11 @@ void CRLBotManager::Tick()
 			continue;
 		}
 
-		// Extract observation
-		ExtractObservation(i, &m_ObservationBuffer[NumActiveBots * ObsSize]);
+		// Extract observation (only on inference frames)
+		if(DoInference)
+		{
+			ExtractObservation(i, &m_ObservationBuffer[NumActiveBots * ObsSize]);
+		}
 		ActiveBotIndices.push_back(i);
 		NumActiveBots++;
 	}
@@ -197,35 +206,38 @@ void CRLBotManager::Tick()
 		return;
 	}
 
-	// Run batched inference
-	if(m_pInference && m_pInference->IsReady())
+	// Run batched inference (only on inference frames)
+	if(DoInference)
 	{
-		if(!m_pInference->InferActions(
-			   m_ObservationBuffer.data(),
-			   NumActiveBots,
-			   m_ActionBuffer.data(),
-			   m_LogProbBuffer.data(),
-			   m_ValueBuffer.data(),
-			   m_Config.m_Deterministic))
+		if(m_pInference && m_pInference->IsReady())
 		{
-			log_warn("rl/botmanager", "Inference failed: %s", m_pInference->GetLastError());
-			return;
+			if(!m_pInference->InferActions(
+				   m_ObservationBuffer.data(),
+				   NumActiveBots,
+				   m_ActionBuffer.data(),
+				   m_LogProbBuffer.data(),
+				   m_ValueBuffer.data(),
+				   m_Config.m_Deterministic))
+			{
+				log_warn("rl/botmanager", "Inference failed: %s", m_pInference->GetLastError());
+				return;
+			}
 		}
-	}
-	else
-	{
-		// Random actions for testing
-		for(int i = 0; i < NumActiveBots; i++)
+		else
 		{
-			m_ActionBuffer[i].m_Direction = (rand() % 3) - 1;
-			m_ActionBuffer[i].m_Jump = rand() % 2;
-			m_ActionBuffer[i].m_Hook = rand() % 2;
-			m_ActionBuffer[i].m_Fire = rand() % 2;
-			m_ActionBuffer[i].m_WeaponNext = 0;
-			m_ActionBuffer[i].m_AimX = (float)(rand() % 1000 - 500) / 100.0f;
-			m_ActionBuffer[i].m_AimY = (float)(rand() % 1000 - 500) / 100.0f;
-			m_LogProbBuffer[i] = 0.0f;
-			m_ValueBuffer[i] = 0.0f;
+			// Random actions for testing
+			for(int i = 0; i < NumActiveBots; i++)
+			{
+				m_ActionBuffer[i].m_Direction = (rand() % 3) - 1;
+				m_ActionBuffer[i].m_Jump = rand() % 2;
+				m_ActionBuffer[i].m_Hook = rand() % 2;
+				m_ActionBuffer[i].m_Fire = rand() % 2;
+				m_ActionBuffer[i].m_WeaponNext = 0;
+				m_ActionBuffer[i].m_AimX = (float)(rand() % 1000 - 500) / 100.0f;
+				m_ActionBuffer[i].m_AimY = (float)(rand() % 1000 - 500) / 100.0f;
+				m_LogProbBuffer[i] = 0.0f;
+				m_ValueBuffer[i] = 0.0f;
+			}
 		}
 	}
 
@@ -235,16 +247,20 @@ void CRLBotManager::Tick()
 		int BotIndex = ActiveBotIndices[i];
 		SBotState &Bot = m_aBots[BotIndex];
 
-		// Apply action
-		ApplyAction(BotIndex, m_ActionBuffer[i]);
+		// On inference frames, update action info
+		if(DoInference)
+		{
+			Bot.m_LastAction = m_ActionBuffer[i];
+			Bot.m_LastLogProb = m_LogProbBuffer[i];
+			Bot.m_LastValue = m_ValueBuffer[i];
+		}
 
-		// Store action info for transition
-		Bot.m_LastAction = m_ActionBuffer[i];
-		Bot.m_LastLogProb = m_LogProbBuffer[i];
-		Bot.m_LastValue = m_ValueBuffer[i];
+		// Apply action (every frame - action repeat)
+		ApplyAction(BotIndex, Bot.m_LastAction);
 
-		// Calculate reward
+		// Calculate reward and accumulate
 		float Reward = CalculateReward(BotIndex) * m_Config.m_RewardScale;
+		Bot.m_AccumulatedReward += Reward;
 		Bot.m_EpisodeReward += Reward;
 		Bot.m_EpisodeStep++;
 		m_TotalSteps++;
@@ -268,14 +284,15 @@ void CRLBotManager::Tick()
 						MaxStep = m_aBots[b].m_EpisodeStep;
 				}
 			}
-			log_info("rl/botmanager", "Episode progress: maxStep=%d totalEpisodes=%u avgSteps=%d maxLen=%d",
-				MaxStep, m_TotalEpisodes, m_ActiveBotCount > 0 ? TotalSteps / m_ActiveBotCount : 0, m_Config.m_MaxEpisodeLength);
+			log_info("rl/botmanager", "Episode progress: maxStep=%d totalEpisodes=%u avgSteps=%d maxLen=%d frameSkip=%d",
+				MaxStep, m_TotalEpisodes, m_ActiveBotCount > 0 ? TotalSteps / m_ActiveBotCount : 0, m_Config.m_MaxEpisodeLength, m_Config.m_FrameSkip);
 		}
 
-		// Write transition to shared memory
-		if(m_pTrainingShm)
+		// Write transition to shared memory (only on inference frames)
+		if(DoInference && m_pTrainingShm)
 		{
-			WriteTransition(BotIndex, Reward, false, Truncated);
+			WriteTransition(BotIndex, Bot.m_AccumulatedReward, false, Truncated);
+			Bot.m_AccumulatedReward = 0.0f;  // Reset accumulated reward
 		}
 
 		// Handle truncation
@@ -283,13 +300,18 @@ void CRLBotManager::Tick()
 		{
 			log_info("rl/botmanager", "Truncating bot %d at step %d (max=%d)",
 				BotIndex, Bot.m_EpisodeStep, m_Config.m_MaxEpisodeLength);
-			// TransitionAlreadyWritten=true because we just wrote it above with Truncated=true
+			// Write final transition if we haven't already (on non-inference frame)
+			if(!DoInference && m_pTrainingShm)
+			{
+				WriteTransition(BotIndex, Bot.m_AccumulatedReward, false, true);
+				Bot.m_AccumulatedReward = 0.0f;
+			}
 			HandleEpisodeEnd(BotIndex, true, true);
 		}
 	}
 
-	// Update shared memory statistics
-	if(m_pTrainingShm)
+	// Update shared memory statistics (only count inference frames as "steps" for training)
+	if(DoInference && m_pTrainingShm)
 	{
 		m_pTrainingShm->Get().AddSteps(NumActiveBots);
 	}

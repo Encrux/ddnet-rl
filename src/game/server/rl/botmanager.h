@@ -40,6 +40,7 @@ public:
 		bool m_Deterministic = false;                // Use deterministic policy (for evaluation)
 		float m_RewardScale = 1.0f;                  // Reward scaling factor
 		int m_MaxEpisodeLength = 10000;              // Max steps before truncation
+		int m_FrameSkip = 1;                         // Only act every N frames (1 = every frame)
 		const char *m_pModelPath = nullptr;          // Path to ONNX model
 		const char *m_pShmName = nullptr;            // Shared memory name (null = disabled)
 	};
@@ -62,6 +63,9 @@ public:
 		rl::SAction m_LastAction;
 		float m_LastLogProb = 0.0f;
 		float m_LastValue = 0.0f;
+
+		// Accumulated reward for frame-skip
+		float m_AccumulatedReward = 0.0f;
 	};
 
 	CRLBotManager(CGameContext *pGameServer);
@@ -147,6 +151,9 @@ private:
 	std::vector<rl::SAction> m_ActionBuffer;
 	std::vector<float> m_LogProbBuffer;
 	std::vector<float> m_ValueBuffer;
+
+	// Frame skip counter
+	int m_FrameCounter = 0;
 
 	// Statistics
 	uint64_t m_TotalSteps = 0;

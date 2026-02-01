@@ -4320,15 +4320,17 @@ void CGameContext::OnInit(const void *pPersistentData)
 	{
 		m_pRLBotManager = new CRLBotManager(this);
 		CRLBotManager::SBotConfig BotConfig;
-		BotConfig.m_MaxBots = 63;  // Max clients - 1 (for potential human player)
+		BotConfig.m_MaxBots = 127;  // Max clients - 1 (for potential human player/spectator)
 		BotConfig.m_UseInference = true;
 		BotConfig.m_Deterministic = false;
 		BotConfig.m_RewardScale = 1.0f;
 		BotConfig.m_MaxEpisodeLength = 1000;  // Reduced for faster episode turnover
 		BotConfig.m_pModelPath = pModelPath;
-		// Use environment variable for shm name to support multi-server training
+		// Use environment variables for configuration
 		const char *pShmName = getenv("DDNET_RL_SHM_NAME");
 		BotConfig.m_pShmName = pShmName ? pShmName : "/ddnet_rl_training";
+		const char *pFrameSkip = getenv("DDNET_RL_FRAME_SKIP");
+		BotConfig.m_FrameSkip = pFrameSkip ? atoi(pFrameSkip) : 4;  // Default: act every 4 frames
 
 		if(m_pRLBotManager->Init(BotConfig))
 		{

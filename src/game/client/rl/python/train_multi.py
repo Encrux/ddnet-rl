@@ -2,7 +2,7 @@
 """
 Multi-server PPO training for DDNet RL.
 
-Spawns multiple DDNet servers, each with 63 bots, and trains from all of them
+Spawns multiple DDNet servers, each with 127 bots, and trains from all of them
 in parallel. Each server writes to its own shared memory region.
 
 Usage:
@@ -47,11 +47,13 @@ class MultiServerManager:
         server_executable: str,
         base_port: int = 8303,
         map_name: str = "Tutorial",
+        frame_skip: int = 4,
     ):
         self.num_servers = num_servers
         self.server_executable = server_executable
         self.base_port = base_port
         self.map_name = map_name
+        self.frame_skip = frame_skip
         self.processes: List[subprocess.Popen] = []
         self.shm_names: List[str] = []
 
@@ -66,6 +68,7 @@ class MultiServerManager:
             # Set environment for this server
             env = os.environ.copy()
             env["DDNET_RL_SHM_NAME"] = shm_name
+            env["DDNET_RL_FRAME_SKIP"] = str(self.frame_skip)
 
             # Add ONNX Runtime and CUDA libraries to LD_LIBRARY_PATH
             # Auto-detect paths based on current environment
@@ -93,6 +96,10 @@ class MultiServerManager:
                 self.server_executable,
                 f"sv_map {self.map_name}",
                 f"sv_port {port}",
+                "sv_max_clients 128",
+                "sv_spectator_slots 1",
+                "sv_max_afk_time 0",
+                "sv_rcon_password rltraining",
             ]
 
             proc = subprocess.Popen(
@@ -184,7 +191,7 @@ def backup_existing_run(model_path: str, checkpoint_path: str, log_dir: str):
 
     # Create backup directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_dir = f"backups/run_{timestamp}"
+    backup_dir = f"backups/{timestamp}_run"
     os.makedirs(backup_dir, exist_ok=True)
 
     # Backup files
@@ -225,18 +232,20 @@ def main():
 
     # Server configuration
     parser.add_argument('--num-servers', type=int, default=4,
-                        help='Number of parallel servers (each with 63 bots)')
+                        help='Number of parallel servers (each with 127 bots)')
     parser.add_argument('--server-executable', type=str, default='./DDNet-Server',
                         help='Path to DDNet-Server executable')
     parser.add_argument('--base-port', type=int, default=8303,
                         help='Base port for servers')
     parser.add_argument('--map', type=str, default='Tutorial',
                         help='Map to load')
+    parser.add_argument('--frame-skip', type=int, default=4,
+                        help='Only act every N frames (reduces transition rate, decorrelates samples)')
 
     # Training configuration
     parser.add_argument('--lr', type=float, default=2.5e-4,
                         help='Learning rate')
-    parser.add_argument('--batch-size', type=int, default=2048,
+    parser.add_argument('--batch-size', type=int, default=8192,
                         help='Batch size for updates')
     parser.add_argument('--update-interval', type=float, default=0.1,
                         help='Seconds between reading transitions')
@@ -262,7 +271,7 @@ def main():
     args = parser.parse_args()
 
     # Calculate total bots
-    bots_per_server = 63
+    bots_per_server = 127
     total_bots = args.num_servers * bots_per_server
 
     print()
@@ -272,6 +281,7 @@ def main():
     print(f"  Servers:        {args.num_servers}")
     print(f"  Bots/server:    {bots_per_server}")
     print(f"  Total bots:     {total_bots}")
+    print(f"  Frame skip:     {args.frame_skip}")
     print(f"  Batch size:     {args.batch_size}")
     print(f"  Learning rate:  {args.lr}")
     print(f"  Export every:   {args.export_interval} updates")
@@ -301,7 +311,7 @@ def main():
         print("Checkpoint loaded.")
 
     # TensorBoard
-    run_name = f"{args.num_servers:02d}srv_{total_bots:04d}bots_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.num_servers:02d}srv_{total_bots:04d}bots"
     writer = SummaryWriter(os.path.join(args.log_dir, run_name))
     print(f"TensorBoard: {args.log_dir}/{run_name}")
     print()
@@ -314,6 +324,7 @@ def main():
             server_executable=args.server_executable,
             base_port=args.base_port,
             map_name=args.map,
+            frame_skip=args.frame_skip,
         )
         shm_names = server_manager.start()
     else:
@@ -374,7 +385,7 @@ def main():
     try:
         while running:
             # Read transitions from all servers
-            new_transitions = multi_reader.read_all_transitions(max_per_reader=2048)
+            new_transitions = multi_reader.read_all_transitions(max_per_reader=8192)
 
             for trans in new_transitions:
                 transition_buffer.append(trans)

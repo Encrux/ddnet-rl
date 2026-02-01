@@ -496,15 +496,20 @@ class PPOTrainer:
                 new_values = result['value']
                 entropy = result['entropy']
 
-                # Policy loss - using REINFORCE/A2C style (no importance sampling)
-                # This is more stable for async training where old_log_probs may be stale
+                # PPO clipped objective
                 mb_advantages = advantages[mb_indices]
+                mb_old_log_probs = old_log_probs[mb_indices]
 
                 # Normalize advantages per minibatch for stability
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Simple policy gradient: -log_prob * advantage
-                policy_loss = -(new_log_probs * mb_advantages).mean()
+                # Importance sampling ratio
+                ratio = (new_log_probs - mb_old_log_probs).exp()
+
+                # Clipped surrogate objective
+                surr1 = ratio * mb_advantages
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * mb_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
 
                 # Value loss (clipped)
                 value_loss = F.mse_loss(new_values, returns[mb_indices])
