@@ -301,7 +301,7 @@ def main():
         print("Checkpoint loaded.")
 
     # TensorBoard
-    run_name = f"{args.num_servers}srv_{total_bots}bots_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_name = f"{args.num_servers:02d}srv_{total_bots:04d}bots_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     writer = SummaryWriter(os.path.join(args.log_dir, run_name))
     print(f"TensorBoard: {args.log_dir}/{run_name}")
     print()

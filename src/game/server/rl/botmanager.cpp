@@ -319,7 +319,7 @@ int CRLBotManager::SpawnBot()
 
 	// Create bot name
 	char aBotName[32];
-	str_format(aBotName, sizeof(aBotName), "RL Bot %d", BotIndex);
+	str_format(aBotName, sizeof(aBotName), "RL Bot %02d", BotIndex);
 
 	// Create bot client using server's bot creation API
 	IServer *pServer = m_pGameServer->Server();
