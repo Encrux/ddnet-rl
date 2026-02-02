@@ -627,6 +627,9 @@ void CBotManager::ExtractTileGrid(CCharacter *pChar, uint8_t *pGrid)
 	const int HalfWidth = TILE_GRID_WIDTH / 2;   // 21 for 43-wide grid
 	const int HalfHeight = TILE_GRID_HEIGHT / 2; // 15 for 31-high grid
 
+	// Get teleport layer once outside the loop for efficiency
+	const CTeleTile *pTele = m_pCollision->TeleLayer();
+
 	for(int gy = 0; gy < TILE_GRID_HEIGHT; gy++)
 	{
 		for(int gx = 0; gx < TILE_GRID_WIDTH; gx++)
@@ -634,36 +637,27 @@ void CBotManager::ExtractTileGrid(CCharacter *pChar, uint8_t *pGrid)
 			int TileX = PlayerTileX + (gx - HalfWidth);
 			int TileY = PlayerTileY + (gy - HalfHeight);
 
-			uint8_t TileType = (uint8_t)ETileType::EMPTY;
+			uint8_t TileType = 0;  // TILE_AIR
 
 			if(TileX >= 0 && TileX < MapWidth && TileY >= 0 && TileY < MapHeight)
 			{
 				int MapIndex = TileY * MapWidth + TileX;
 				int TileIdx = m_pCollision->GetTileIndex(MapIndex);
 
-				switch(TileIdx)
+				// Check teleport layer - teleports are on a separate layer
+				// If a teleport exists, use its type instead of the underlying tile
+				if(pTele && pTele[MapIndex].m_Type != 0)
 				{
-				case TILE_AIR: TileType = (uint8_t)ETileType::EMPTY; break;
-				case TILE_SOLID: TileType = (uint8_t)ETileType::SOLID; break;
-				case TILE_DEATH: TileType = (uint8_t)ETileType::DEATH; break;
-				case TILE_NOHOOK: TileType = (uint8_t)ETileType::NOHOOK; break;
-				case TILE_FREEZE: TileType = (uint8_t)ETileType::FREEZE; break;
-				case TILE_UNFREEZE: TileType = (uint8_t)ETileType::UNFREEZE; break;
-				case TILE_START: TileType = (uint8_t)ETileType::SPAWN; break;
-				case TILE_FINISH: TileType = (uint8_t)ETileType::FINISH; break;
-				case TILE_CP:
-				case TILE_CP_F: TileType = (uint8_t)ETileType::CHECKPOINT; break;
-				default:
-					if(TileIdx >= TILE_TIME_CHECKPOINT_FIRST && TileIdx <= TILE_TIME_CHECKPOINT_LAST)
-						TileType = (uint8_t)ETileType::CHECKPOINT;
-					else if(TileIdx > 0)
-						TileType = (uint8_t)ETileType::OTHER;
-					break;
+					TileIdx = pTele[MapIndex].m_Type;
 				}
+
+				// Pass raw tile index (clamped to uint8 range)
+				// This preserves all tile types for learned embeddings
+				TileType = (TileIdx > 255) ? 255 : (uint8_t)TileIdx;
 			}
 			else
 			{
-				TileType = (uint8_t)ETileType::SOLID; // Out of bounds
+				TileType = 1;  // TILE_SOLID for out of bounds
 			}
 
 			pGrid[gy * TILE_GRID_WIDTH + gx] = TileType;

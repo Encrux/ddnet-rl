@@ -126,6 +126,7 @@ class ServerEnvConfig:
     startup_wait: float = 3.0
     action_timeout: float = 0.5  # Timeout waiting for observations (increased for debugging)
     use_dict_obs: bool = False   # Return dict observations for CNN policy
+    use_embeddings: bool = False # Return raw tile IDs for embedding lookup (requires use_dict_obs=True)
     map_name: str = "Tutorial"   # Map to load (use novice maps for training)
     sv_name: str = "RL Training" # Server name
     allow_spectators: bool = True  # Allow connecting to watch
@@ -134,6 +135,9 @@ class ServerEnvConfig:
     def __post_init__(self):
         if self.server_path is None:
             self.server_path = _get_default_server_path()
+        # use_embeddings implies use_dict_obs
+        if self.use_embeddings:
+            self.use_dict_obs = True
 
 
 # Numba-accelerated CNN observation parsing
@@ -646,6 +650,113 @@ class ServerShmClient:
 
         return {'tiles': tiles, 'player_state': player_state, 'checkpoint': checkpoint}, rewards, dones
 
+    def read_observations_batch_embed(self) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
+        """Read all observations for embedding-based policy.
+
+        Returns raw tile IDs (int64) for nn.Embedding lookup instead of normalized floats.
+        Uses pure numpy with strided views for maximum speed.
+
+        Returns:
+            observations: Dict with:
+                'tiles': np.ndarray(shape=(n, 31, 43), dtype=np.int64) - raw tile IDs 0-255
+                'player_state': np.ndarray(shape=(n, 15), dtype=np.float32)
+                'checkpoint': np.ndarray(shape=(n, 4), dtype=np.float32)
+            rewards: np.ndarray of shape (n,)
+            dones: np.ndarray of shape (n,)
+        """
+        from numpy.lib.stride_tricks import as_strided
+        import struct
+
+        n = self.num_bots
+
+        # Read ALL bot data at once
+        self.shm_mmap.seek(HEADER_SIZE)
+        raw = self.shm_mmap.read(n * BOT_DATA_SIZE)
+        raw_arr = np.frombuffer(raw, dtype=np.uint8)
+
+        # Offsets within SBotData (1448 bytes)
+        OBS_START = 32
+        LOCAL_PLAYER = OBS_START + 8  # 40
+        TILES = LOCAL_PLAYER + 36      # 76
+        EXTRA_STATE = TILES + 1333     # 1409
+        CHECKPOINT = EXTRA_STATE + 4   # 1413
+        REWARD_OFF = OBS_START + 1400  # 1432
+        DONE_OFF = REWARD_OFF + 4      # 1436
+
+        # Pre-allocate outputs
+        # Tiles as int64 for embedding lookup (no normalization)
+        tiles = np.empty((n, 31, 43), dtype=np.int64)
+        player_state = np.empty((n, 15), dtype=np.float32)
+        checkpoint = np.empty((n, 4), dtype=np.float32)
+        rewards = np.empty(n, dtype=np.float32)
+        dones = np.empty(n, dtype=np.bool_)
+
+        # ===== TILES: strided view, cast to int64 for embedding =====
+        tile_view = as_strided(raw_arr[TILES:], shape=(n, 31, 43), strides=(BOT_DATA_SIZE, 43, 1), writeable=False)
+        tiles[:] = tile_view.astype(np.int64)
+
+        # ===== REWARDS & DONES =====
+        for i in range(n):
+            base = i * BOT_DATA_SIZE
+            rewards[i] = struct.unpack_from('<f', raw, base + REWARD_OFF)[0]
+            dones[i] = struct.unpack_from('<i', raw, base + DONE_OFF)[0] != 0
+
+        # ===== PLAYER STATE =====
+        bot_offsets = np.arange(n) * BOT_DATA_SIZE
+
+        # Float fields via struct
+        pos_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER)[0] for o in bot_offsets], dtype=np.float32)
+        pos_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 4)[0] for o in bot_offsets], dtype=np.float32)
+        vel_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 8)[0] for o in bot_offsets], dtype=np.float32)
+        vel_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 12)[0] for o in bot_offsets], dtype=np.float32)
+
+        # Byte fields via strided view
+        def byte_col(offset):
+            return as_strided(raw_arr[offset:], shape=(n,), strides=(BOT_DATA_SIZE,), writeable=False)
+
+        direction = byte_col(LOCAL_PLAYER + 16).astype(np.int8).astype(np.float32)
+        jumped = byte_col(LOCAL_PLAYER + 17).astype(np.float32)
+        hook_state = byte_col(LOCAL_PLAYER + 18).astype(np.float32)
+        is_frozen = byte_col(LOCAL_PLAYER + 30).astype(np.float32)
+        health = byte_col(LOCAL_PLAYER + 32).astype(np.float32)
+        armor = byte_col(LOCAL_PLAYER + 33).astype(np.float32)
+        is_grounded = byte_col(EXTRA_STATE).astype(np.float32)
+        jumps_remaining = byte_col(EXTRA_STATE + 1).astype(np.float32)
+        can_hook = byte_col(EXTRA_STATE + 2).astype(np.float32)
+
+        player_state[:, 0] = vel_x / 50.0
+        player_state[:, 1] = vel_y / 50.0
+        player_state[:, 2] = is_grounded
+        player_state[:, 3] = jumps_remaining / 2.0
+        player_state[:, 4] = can_hook
+        player_state[:, 5] = direction
+        player_state[:, 6] = is_frozen
+        player_state[:, 7] = (hook_state == 0).astype(np.float32)
+        player_state[:, 8] = (hook_state == 1).astype(np.float32)
+        player_state[:, 9] = (hook_state == 2).astype(np.float32)
+        player_state[:, 10] = 0.0
+        player_state[:, 11] = 0.0
+        player_state[:, 12] = health / 10.0
+        player_state[:, 13] = armor / 10.0
+        player_state[:, 14] = jumped / 3.0
+
+        # ===== CHECKPOINT =====
+        cp_x = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT)[0] for o in bot_offsets], dtype=np.float32)
+        cp_y = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT + 4)[0] for o in bot_offsets], dtype=np.float32)
+        cp_idx = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 8)[0] for o in bot_offsets], dtype=np.float32)
+        total_cp = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 12)[0] for o in bot_offsets], dtype=np.float32)
+
+        checkpoint[:, 0] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
+        checkpoint[:, 1] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
+        checkpoint[:, 2] = cp_idx / np.maximum(1.0, total_cp)
+        checkpoint[:, 3] = total_cp / 20.0
+
+        # Sanitize NaN/inf
+        np.nan_to_num(player_state, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+        np.nan_to_num(checkpoint, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        return {'tiles': tiles, 'player_state': player_state, 'checkpoint': checkpoint}, rewards, dones
+
     def _parse_observations_cnn_python(self, raw: bytes, raw_arr: np.ndarray, n: int,
                                          tiles: np.ndarray, player_state: np.ndarray,
                                          checkpoint: np.ndarray, rewards: np.ndarray,
@@ -870,6 +981,7 @@ class TeeWorldsServerEnv:
         self.num_envs = self.num_bots  # Alias for compatibility
         self.config = config or ServerEnvConfig()
         self.use_dict_obs = self.config.use_dict_obs
+        self.use_embeddings = self.config.use_embeddings
 
         # Process management (list for multiple servers)
         self.server_procs: List[subprocess.Popen] = []
@@ -1166,8 +1278,23 @@ class TeeWorldsServerEnv:
         self.episode_rewards[:] = 0.0
 
         # Read observations from all servers
-        if self.use_dict_obs:
-            # CNN mode: return dict observations
+        if self.use_embeddings:
+            # Embedding mode: return raw tile IDs (int64) for nn.Embedding
+            all_tiles = []
+            all_player_state = []
+            all_checkpoint = []
+            for shm_client in self.shm_clients:
+                obs_dict, _, _ = shm_client.read_observations_batch_embed()
+                all_tiles.append(obs_dict['tiles'])
+                all_player_state.append(obs_dict['player_state'])
+                all_checkpoint.append(obs_dict['checkpoint'])
+            return {
+                'tiles': np.vstack(all_tiles),
+                'player_state': np.vstack(all_player_state),
+                'checkpoint': np.vstack(all_checkpoint),
+            }, {}
+        elif self.use_dict_obs:
+            # CNN mode: return dict observations (normalized tiles)
             all_tiles = []
             all_player_state = []
             all_checkpoint = []
@@ -1234,8 +1361,10 @@ class TeeWorldsServerEnv:
         if not shm_client.wait_for_observations(timeout=self.config.action_timeout):
             return server_idx, None, None, None, True, 0.0, 0.0  # timeout_occurred=True
         t_wait = time.perf_counter()
-        # Use CNN or fast path depending on config
-        if self.use_dict_obs:
+        # Use embedding, CNN, or fast path depending on config
+        if self.use_embeddings:
+            observations, rewards, dones = shm_client.read_observations_batch_embed()
+        elif self.use_dict_obs:
             observations, rewards, dones = shm_client.read_observations_batch_cnn()
         else:
             observations, rewards, dones = shm_client.read_observations_batch_fast()
@@ -1339,8 +1468,32 @@ class TeeWorldsServerEnv:
         all_rewards = []
         all_dones = []
 
-        if self.use_dict_obs:
-            # CNN mode: aggregate dict observations
+        if self.use_embeddings:
+            # Embedding mode: aggregate dict observations with int64 tiles
+            all_tiles = []
+            all_player_state = []
+            all_checkpoint = []
+            for obs, rew, done in results:
+                if obs is not None:
+                    all_tiles.append(obs['tiles'])
+                    all_player_state.append(obs['player_state'])
+                    all_checkpoint.append(obs['checkpoint'])
+                    all_rewards.append(rew)
+                    all_dones.append(done)
+                else:
+                    # Handle timeout case - append zeros
+                    all_tiles.append(np.zeros((self.num_bots_per_server, TILE_GRID_HEIGHT, TILE_GRID_WIDTH), dtype=np.int64))
+                    all_player_state.append(np.zeros((self.num_bots_per_server, 15), dtype=np.float32))
+                    all_checkpoint.append(np.zeros((self.num_bots_per_server, 4), dtype=np.float32))
+                    all_rewards.append(np.zeros(self.num_bots_per_server, dtype=np.float32))
+                    all_dones.append(np.zeros(self.num_bots_per_server, dtype=bool))
+            obs_out = {
+                'tiles': np.vstack(all_tiles),
+                'player_state': np.vstack(all_player_state),
+                'checkpoint': np.vstack(all_checkpoint),
+            }
+        elif self.use_dict_obs:
+            # CNN mode: aggregate dict observations (normalized float32 tiles)
             all_tiles = []
             all_player_state = []
             all_checkpoint = []
@@ -1454,7 +1607,15 @@ class TeeWorldsServerEnv:
 
             if shm_client.wait_for_observations(timeout=0.1):
                 # Read fresh observations for reset environments
-                if self.use_dict_obs:
+                if self.use_embeddings:
+                    fresh_obs, _, _ = shm_client.read_observations_batch_embed()
+                    # Update only masked environments
+                    for local_i in np.where(server_mask)[0]:
+                        global_i = start_idx + local_i
+                        observations['tiles'][global_i] = fresh_obs['tiles'][local_i]
+                        observations['player_state'][global_i] = fresh_obs['player_state'][local_i]
+                        observations['checkpoint'][global_i] = fresh_obs['checkpoint'][local_i]
+                elif self.use_dict_obs:
                     fresh_obs, _, _ = shm_client.read_observations_batch_cnn()
                     # Update only masked environments
                     for local_i in np.where(server_mask)[0]:

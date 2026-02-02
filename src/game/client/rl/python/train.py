@@ -123,6 +123,15 @@ def parse_args():
     parser.add_argument("--debug-timing", action="store_true",
                         help="Print step timing debug info")
 
+    # Embedding Policy (tile embeddings)
+    parser.add_argument("--use-embeddings", action="store_true",
+                        help="Use tile embeddings (raw tile IDs -> learned embeddings)")
+    parser.add_argument("--tile-embed-dim", type=int, default=8,
+                        help="Tile embedding dimension (default: 8)")
+    parser.add_argument("--tile-encoder", type=str, default="mlp",
+                        choices=["mlp", "cnn"],
+                        help="Encoder for embedded tiles: mlp or cnn (default: mlp)")
+
     # Curriculum learning
     parser.add_argument("--curriculum", type=str, default="none",
                         choices=["none", "map", "segment", "both"],
@@ -179,6 +188,7 @@ def main():
             frame_skip=args.frame_skip,
             max_episode_steps=args.max_episode_steps,
             use_dict_obs=args.use_cnn,  # Enable dict observations for CNN
+            use_embeddings=args.use_embeddings,  # Enable embedding observations
             map_name=args.map,
             debug_timing=args.debug_timing,
         )
@@ -226,6 +236,9 @@ def main():
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
             use_cnn=args.use_cnn,
+            use_embeddings=args.use_embeddings,
+            tile_embed_dim=args.tile_embed_dim,
+            tile_encoder=args.tile_encoder,
         )
 
         # Create agent
@@ -323,12 +336,29 @@ def main():
             update_time = time.time() - update_start
             agent.global_step = global_step
 
-            # Logging
-            if update % args.log_freq == 0:
-                elapsed = time.time() - start_time
-                fps = (global_step - starting_global_step) / elapsed
+            # Console logging (every update)
+            elapsed = time.time() - start_time
+            fps = (global_step - starting_global_step) / elapsed
 
-                # TensorBoard logging
+            if episode_rewards:
+                mean_reward = np.mean(episode_rewards[-100:])
+                mean_length = np.mean(episode_lengths[-100:])
+                print(f"Update {update:5d} | Step {global_step:9,d} | "
+                      f"FPS {fps:6.0f} | "
+                      f"Reward {mean_reward:7.2f} | "
+                      f"Length {mean_length:6.0f} | "
+                      f"PG {stats['policy_loss']:6.3f} | "
+                      f"Ent {stats['entropy']:.3f} | "
+                      f"R/U {rollout_time:.1f}/{update_time:.1f}s")
+            else:
+                print(f"Update {update:5d} | Step {global_step:9,d} | "
+                      f"FPS {fps:6.0f} | "
+                      f"PG {stats['policy_loss']:6.3f} | "
+                      f"Ent {stats['entropy']:.3f} | "
+                      f"R/U {rollout_time:.1f}/{update_time:.1f}s")
+
+            # TensorBoard logging (every log_freq updates)
+            if update % args.log_freq == 0:
                 writer.add_scalar("charts/learning_rate", lr, global_step)
                 writer.add_scalar("charts/fps", fps, global_step)
                 writer.add_scalar("losses/policy_loss", stats['policy_loss'], global_step)
@@ -338,24 +368,8 @@ def main():
                 writer.add_scalar("losses/clipfrac", stats['clipfrac'], global_step)
 
                 if episode_rewards:
-                    mean_reward = np.mean(episode_rewards[-100:])
-                    mean_length = np.mean(episode_lengths[-100:])
                     writer.add_scalar("charts/episodic_return", mean_reward, global_step)
                     writer.add_scalar("charts/episodic_length", mean_length, global_step)
-
-                    print(f"Update {update:5d} | Step {global_step:9,d} | "
-                          f"FPS {fps:6.0f} | "
-                          f"Reward {mean_reward:7.2f} | "
-                          f"Length {mean_length:6.0f} | "
-                          f"PG {stats['policy_loss']:6.3f} | "
-                          f"Ent {stats['entropy']:.3f} | "
-                          f"R/U {rollout_time:.1f}/{update_time:.1f}s")
-                else:
-                    print(f"Update {update:5d} | Step {global_step:9,d} | "
-                          f"FPS {fps:6.0f} | "
-                          f"PG {stats['policy_loss']:6.3f} | "
-                          f"Ent {stats['entropy']:.3f} | "
-                          f"R/U {rollout_time:.1f}/{update_time:.1f}s")
 
             # Save checkpoint
             if update % args.save_freq == 0:

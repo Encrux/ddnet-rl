@@ -52,6 +52,11 @@ class PPOConfig:
     checkpoint_dim: int = 4      # Checkpoint navigation features
     cnn_channels: Tuple[int, ...] = (32, 64, 64)  # CNN channel progression
 
+    # Embedding Feature Extractor (for raw tile IDs)
+    use_embeddings: bool = False     # Use tile embeddings instead of normalized values
+    tile_embed_dim: int = 8          # Embedding dimension per tile
+    tile_encoder: str = "mlp"        # "mlp" or "cnn" for processing embedded tiles
+
     # Mixed precision training (2-3x speedup on modern GPUs)
     use_amp: bool = True
 
@@ -156,6 +161,113 @@ class CNNFeatureExtractor(nn.Module):
         return self.combine(combined)
 
 
+class EmbeddingFeatureExtractor(nn.Module):
+    """
+    Feature extractor using learned tile embeddings.
+
+    Uses nn.Embedding(256, embed_dim) to convert raw tile IDs to dense vectors,
+    then processes with either MLP or CNN encoder.
+
+    Input:
+        tiles: (batch, H, W) - Raw tile IDs (int64, values 0-255)
+        player_state: (batch, player_state_dim) - Player features
+        checkpoint: (batch, checkpoint_dim) - Checkpoint navigation
+
+    Output:
+        features: (batch, output_dim) - Combined feature vector
+    """
+
+    def __init__(self, config: PPOConfig):
+        super().__init__()
+        self.config = config
+
+        h, w = config.tile_grid_height, config.tile_grid_width
+        embed_dim = config.tile_embed_dim
+        tile_encoder = config.tile_encoder
+
+        # Learned tile embeddings: 256 possible tile IDs -> embed_dim
+        self.tile_embedding = nn.Embedding(256, embed_dim)
+
+        if tile_encoder == "mlp":
+            # MLP: Flatten embedded tiles and project
+            # (batch, H, W, embed_dim) -> (batch, H*W*embed_dim) -> (batch, hidden_dim)
+            flat_size = h * w * embed_dim  # 31 * 43 * 8 = 10664
+            self.tile_encoder = nn.Sequential(
+                nn.Flatten(),
+                layer_init(nn.Linear(flat_size, config.hidden_dim)),
+                nn.ReLU(),
+            )
+            tile_out_dim = config.hidden_dim
+        else:  # cnn
+            # CNN: Process embedded tiles as channels
+            # (batch, H, W, embed_dim) -> permute -> (batch, embed_dim, H, W)
+            # Then apply conv layers
+            self.tile_encoder = nn.Sequential(
+                # Conv1: (embed_dim, 31, 43) -> (16, 16, 22)
+                layer_init(nn.Conv2d(embed_dim, 16, kernel_size=3, stride=2, padding=1)),
+                nn.ReLU(),
+                # Conv2: (16, 16, 22) -> (32, 8, 11)
+                layer_init(nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)),
+                nn.ReLU(),
+                # Conv3: (32, 8, 11) -> (64, 4, 6)
+                layer_init(nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            # Calculate CNN output size
+            def conv_out_size(size, kernel=3, stride=2, padding=1):
+                return (size + 2 * padding - kernel) // stride + 1
+            h1 = conv_out_size(h)  # 31 -> 16
+            w1 = conv_out_size(w)  # 43 -> 22
+            h2 = conv_out_size(h1) # 16 -> 8
+            w2 = conv_out_size(w1) # 22 -> 11
+            h3 = conv_out_size(h2) # 8 -> 4
+            w3 = conv_out_size(w2) # 11 -> 6
+            tile_out_dim = 64 * h3 * w3  # 64 * 4 * 6 = 1536
+
+        self.use_cnn_encoder = (tile_encoder == "cnn")
+
+        # Combine tile features with player_state(15) + checkpoint(4)
+        combined_input_size = tile_out_dim + config.player_state_dim + config.checkpoint_dim
+
+        self.combine = nn.Sequential(
+            layer_init(nn.Linear(combined_input_size, config.hidden_dim)),
+            nn.Tanh(),
+        )
+
+        self.output_dim = config.hidden_dim
+
+    def forward(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Forward pass through embeddings and combination layers.
+
+        Args:
+            obs: Dict with keys 'tiles' (int64), 'player_state', 'checkpoint'
+
+        Returns:
+            Combined feature tensor of shape (batch, hidden_dim)
+        """
+        tiles = obs['tiles']  # (batch, H, W) int64
+        player_state = obs['player_state']  # (batch, player_dim)
+        checkpoint = obs['checkpoint']  # (batch, cp_dim)
+
+        # Embed tiles: (batch, H, W) -> (batch, H, W, embed_dim)
+        tile_embeds = self.tile_embedding(tiles)
+
+        if self.use_cnn_encoder:
+            # Permute for CNN: (batch, H, W, embed_dim) -> (batch, embed_dim, H, W)
+            tile_embeds = tile_embeds.permute(0, 3, 1, 2)
+
+        # Process tiles through encoder
+        tile_features = self.tile_encoder(tile_embeds)
+
+        # Concatenate all features
+        combined = torch.cat([tile_features, player_state, checkpoint], dim=-1)
+
+        # Process through combination layers
+        return self.combine(combined)
+
+
 class FlatFeatureExtractor(nn.Module):
     """
     Simple MLP feature extractor for flat observation vectors.
@@ -185,7 +297,7 @@ class HybridActor(nn.Module):
     """
     Actor network for hybrid action space.
 
-    Supports both flat observations (MLP) and dict observations (CNN).
+    Supports flat observations (MLP), dict observations (CNN), and embeddings.
 
     Outputs:
         - Logits for each discrete action dimension
@@ -197,9 +309,13 @@ class HybridActor(nn.Module):
         super().__init__()
         self.config = config
         self.use_cnn = config.use_cnn
+        self.use_embeddings = config.use_embeddings
 
-        # Feature extractor (CNN or MLP)
-        if config.use_cnn:
+        # Feature extractor (Embedding, CNN, or MLP)
+        if config.use_embeddings:
+            self.feature_extractor = EmbeddingFeatureExtractor(config)
+            feature_dim = self.feature_extractor.output_dim
+        elif config.use_cnn:
             self.feature_extractor = CNNFeatureExtractor(config)
             feature_dim = self.feature_extractor.output_dim
         else:
@@ -306,15 +422,19 @@ class HybridActor(nn.Module):
 
 
 class Critic(nn.Module):
-    """Value function network. Supports both flat and CNN observations."""
+    """Value function network. Supports flat, CNN, and embedding observations."""
 
     def __init__(self, obs_dim: int, config: PPOConfig):
         super().__init__()
         self.config = config
         self.use_cnn = config.use_cnn
+        self.use_embeddings = config.use_embeddings
 
-        # Feature extractor (CNN or MLP)
-        if config.use_cnn:
+        # Feature extractor (Embedding, CNN, or MLP)
+        if config.use_embeddings:
+            self.feature_extractor = EmbeddingFeatureExtractor(config)
+            feature_dim = self.feature_extractor.output_dim
+        elif config.use_cnn:
             self.feature_extractor = CNNFeatureExtractor(config)
             feature_dim = self.feature_extractor.output_dim
         else:
@@ -349,6 +469,7 @@ class PPOAgent:
         self.obs_dim = obs_dim
         self.device = torch.device(device)
         self.use_cnn = self.config.use_cnn
+        self.use_embeddings = self.config.use_embeddings
 
         # Create networks
         self.actor = HybridActor(obs_dim, self.config).to(self.device)
@@ -391,8 +512,19 @@ class PPOAgent:
         ns, ne = self.num_steps, self.num_envs
         cfg = self.config
 
-        if self.use_cnn:
-            # Dict observation storage
+        if self.use_embeddings:
+            # Embedding observation storage (tiles as int64 for nn.Embedding)
+            self.obs_tiles = torch.zeros(
+                (ns, ne, cfg.tile_grid_height, cfg.tile_grid_width), dtype=torch.long, device=self.device
+            )
+            self.obs_player_state = torch.zeros(
+                (ns, ne, cfg.player_state_dim), device=self.device
+            )
+            self.obs_checkpoint = torch.zeros(
+                (ns, ne, cfg.checkpoint_dim), device=self.device
+            )
+        elif self.use_cnn:
+            # Dict observation storage (tiles as float32)
             self.obs_tiles = torch.zeros(
                 (ns, ne, 1, cfg.tile_grid_height, cfg.tile_grid_width), device=self.device
             )
@@ -421,11 +553,20 @@ class PPOAgent:
         """Convert numpy observation to tensor(s)."""
         # Auto-detect observation type (dict vs flat array)
         if isinstance(obs, dict):
-            return {
-                'tiles': torch.from_numpy(obs['tiles']).float().to(self.device),
-                'player_state': torch.from_numpy(obs['player_state']).float().to(self.device),
-                'checkpoint': torch.from_numpy(obs['checkpoint']).float().to(self.device),
-            }
+            if self.use_embeddings:
+                # Embedding mode: tiles stay as int64/long for nn.Embedding
+                return {
+                    'tiles': torch.from_numpy(obs['tiles']).long().to(self.device),
+                    'player_state': torch.from_numpy(obs['player_state']).float().to(self.device),
+                    'checkpoint': torch.from_numpy(obs['checkpoint']).float().to(self.device),
+                }
+            else:
+                # CNN mode: tiles are float32
+                return {
+                    'tiles': torch.from_numpy(obs['tiles']).float().to(self.device),
+                    'player_state': torch.from_numpy(obs['player_state']).float().to(self.device),
+                    'checkpoint': torch.from_numpy(obs['checkpoint']).float().to(self.device),
+                }
         else:
             return torch.from_numpy(obs).float().to(self.device)
 
@@ -483,7 +624,12 @@ class PPOAgent:
         value: np.ndarray
     ):
         """Store a transition in the rollout buffer."""
-        if self.use_cnn:
+        if self.use_embeddings:
+            # Embedding mode: tiles as long for nn.Embedding
+            self.obs_tiles[step] = torch.from_numpy(obs['tiles']).long().to(self.device)
+            self.obs_player_state[step] = torch.from_numpy(obs['player_state']).to(self.device)
+            self.obs_checkpoint[step] = torch.from_numpy(obs['checkpoint']).to(self.device)
+        elif self.use_cnn:
             self.obs_tiles[step] = torch.from_numpy(obs['tiles']).to(self.device)
             self.obs_player_state[step] = torch.from_numpy(obs['player_state']).to(self.device)
             self.obs_checkpoint[step] = torch.from_numpy(obs['checkpoint']).to(self.device)
@@ -551,7 +697,12 @@ class PPOAgent:
         batch_size = self.num_steps * self.num_envs
         cfg = self.config
 
-        if self.use_cnn:
+        if self.use_embeddings:
+            # Embedding mode: tiles as (batch, H, W) long tensor
+            b_tiles = self.obs_tiles.reshape(-1, cfg.tile_grid_height, cfg.tile_grid_width)
+            b_player_state = self.obs_player_state.reshape(-1, cfg.player_state_dim)
+            b_checkpoint = self.obs_checkpoint.reshape(-1, cfg.checkpoint_dim)
+        elif self.use_cnn:
             b_tiles = self.obs_tiles.reshape(-1, 1, cfg.tile_grid_height, cfg.tile_grid_width)
             b_player_state = self.obs_player_state.reshape(-1, cfg.player_state_dim)
             b_checkpoint = self.obs_checkpoint.reshape(-1, cfg.checkpoint_dim)
@@ -586,7 +737,7 @@ class PPOAgent:
                 mb_indices = indices[start:end]
 
                 # Get minibatch observation
-                if self.use_cnn:
+                if self.use_embeddings or self.use_cnn:
                     mb_obs = {
                         'tiles': b_tiles[mb_indices],
                         'player_state': b_player_state[mb_indices],
