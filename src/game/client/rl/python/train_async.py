@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Asynchronous PPO training for DDNet RL.
+Asynchronous V-trace training for DDNet RL.
 
 This script reads transitions from shared memory written by the C++ server,
-runs PPO updates, and exports updated ONNX models for hot reload.
+runs V-trace updates with off-policy correction, and exports updated ONNX
+models for hot reload.
 
 Architecture:
 - C++ server runs inference locally using ONNX Runtime
 - C++ server writes transitions to shared memory ring buffer
-- This script reads transitions periodically and runs PPO updates
+- This script reads transitions periodically and runs V-trace updates
+- V-trace handles policy lag by using importance sampling with truncation
 - Updated model is exported to ONNX and signaled for hot reload
 """
 
@@ -31,28 +33,22 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, Normal
 
 # Constants matching C++ rl_protocol.h
-MAX_PLAYERS = 16
-MAX_PROJECTILES = 64
-MAX_PICKUPS = 32
 TILE_GRID_WIDTH = 29
 TILE_GRID_HEIGHT = 21
 TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT
 
-# Observation size calculation
-OBS_GAME_STATE = 4  # tick, time_left, num_players, num_projectiles
-OBS_PLAYER = 16
-OBS_OTHER_PLAYERS = (MAX_PLAYERS - 1) * OBS_PLAYER
-OBS_PROJECTILES = MAX_PROJECTILES * 8
-OBS_PICKUPS = MAX_PICKUPS * 4
-OBS_TILES = TILE_GRID_SIZE
+# Observation size calculation (simplified)
+OBS_PLAYER = 16      # local player state
+OBS_TILES = TILE_GRID_SIZE  # 29x21 = 609 tile IDs
 
-OBSERVATION_SIZE = (
-    OBS_GAME_STATE + OBS_PLAYER + OBS_OTHER_PLAYERS +
-    OBS_PROJECTILES + OBS_PICKUPS + OBS_TILES
-)
+OBSERVATION_SIZE = OBS_PLAYER + OBS_TILES  # = 625
 
 # Network output size
 NETWORK_OUTPUT_SIZE = 14  # 3 + 1 + 1 + 1 + 3 + 2 + 2 + 1
+
+# Tile embedding configuration
+NUM_TILE_TYPES = 256  # Tile IDs are 0-255
+TILE_EMBEDDING_DIM = 16
 
 
 @dataclass
@@ -81,20 +77,8 @@ class SharedMemoryReader:
         self.shm_name = shm_name
         self.shm_fd = None
         self.mmap_obj = None
-        self.header_size = self._calculate_header_size()
-        self.transition_size = self._calculate_transition_size()
-
-    def _calculate_header_size(self) -> int:
-        """Calculate size of STrainingSharedMemory header."""
-        # Calculated from actual shared memory: size - capacity * transition_size = 768
-        return 768
-
-    def _calculate_transition_size(self) -> int:
-        """Calculate size of STransition."""
-        # Read from shared memory at runtime instead of calculating
-        # This ensures we match the C++ struct exactly
-        # Default value based on C++ sizeof(STransition) = 6104
-        return 6104
+        self.header_size = 768  # STrainingSharedMemory header size
+        self.transition_size = 0  # Will be read from header
 
     def open(self) -> bool:
         """Open the shared memory region."""
@@ -103,7 +87,6 @@ class SharedMemoryReader:
             import posix_ipc
             self.shm = posix_ipc.SharedMemory(self.shm_name)
             self.mmap_obj = mmap.mmap(self.shm.fd, 0)
-            return True
         except ImportError:
             # Fallback: try to open via /dev/shm
             shm_path = f"/dev/shm{self.shm_name}"
@@ -111,11 +94,43 @@ class SharedMemoryReader:
                 self.shm_fd = os.open(shm_path, os.O_RDWR)
                 size = os.fstat(self.shm_fd).st_size
                 self.mmap_obj = mmap.mmap(self.shm_fd, size)
-                return True
-            return False
+            else:
+                return False
         except Exception as e:
             print(f"Failed to open shared memory: {e}")
             return False
+
+        # Read transition size from header (offset 204)
+        if self.mmap_obj:
+            # Read capacity and transition size
+            self.mmap_obj.seek(200)
+            capacity = struct.unpack('I', self.mmap_obj.read(4))[0]
+            self.transition_size = struct.unpack('I', self.mmap_obj.read(4))[0]
+
+            # Calculate expected transition size based on current OBSERVATION_SIZE
+            # Observation + Action(5 ints + 2 floats) + LogProbs(6 floats) + Value + Reward + flags + BotId
+            expected_obs_bytes = OBSERVATION_SIZE * 4
+            expected_trans_size = expected_obs_bytes + 28 + 24 + 4 + 4 + 4 + 4  # = OBSERVATION_SIZE*4 + 68
+
+            print(f"Shared memory opened:")
+            print(f"  capacity={capacity}")
+            print(f"  transition_size={self.transition_size} bytes")
+            print(f"  expected ~{expected_trans_size} bytes (obs={OBSERVATION_SIZE} floats = {expected_obs_bytes} bytes)")
+
+            if self.transition_size != expected_trans_size and abs(self.transition_size - expected_trans_size) > 16:
+                print(f"  WARNING: Size mismatch! Server may be using different observation size.")
+                print(f"  If server was just restarted, this may indicate a build mismatch.")
+
+            # Flush stale transitions by setting read index = write index
+            self.mmap_obj.seek(0)
+            write_idx = struct.unpack('Q', self.mmap_obj.read(8))[0]
+            self.mmap_obj.seek(64)
+            self.mmap_obj.write(struct.pack('Q', write_idx))
+            self.mmap_obj.flush()
+            print(f"  Flushed buffer (set read_idx = write_idx = {write_idx})")
+
+            return True
+        return False
 
     def close(self):
         """Close the shared memory region."""
@@ -200,6 +215,12 @@ class SharedMemoryReader:
         aim_x, aim_y = struct.unpack_from('ff', data, offset)
         offset += 8
 
+        # Sanity check aim values - clamp to reasonable range
+        if not (-100.0 <= aim_x <= 100.0) or np.isnan(aim_x) or np.isinf(aim_x):
+            aim_x = 0.0
+        if not (-100.0 <= aim_y <= 100.0) or np.isnan(aim_y) or np.isinf(aim_y):
+            aim_y = 0.0
+
         # Log probs (6 floats, we just use the first one as total)
         log_probs = struct.unpack_from('ffffff', data, offset)
         log_prob = log_probs[0]
@@ -259,18 +280,39 @@ class SharedMemoryReader:
 
 
 class PolicyNetwork(nn.Module):
-    """Actor-Critic network for hybrid action space."""
+    """Actor-Critic network with tile embeddings for hybrid action space."""
 
-    def __init__(self, obs_size: int = OBSERVATION_SIZE, hidden_size: int = 256):
+    def __init__(self, hidden_size: int = 256):
         super().__init__()
 
-        # Shared feature extractor
+        # Tile embedding layer: maps tile IDs (0-255) to learned embeddings
+        self.tile_embedding = nn.Embedding(NUM_TILE_TYPES, TILE_EMBEDDING_DIM)
+
+        # Input size after embedding tiles
+        # Player: 16, Tiles: 609 * TILE_EMBEDDING_DIM
+        tile_features_size = TILE_GRID_SIZE * TILE_EMBEDDING_DIM
+        total_input_size = OBS_PLAYER + tile_features_size
+
+        # Running observation normalization for non-tile features (player state only)
+        self.register_buffer('obs_mean', torch.zeros(OBS_PLAYER))
+        self.register_buffer('obs_var', torch.ones(OBS_PLAYER))
+        self.register_buffer('obs_count', torch.tensor(1e-4))
+
+        # Shared feature extractor with LayerNorm for stability
         self.shared = nn.Sequential(
-            nn.Linear(obs_size, hidden_size),
+            nn.Linear(total_input_size, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.ReLU(),
         )
+
+        # Initialize weights with orthogonal initialization for stability
+        for module in self.shared:
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                nn.init.zeros_(module.bias)
 
         # Actor heads
         self.direction_head = nn.Linear(hidden_size, 3)  # left, none, right
@@ -284,9 +326,56 @@ class PolicyNetwork(nn.Module):
         # Critic head
         self.value_head = nn.Linear(hidden_size, 1)
 
+        # Initialize actor heads with small weights for stable initial policy
+        for head in [self.direction_head, self.jump_head, self.hook_head,
+                     self.fire_head, self.weapon_head, self.aim_mean, self.aim_log_std]:
+            nn.init.orthogonal_(head.weight, gain=0.01)
+            nn.init.zeros_(head.bias)
+
+        # Initialize value head with standard gain
+        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+        nn.init.zeros_(self.value_head.bias)
+
+    def _process_observation(self, x: torch.Tensor, update_stats: bool = False) -> torch.Tensor:
+        """Process raw observation into features with tile embeddings.
+
+        Input x has shape [batch, 625]:
+          - x[:, :16] = player state (16 floats, pre-normalized by C++ to ~[-1,1])
+          - x[:, 16:] = tile IDs (609 floats, to be cast to int for embedding)
+
+        Note: We don't apply running normalization here because:
+        1. C++ already pre-normalizes observations to roughly [-1, 1]
+        2. The network has LayerNorm which handles varying input scales
+        3. Running stats would cause mismatch between ONNX inference and Python training
+        """
+        # Handle NaN/inf in entire observation first
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Split observation into components
+        player_state = x[:, :OBS_PLAYER]  # [batch, 16]
+        tile_ids_float = x[:, OBS_PLAYER:]  # [batch, 609]
+
+        # Just clamp to handle any outliers from C++ normalization
+        non_tile_features = player_state.clamp(-10.0, 10.0)
+
+        # Cast tile IDs to long for embedding lookup
+        tile_ids = tile_ids_float.clamp(0, NUM_TILE_TYPES - 1).long()
+
+        # Embed tiles: [batch, 609] -> [batch, 609, 16]
+        tile_features = self.tile_embedding(tile_ids)
+
+        # Flatten tile features: [batch, 609, 16] -> [batch, 609 * 16]
+        tile_flat = tile_features.flatten(start_dim=1)
+
+        # Combine all features
+        combined = torch.cat([non_tile_features, tile_flat], dim=1)
+
+        return combined
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass returning flattened output for ONNX."""
-        features = self.shared(x)
+        combined = self._process_observation(x)
+        features = self.shared(combined)
 
         # All outputs concatenated
         direction_logits = self.direction_head(features)  # 3
@@ -295,7 +384,7 @@ class PolicyNetwork(nn.Module):
         fire_logit = self.fire_head(features)  # 1
         weapon_logits = self.weapon_head(features)  # 3
         aim_mean = self.aim_mean(features)  # 2
-        aim_log_std = self.aim_log_std(features)  # 2
+        aim_log_std = self.aim_log_std(features).clamp(-2, 2)  # 2, clamped to match get_action_and_value
         value = self.value_head(features)  # 1
 
         return torch.cat([
@@ -305,7 +394,8 @@ class PolicyNetwork(nn.Module):
 
     def get_action_and_value(self, x: torch.Tensor, deterministic: bool = False):
         """Get action, log_prob, entropy, and value."""
-        features = self.shared(x)
+        combined = self._process_observation(x)
+        features = self.shared(combined)
 
         # Direction
         direction_logits = self.direction_head(features)
@@ -391,7 +481,13 @@ class PolicyNetwork(nn.Module):
                          fires: torch.Tensor, weapons: torch.Tensor,
                          aims: torch.Tensor) -> dict:
         """Evaluate log probs and entropy for given actions (for PPO update)."""
-        features = self.shared(x)
+        # Don't update stats here - must match the normalization used in ONNX during inference
+        combined = self._process_observation(x, update_stats=False)
+        features = self.shared(combined)
+
+        # Check for NaN in features and skip if found
+        if torch.isnan(features).any():
+            raise ValueError("NaN detected in network features")
 
         # Direction
         direction_logits = self.direction_head(features)
@@ -445,29 +541,48 @@ class PolicyNetwork(nn.Module):
         }
 
 
-class PPOTrainer:
-    """PPO trainer for async training."""
+class VTraceTrainer:
+    """V-trace trainer for async training with off-policy correction.
+
+    Based on IMPALA: https://arxiv.org/abs/1802.01561
+
+    V-trace handles the policy lag between C++ ONNX inference and Python training
+    by using importance sampling with truncation to correct for off-policy data.
+    """
 
     def __init__(
         self,
         model: PolicyNetwork,
         lr: float = 3e-4,
         gamma: float = 0.99,
-        gae_lambda: float = 0.95,
-        clip_epsilon: float = 0.2,
-        value_coef: float = 0.5,
-        entropy_coef: float = 0.01,
+        rho_bar: float = 0.5,      # Truncation for importance weights (lower = more stable)
+        c_bar: float = 0.5,        # Truncation for trace coefficients (lower = more stable)
+        clip_epsilon: float = 0.1, # PPO-style clipping for trust region (tighter)
+        target_kl: float = 0.015,  # KL divergence threshold for early stopping
+        value_coef: float = 0.5,   # Standard value coefficient
+        entropy_coef: float = 0.01,    # Coefficient for entropy targeting
+        target_entropy: float = 5.0,   # Target entropy - pulls policy toward this value
         max_grad_norm: float = 0.5,
-        update_epochs: int = 4,
-        minibatch_size: int = 64,
+        update_epochs: int = 1,    # V-trace typically uses fewer epochs (often just 1)
+        minibatch_size: int = 256, # Larger minibatches work better with V-trace
     ):
         self.model = model
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        # Use same decay for both moments + weight decay to prevent sudden large updates
+        # Research: https://openreview.net/forum?id=m9Jfdz4ymO
+        self.optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=lr,
+            betas=(0.9, 0.9),      # Same decay prevents policy collapse
+            weight_decay=1e-4,     # L2 regularization for stability
+        )
         self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.clip_epsilon = clip_epsilon
+        self.rho_bar = rho_bar      # ρ̄ - truncation for policy gradient
+        self.c_bar = c_bar          # c̄ - truncation for trace coefficient
+        self.clip_epsilon = clip_epsilon  # PPO-style clipping
+        self.target_kl = target_kl  # KL threshold for early stopping
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
+        self.target_entropy = target_entropy
         self.max_grad_norm = max_grad_norm
         self.update_epochs = update_epochs
         self.minibatch_size = minibatch_size
@@ -475,40 +590,85 @@ class PPOTrainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
 
-    def compute_gae(
+    def compute_vtrace(
         self,
         rewards: torch.Tensor,
         values: torch.Tensor,
         dones: torch.Tensor,
-        next_value: float,
+        log_rhos: torch.Tensor,  # log(π_new / π_old) = new_log_prob - old_log_prob
+        bootstrap_value: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute GAE advantages and returns."""
-        advantages = torch.zeros_like(rewards)
-        last_gae = 0
+        """Compute V-trace targets and advantages.
 
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                next_val = next_value
-            else:
-                next_val = values[t + 1]
+        V-trace corrects for off-policy data by using truncated importance sampling.
+        This allows learning from data collected by older policy versions.
 
-            delta = rewards[t] + self.gamma * next_val * (1 - dones[t]) - values[t]
-            advantages[t] = last_gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * last_gae
+        Args:
+            rewards: Tensor of rewards [T]
+            values: Value estimates V(x_t) from current policy [T]
+            dones: Episode termination flags [T]
+            log_rhos: Log importance ratios log(π/μ) [T]
+            bootstrap_value: V(x_T) for bootstrapping
 
-        returns = advantages + values
-        return advantages, returns
+        Returns:
+            vtrace_targets: V-trace value targets [T]
+            advantages: Policy gradient advantages [T]
+        """
+        T = len(rewards)
+
+        # Compute importance ratios and clip them
+        rhos = torch.exp(log_rhos.clamp(-20.0, 20.0))  # π(a|s) / μ(a|s)
+        clipped_rhos = torch.clamp(rhos, max=self.rho_bar)  # ρ̄_t = min(ρ̄, ρ_t)
+        cs = torch.clamp(rhos, max=self.c_bar)  # c_t = min(c̄, ρ_t)
+
+        # Compute TD errors: δ_t = ρ̄_t * (r_t + γ * V(x_{t+1}) - V(x_t))
+        # Note: we use clipped_rhos for the TD error
+        values_t_plus_1 = torch.cat([values[1:], torch.tensor([bootstrap_value], device=values.device)])
+        not_done = 1.0 - dones
+        deltas = clipped_rhos * (rewards + self.gamma * values_t_plus_1 * not_done - values)
+
+        # Compute V-trace targets iterating backwards
+        # v_s = V(x_s) + Σ_{t=s}^{T-1} γ^{t-s} (Π_{i=s}^{t-1} c_i) * δ_t
+        vtrace_targets = torch.zeros_like(rewards)
+        vtrace_minus_v = torch.zeros_like(rewards)  # v_s - V(x_s)
+
+        last_vtrace_minus_v = 0.0
+        for t in reversed(range(T)):
+            # v_{t+1} - V(x_{t+1}) term, propagated with discount and trace coef
+            vtrace_minus_v[t] = deltas[t] + self.gamma * not_done[t] * cs[t] * last_vtrace_minus_v
+            last_vtrace_minus_v = vtrace_minus_v[t]
+
+        vtrace_targets = vtrace_minus_v + values
+
+        # Policy gradient advantages: ρ̄_t * (r_t + γ * v_{t+1} - V(x_t))
+        # where v_{t+1} is the V-trace target (not the value estimate)
+        vtrace_t_plus_1 = torch.cat([vtrace_targets[1:], torch.tensor([bootstrap_value], device=values.device)])
+        advantages = clipped_rhos * (rewards + self.gamma * vtrace_t_plus_1 * not_done - values)
+
+        return vtrace_targets, advantages
 
     def update(self, transitions: list) -> dict:
-        """Run PPO update on a batch of transitions."""
+        """Run V-trace update on a batch of transitions.
+
+        Unlike PPO, V-trace properly handles off-policy data by using importance
+        sampling with truncation. This is essential for async training where
+        the C++ inference uses an older policy version.
+        """
         if len(transitions) < self.minibatch_size:
-            return {'loss': 0, 'policy_loss': 0, 'value_loss': 0, 'entropy': 0}
+            return {'loss': 0, 'policy_loss': 0, 'value_loss': 0, 'entropy': 0, 'avg_rho': 0, 'clip_frac': 0}
 
         # Convert transitions to tensors
         obs = torch.tensor(np.array([t.observation for t in transitions]), dtype=torch.float32, device=self.device)
         old_log_probs = torch.tensor([t.log_prob for t in transitions], dtype=torch.float32, device=self.device)
-        old_values = torch.tensor([t.value for t in transitions], dtype=torch.float32, device=self.device)
         rewards = torch.tensor([t.reward for t in transitions], dtype=torch.float32, device=self.device)
         dones = torch.tensor([t.done or t.truncated for t in transitions], dtype=torch.float32, device=self.device)
+
+        # Validate inputs - replace NaN/inf with safe values
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+        old_log_probs = torch.nan_to_num(old_log_probs, nan=-10.0, posinf=-1.0, neginf=-100.0)
+        old_log_probs = old_log_probs.clamp(-100.0, 0.0)  # Log probs should be <= 0
+        rewards = torch.nan_to_num(rewards, nan=0.0, posinf=100.0, neginf=-100.0)
+        rewards = rewards.clamp(-100.0, 100.0)  # Clamp extreme rewards
 
         # Actions
         directions = torch.tensor([t.action_direction + 1 for t in transitions], dtype=torch.long, device=self.device)
@@ -518,92 +678,154 @@ class PPOTrainer:
         weapons = torch.tensor([t.action_weapon + 1 for t in transitions], dtype=torch.long, device=self.device)
         aims = torch.tensor([[t.action_aim_x, t.action_aim_y] for t in transitions], dtype=torch.float32, device=self.device)
 
-        # Compute GAE
+        # First pass: compute new log probs and values for all transitions
+        # This is needed to compute V-trace targets
         with torch.no_grad():
-            # Get value of last observation for bootstrapping
+            all_result = self.model.evaluate_actions(
+                obs, directions, jumps.float(), hooks.float(), fires.float(), weapons, aims
+            )
+            new_log_probs_all = all_result['log_prob']
+            values_all = all_result['value']
+
+            # Bootstrap value for last transition
             last_output = self.model(obs[-1:])
-            next_value = last_output[0, -1].item()
+            bootstrap_value = last_output[0, -1].item()
 
-        advantages, returns = self.compute_gae(rewards, old_values, dones, next_value)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            # Compute log importance ratios: log(π_new / π_old)
+            log_rhos = new_log_probs_all - old_log_probs
 
-        # PPO update
+            # Compute V-trace targets and advantages
+            vtrace_targets, advantages = self.compute_vtrace(
+                rewards, values_all, dones, log_rhos, bootstrap_value
+            )
+
+            # Clip V-trace targets to be within reasonable range of current values
+            # This prevents the value function from chasing extreme targets
+            vtrace_targets = torch.clamp(
+                vtrace_targets,
+                values_all - 10.0,  # Don't decrease by more than 10
+                values_all + 10.0   # Don't increase by more than 10
+            )
+
+            # Clip advantages to prevent extreme policy updates (tighter than before)
+            advantages = torch.clamp(advantages, -5.0, 5.0)
+
+            # Track average importance ratio for monitoring
+            avg_rho = torch.exp(log_rhos.clamp(-20, 20)).mean().item()
+
+        # V-trace update with PPO clipping for extra stability
         total_loss = 0
         total_policy_loss = 0
         total_value_loss = 0
         total_entropy = 0
+        total_clip_frac = 0
+        total_approx_kl = 0
         num_updates = 0
+        early_stop = False
 
-        for _ in range(self.update_epochs):
+        for epoch in range(self.update_epochs):
+            if early_stop:
+                break
+
             # Shuffle
             indices = torch.randperm(len(transitions))
 
             for start in range(0, len(transitions), self.minibatch_size):
+                if early_stop:
+                    break
+
                 end = start + self.minibatch_size
                 if end > len(transitions):
                     break
 
                 mb_indices = indices[start:end]
 
-                # Evaluate log probs for the actions that were actually taken
-                result = self.model.evaluate_actions(
-                    obs[mb_indices],
-                    directions[mb_indices],
-                    jumps[mb_indices].float(),
-                    hooks[mb_indices].float(),
-                    fires[mb_indices].float(),
-                    weapons[mb_indices],
-                    aims[mb_indices]
-                )
+                try:
+                    # Evaluate log probs for the actions that were actually taken
+                    result = self.model.evaluate_actions(
+                        obs[mb_indices],
+                        directions[mb_indices],
+                        jumps[mb_indices].float(),
+                        hooks[mb_indices].float(),
+                        fires[mb_indices].float(),
+                        weapons[mb_indices],
+                        aims[mb_indices]
+                    )
+                except ValueError as e:
+                    print(f"  Warning: {e}, skipping minibatch")
+                    continue
+
                 new_log_probs = result['log_prob']
                 new_values = result['value']
                 entropy = result['entropy']
 
-                # PPO clipped objective
-                mb_advantages = advantages[mb_indices]
+                # Get old log probs for this minibatch (from the behavior policy)
                 mb_old_log_probs = old_log_probs[mb_indices]
 
-                # Normalize advantages per minibatch for stability
+                # V-trace advantages (already importance-weighted via clipped_rhos)
+                mb_advantages = advantages[mb_indices]
+
+                # Normalize advantages within minibatch for stability
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Importance sampling ratio
-                ratio = (new_log_probs - mb_old_log_probs).exp()
+                # Compute importance ratio for PPO clipping
+                log_ratio = new_log_probs - mb_old_log_probs
+                ratio = torch.exp(log_ratio.clamp(-20, 20))
 
-                # Clipped surrogate objective
+                # PPO-style clipped objective on top of V-trace
+                # V-trace corrects the training objective, PPO clipping guards against destructive updates
+                # Research: Sample Factory found this combination works well
                 surr1 = ratio * mb_advantages
-                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * mb_advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * mb_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss with clipping (PPO-style)
-                mb_returns = returns[mb_indices]
-                mb_old_values = old_values[mb_indices]
-                value_pred_clipped = mb_old_values + torch.clamp(
-                    new_values - mb_old_values, -self.clip_epsilon, self.clip_epsilon
-                )
-                value_loss_unclipped = (new_values - mb_returns) ** 2
-                value_loss_clipped = (value_pred_clipped - mb_returns) ** 2
-                value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+                # Track metrics
+                with torch.no_grad():
+                    clip_frac = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
+                    # Approximate KL divergence for early stopping
+                    approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                    total_approx_kl += approx_kl
 
-                # Entropy bonus
-                entropy_loss = -entropy.mean()
+                # KL early stopping - prevent destructive updates
+                if approx_kl > 1.5 * self.target_kl:
+                    early_stop = True
+                    break
+
+                # Value loss: MSE to V-trace targets (also clipped for stability)
+                mb_vtrace_targets = vtrace_targets[mb_indices]
+                value_loss = 0.5 * ((new_values - mb_vtrace_targets.clamp(-100, 100)) ** 2).mean()
+
+                # Entropy targeting - pull toward target, penalize deviation in either direction
+                entropy_loss = (entropy.mean() - self.target_entropy) ** 2
 
                 # Total loss
                 loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
 
-                # Skip if loss is NaN or infinite
-                if torch.isnan(loss) or torch.isinf(loss):
+                # Skip if loss is NaN, infinite, or too extreme (prevents catastrophic updates)
+                if torch.isnan(loss) or torch.isinf(loss) or abs(loss.item()) > 5.0:
+                    if abs(loss.item()) > 5.0:
+                        print(f"  Warning: Extreme loss {loss.item():.2f}, skipping minibatch")
+                    else:
+                        print(f"  Warning: NaN/inf loss detected, skipping minibatch")
                     continue
 
                 # Update
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                # Check for NaN gradients before stepping
+                grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print(f"  Warning: NaN/inf gradient norm, skipping update")
+                    continue
+
                 self.optimizer.step()
 
                 total_loss += loss.item()
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
                 total_entropy += entropy.mean().item()
+                total_clip_frac += clip_frac
                 num_updates += 1
 
         return {
@@ -611,6 +833,10 @@ class PPOTrainer:
             'policy_loss': total_policy_loss / max(num_updates, 1),
             'value_loss': total_value_loss / max(num_updates, 1),
             'entropy': total_entropy / max(num_updates, 1),
+            'avg_rho': avg_rho,  # Monitor importance ratio - should be close to 1.0
+            'clip_frac': total_clip_frac / max(num_updates, 1),  # Fraction of ratios clipped
+            'approx_kl': total_approx_kl / max(num_updates, 1),  # KL divergence for monitoring
+            'early_stop': early_stop,  # Whether training stopped early due to KL
         }
 
     def export_onnx(self, path: str):
@@ -671,7 +897,7 @@ def main():
 
     # Initialize model and trainer
     model = PolicyNetwork()
-    trainer = PPOTrainer(model, lr=args.lr, minibatch_size=64)
+    trainer = VTraceTrainer(model, lr=args.lr, minibatch_size=64)
 
     if args.resume and os.path.exists(args.checkpoint_path):
         print(f"Resuming from {args.checkpoint_path}")
@@ -740,6 +966,7 @@ def main():
                   f"policy={stats['policy_loss']:.4f} "
                   f"value={stats['value_loss']:.4f} "
                   f"entropy={stats['entropy']:.4f} "
+                  f"rho={stats['avg_rho']:.3f} "
                   f"transitions={total_transitions}")
 
             # Export ONNX periodically

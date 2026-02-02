@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Multi-server PPO training for DDNet RL.
+Multi-server V-trace training for DDNet RL.
+
+Uses V-trace (IMPALA) for proper off-policy correction with async C++ inference.
 
 Spawns multiple DDNet servers, each with 127 bots, and trains from all of them
 in parallel. Each server writes to its own shared memory region.
@@ -33,7 +35,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Import from existing train_async
 from train_async import (
-    SharedMemoryReader, PolicyNetwork, PPOTrainer,
+    SharedMemoryReader, PolicyNetwork, VTraceTrainer,
     OBSERVATION_SIZE, Transition
 )
 
@@ -211,7 +213,7 @@ def backup_existing_run(model_path: str, checkpoint_path: str, log_dir: str):
 def create_fresh_model(model_path: str):
     """Create a fresh randomly initialized model."""
     model = PolicyNetwork()
-    trainer = PPOTrainer(model, lr=1e-4)
+    trainer = VTraceTrainer(model, lr=1e-4)
     trainer.export_onnx(model_path)
     print(f"Created fresh model: {model_path}")
 
@@ -226,7 +228,7 @@ def format_time(seconds: float) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Multi-server PPO training for DDNet RL',
+        description='Multi-server V-trace training for DDNet RL',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
@@ -243,7 +245,7 @@ def main():
                         help='Only act every N frames (reduces transition rate, decorrelates samples)')
 
     # Training configuration
-    parser.add_argument('--lr', type=float, default=2.5e-4,
+    parser.add_argument('--lr', type=float, default=5e-4,
                         help='Learning rate')
     parser.add_argument('--batch-size', type=int, default=8192,
                         help='Batch size for updates')
@@ -304,7 +306,7 @@ def main():
 
     # Initialize model and trainer
     model = PolicyNetwork()
-    trainer = PPOTrainer(model, lr=args.lr, minibatch_size=256)
+    trainer = VTraceTrainer(model, lr=args.lr, minibatch_size=256)
 
     if args.resume:
         trainer.load_checkpoint(args.checkpoint_path)
@@ -437,20 +439,20 @@ def main():
                 writer.add_scalar('losses/value_loss', stats['value_loss'], global_step)
                 writer.add_scalar('losses/entropy', stats['entropy'], global_step)
                 writer.add_scalar('losses/total_loss', stats['loss'], global_step)
+                writer.add_scalar('vtrace/avg_rho', stats['avg_rho'], global_step)
+                writer.add_scalar('vtrace/clip_frac', stats['clip_frac'], global_step)
 
                 if episode_rewards:
                     writer.add_scalar('charts/episodic_return', mean_reward, global_step)
                     writer.add_scalar('charts/episodic_length', mean_length, global_step)
                     writer.add_scalar('charts/episodes', len(episode_rewards), global_step)
 
-                # Print progress
-                print(f"Update {update_count:5d} | "
-                      f"Step {global_step:10,d} | "
-                      f"SPS {sps:5.0f} | "
-                      f"Reward {mean_reward:8.2f} | "
-                      f"Len {mean_length:6.0f} | "
-                      f"Loss {stats['loss']:8.4f} | "
-                      f"Ent {stats['entropy']:.2f}")
+                # Print progress (concise single line)
+                kl_marker = "*" if stats.get('early_stop', False) else ""
+                print(f"U{update_count:4d} | {global_step:10,d} stp | {sps:5.0f} SPS | "
+                      f"R {mean_reward:7.2f} | L {mean_length:5.0f} | "
+                      f"loss {stats['loss']:6.2f} | ent {stats['entropy']:.2f} | "
+                      f"kl {stats.get('approx_kl', 0):.3f}{kl_marker} | clip {stats['clip_frac']:.2f}")
 
                 # Export model periodically
                 if update_count % args.export_interval == 0:
@@ -459,16 +461,11 @@ def main():
                     os.rename(temp_path, args.model_path)
                     multi_reader.signal_all_new_model(args.model_path)
 
-                    # IMPORTANT: Clear transition buffer after model export!
-                    # With PPO importance sampling, stale transitions from the old policy
-                    # cause bad ratio estimates and training instability.
-                    old_buffer_size = len(transition_buffer)
-                    transition_buffer = []
-
                     # Save checkpoint
                     trainer.save_checkpoint(args.checkpoint_path)
 
-                    print(f"  -> Model exported, {args.num_servers} servers signaled, cleared {old_buffer_size} stale transitions")
+                    # Note: V-trace handles off-policy data properly via importance sampling,
+                    # so we don't need to clear the transition buffer after model export.
 
                 # Check server health periodically
                 if server_manager and update_count % 50 == 0:

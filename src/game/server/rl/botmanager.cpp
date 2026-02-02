@@ -229,7 +229,9 @@ void CRLBotManager::Tick()
 		}
 		else
 		{
-			// Random actions for testing
+			// Random actions fallback - this should not happen during training
+			log_warn("rl/botmanager", "Inference not ready (m_pInference=%p, IsReady=%s), using random actions for %d bots",
+				m_pInference, m_pInference ? (m_pInference->IsReady() ? "true" : "false") : "N/A", NumActiveBots);
 			for(int i = 0; i < NumActiveBots; i++)
 			{
 				m_ActionBuffer[i].m_Direction = (rand() % 3) - 1;
@@ -455,23 +457,6 @@ void CRLBotManager::ExtractObservation(int BotIndex, float *pObs)
 
 	rl::SObservation *pObservation = reinterpret_cast<rl::SObservation *>(pObs);
 
-	// Game state
-	IServer *pServer = m_pGameServer->Server();
-	pObservation->m_GameTick = (float)pServer->Tick();
-	pObservation->m_TimeLeft = 0.0f; // TODO: Get from game controller
-	pObservation->m_NumPlayers = 0;
-	pObservation->m_NumProjectiles = 0;
-
-	// Count players
-	for(int i = 0; i < MAX_CLIENTS; i++)
-	{
-		CPlayer *pPlayer = m_pGameServer->m_apPlayers[i];
-		if(pPlayer && pPlayer->GetCharacter())
-		{
-			pObservation->m_NumPlayers += 1.0f;
-		}
-	}
-
 	// Local player observation
 	ExtractPlayerObs(pChar, &pObservation->m_LocalPlayer, true);
 
@@ -480,31 +465,6 @@ void CRLBotManager::ExtractObservation(int BotIndex, float *pObs)
 	Bot.m_PrevPos = pCore->m_Pos;
 	Bot.m_PrevHealth = (float)pChar->GetArmor(); // Actually health in DDNet
 	Bot.m_PrevArmor = (float)pChar->GetArmor();
-
-	// Other players
-	int OtherIdx = 0;
-	for(int i = 0; i < MAX_CLIENTS && OtherIdx < rl::MAX_PLAYERS - 1; i++)
-	{
-		if(i == Bot.m_ClientId)
-			continue;
-
-		CPlayer *pPlayer = m_pGameServer->m_apPlayers[i];
-		if(!pPlayer)
-			continue;
-
-		CCharacter *pOtherChar = pPlayer->GetCharacter();
-		if(pOtherChar && pOtherChar->IsAlive())
-		{
-			ExtractPlayerObs(pOtherChar, &pObservation->m_OtherPlayers[OtherIdx], false);
-			OtherIdx++;
-		}
-	}
-
-	// Projectiles
-	ExtractProjectileObs(BotIndex, pObservation->m_Projectiles, rl::MAX_PROJECTILES);
-
-	// Pickups
-	ExtractPickupObs(BotIndex, pObservation->m_Pickups, rl::MAX_PICKUPS);
 
 	// Tile grid
 	ExtractTileGrid(BotIndex, pObservation->m_TileGrid);
@@ -540,25 +500,6 @@ void CRLBotManager::ExtractPlayerObs(CCharacter *pChar, rl::SPlayerObs *pObs, bo
 	pObs->m_Padding = 0.0f;
 }
 
-void CRLBotManager::ExtractProjectileObs(int BotIndex, rl::SProjectileObs *pObs, int MaxProjectiles)
-{
-	// Zero out all projectile observations
-	mem_zero(pObs, MaxProjectiles * sizeof(rl::SProjectileObs));
-
-	// TODO: Iterate through game world projectiles
-	// This would require access to CGameWorld::m_apFirstEntityTypes
-	// For now, leave projectiles empty
-}
-
-void CRLBotManager::ExtractPickupObs(int BotIndex, rl::SPickupObs *pObs, int MaxPickups)
-{
-	// Zero out all pickup observations
-	mem_zero(pObs, MaxPickups * sizeof(rl::SPickupObs));
-
-	// TODO: Iterate through game world pickups
-	// For now, leave pickups empty
-}
-
 void CRLBotManager::ExtractTileGrid(int BotIndex, float *pGrid)
 {
 	CCharacter *pChar = GetBotCharacter(BotIndex);
@@ -583,16 +524,35 @@ void CRLBotManager::ExtractTileGrid(int BotIndex, float *pGrid)
 	{
 		for(int x = 0; x < rl::TILE_GRID_WIDTH; x++)
 		{
-			int WorldX = (int)(Pos.x / TileSize) + (x - HalfW);
-			int WorldY = (int)(Pos.y / TileSize) + (y - HalfH);
+			int WorldTileX = (int)(Pos.x / TileSize) + (x - HalfW);
+			int WorldTileY = (int)(Pos.y / TileSize) + (y - HalfH);
 
-			// Get tile index from collision using GetIndex(x, y) then GetTileIndex(index)
-			int Index = pCollision->GetIndex(WorldX, WorldY);
-			int TileIndex = pCollision->GetTileIndex(Index);
+			// Convert tile coordinates to pixel coordinates (center of tile)
+			float PixelX = (WorldTileX + 0.5f) * TileSize;
+			float PixelY = (WorldTileY + 0.5f) * TileSize;
 
-			// Normalize tile type to [0, 1]
-			// Common tiles: 0=air, 1=solid, etc.
-			pGrid[y * rl::TILE_GRID_WIDTH + x] = (float)TileIndex / 255.0f;
+			// GetPureMapIndex takes pixel coords, returns linear array index
+			int MapIndex = pCollision->GetPureMapIndex(PixelX, PixelY);
+
+			// GetTileIndex takes linear index, returns tile type
+			int TileIndex = pCollision->GetTileIndex(MapIndex);
+
+			// Check front layer for death tiles (overrides game layer)
+			int FrontIndex = pCollision->GetFrontTileIndex(MapIndex);
+			if(FrontIndex == TILE_DEATH)
+				TileIndex = TILE_DEATH;
+
+			// Clamp tile index to valid range [0, 255] for embedding lookup
+			// Negative or out-of-range values can occur for tiles outside map bounds
+			if(TileIndex < 0)
+				TileIndex = 0;
+			else if(TileIndex > 255)
+				TileIndex = 255;
+
+			// Store raw tile ID (will be cast to int in Python for embedding lookup)
+			// Entity tiles (pickups, spawns, lasers) have index >= ENTITY_OFFSET (191)
+			// and are captured automatically from the game layer
+			pGrid[y * rl::TILE_GRID_WIDTH + x] = (float)TileIndex;
 		}
 	}
 }
@@ -685,8 +645,12 @@ float CRLBotManager::CalculateReward(int BotIndex)
 		float Progress = Bot.m_BestDistToCheckpoint - DistToCheckpoint;
 		Reward += Progress / 100.0f;
 		Bot.m_BestDistToCheckpoint = DistToCheckpoint;
+		Bot.m_TicksSinceProgress = 0;  // Reset - we made progress
 	}
-	// No penalty for backtracking - just 0 reward
+	else
+	{
+		Bot.m_TicksSinceProgress++;  // No improvement this tick
+	}
 
 	// Check if bot reached a new checkpoint
 	int CpAtPos = GetCheckpointAtPos(Pos);
@@ -698,19 +662,20 @@ float CRLBotManager::CalculateReward(int BotIndex)
 	// Checkpoint reached bonus (sparse but important)
 	if(Bot.m_CurrentCheckpointIndex > Bot.m_LastCheckpointRewarded)
 	{
-		Reward += 1.0f;  // Scaled down for stability
+		Reward += 10.0f;  // Important sparse reward for reaching checkpoint
 		Bot.m_LastCheckpointRewarded = Bot.m_CurrentCheckpointIndex;
 		// Reset distance tracking for new checkpoint
 		vec2 NewNextCp = GetNextCheckpointPos(Bot.m_CurrentCheckpointIndex);
 		float NewDist = length(NewNextCp - Pos);
 		Bot.m_LastDistToCheckpoint = NewDist;
 		Bot.m_BestDistToCheckpoint = NewDist;  // Reset high water mark
+		Bot.m_TicksSinceProgress = 0;  // Reaching checkpoint = progress
 	}
 
 	// Finish reached bonus
 	if(m_FinishPos.x > 0 && distance(Pos, m_FinishPos) < 48.0f)
 	{
-		Reward += 5.0f;  // Scaled down for stability
+		Reward += 100.0f;  // Large reward for finishing
 	}
 
 	// Time penalty (small)
@@ -736,24 +701,16 @@ float CRLBotManager::CalculateReward(int BotIndex)
 	bool IsFrozen = pChar->m_FreezeTime > 0;
 	if(IsFrozen && !Bot.m_WasFrozen)
 	{
-		Reward -= 0.1f;  // Entry penalty (scaled down)
+		Reward -= 0.3f;  // Entry penalty
 	}
 	if(IsFrozen)
 	{
-		Reward -= 0.01f;  // Per-tick penalty while frozen (scaled down)
+		Reward -= 0.1f;  // Per-tick penalty while frozen
 	}
 
-	// Stuck detection based on lack of progress (not lack of movement)
-	// Use generous tolerance (32 units = 1 tile) for physics oscillations
-	bool MadeProgress = (DistToCheckpoint <= Bot.m_BestDistToCheckpoint + 32.0f);
-	if(MadeProgress)
-	{
-		Bot.m_StuckCounter = 0;
-	}
-	else
-	{
-		Bot.m_StuckCounter++;
-	}
+	// Stuck detection: use m_TicksSinceProgress which tracks ticks since
+	// m_BestDistToCheckpoint was last improved (updated above in progress reward)
+	Bot.m_StuckCounter = Bot.m_TicksSinceProgress;  // For logging in Tick()
 
 	// Update state
 	Bot.m_PrevPos = Pos;
@@ -1074,6 +1031,7 @@ void CRLBotManager::ResetBotRewardState(int BotIndex)
 	SBotState &Bot = m_aBots[BotIndex];
 	Bot.m_CurrentCheckpointIndex = -1;
 	Bot.m_LastCheckpointRewarded = -1;
+	Bot.m_TicksSinceProgress = 0;
 	Bot.m_StuckCounter = 0;
 	Bot.m_LastHookState = 0;
 	Bot.m_WasFrozen = false;

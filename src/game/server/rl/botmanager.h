@@ -64,7 +64,8 @@ public:
 		int m_LastCheckpointRewarded = -1;           // Last checkpoint that gave bonus
 		float m_LastDistToCheckpoint = 10000.0f;     // Distance to next checkpoint
 		float m_BestDistToCheckpoint = 10000.0f;     // High water mark (closest to checkpoint)
-		int m_StuckCounter = 0;                      // Ticks without progress
+		int m_TicksSinceProgress = 0;                // Ticks since m_BestDistToCheckpoint improved
+		int m_StuckCounter = 0;                      // Ticks without progress (for logging)
 
 		// State tracking for rewards
 		int m_LastHookState = 0;                     // Previous hook state
@@ -193,8 +194,6 @@ private:
 
 	// Observation extraction helpers
 	void ExtractPlayerObs(CCharacter *pChar, rl::SPlayerObs *pObs, bool IsLocal);
-	void ExtractProjectileObs(int BotIndex, rl::SProjectileObs *pObs, int MaxProjectiles);
-	void ExtractPickupObs(int BotIndex, rl::SPickupObs *pObs, int MaxPickups);
 	void ExtractTileGrid(int BotIndex, float *pGrid);
 
 	// Action conversion

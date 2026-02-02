@@ -6,9 +6,6 @@
 namespace rl {
 
 // Constants for observation dimensions
-constexpr int MAX_PLAYERS = 16;
-constexpr int MAX_PROJECTILES = 64;
-constexpr int MAX_PICKUPS = 32;
 constexpr int TILE_GRID_WIDTH = 29;
 constexpr int TILE_GRID_HEIGHT = 21;
 constexpr int TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT;
@@ -35,62 +32,22 @@ struct SPlayerObs
 };
 static_assert(sizeof(SPlayerObs) == 16 * sizeof(float), "SPlayerObs must be 16 floats");
 
-// Projectile observation
-struct SProjectileObs
-{
-	float m_PosX;
-	float m_PosY;
-	float m_VelX;
-	float m_VelY;
-	float m_Type;    // Projectile type
-	float m_Active;  // 1.0 if active, 0.0 if not
-	float m_Padding[2];
-};
-static_assert(sizeof(SProjectileObs) == 8 * sizeof(float), "SProjectileObs must be 8 floats");
-
-// Pickup observation
-struct SPickupObs
-{
-	float m_PosX;
-	float m_PosY;
-	float m_Type;
-	float m_Active;
-};
-static_assert(sizeof(SPickupObs) == 4 * sizeof(float), "SPickupObs must be 4 floats");
-
 // Complete observation for a single bot
 struct SObservation
 {
-	// Game state
-	float m_GameTick;
-	float m_TimeLeft;
-	float m_NumPlayers;
-	float m_NumProjectiles;
-
-	// Local player (controlled bot)
+	// Local player (16 floats)
 	SPlayerObs m_LocalPlayer;
 
-	// Other players
-	SPlayerObs m_OtherPlayers[MAX_PLAYERS - 1];
-
-	// Projectiles
-	SProjectileObs m_Projectiles[MAX_PROJECTILES];
-
-	// Pickups
-	SPickupObs m_Pickups[MAX_PICKUPS];
-
-	// Local tile grid (surrounding area)
+	// Local tile grid (29x21 = 609 floats)
+	// Each float is a tile ID (0-255), to be used with embedding layer in neural network
 	float m_TileGrid[TILE_GRID_SIZE];
 
 	// Total size calculation for reference
 	static constexpr int GetFloatCount()
 	{
-		return 4 +                                          // Game state
-		       16 +                                         // Local player
-		       (MAX_PLAYERS - 1) * 16 +                     // Other players
-		       MAX_PROJECTILES * 8 +                        // Projectiles
-		       MAX_PICKUPS * 4 +                            // Pickups
-		       TILE_GRID_SIZE;                              // Tile grid
+		return 16 +             // Local player
+		       TILE_GRID_SIZE;  // Tile grid (609)
+		// Total: 625 floats
 	}
 };
 
