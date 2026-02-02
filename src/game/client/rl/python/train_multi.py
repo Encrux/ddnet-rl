@@ -459,13 +459,16 @@ def main():
                     os.rename(temp_path, args.model_path)
                     multi_reader.signal_all_new_model(args.model_path)
 
-                    # With REINFORCE (no importance sampling), we don't need to clear
-                    # stale transitions or wait - policy mismatch doesn't cause issues
+                    # IMPORTANT: Clear transition buffer after model export!
+                    # With PPO importance sampling, stale transitions from the old policy
+                    # cause bad ratio estimates and training instability.
+                    old_buffer_size = len(transition_buffer)
+                    transition_buffer = []
 
                     # Save checkpoint
                     trainer.save_checkpoint(args.checkpoint_path)
 
-                    print(f"  -> Model exported, {args.num_servers} servers signaled")
+                    print(f"  -> Model exported, {args.num_servers} servers signaled, cleared {old_buffer_size} stale transitions")
 
                 # Check server health periodically
                 if server_manager and update_count % 50 == 0:

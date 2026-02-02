@@ -386,6 +386,64 @@ class PolicyNetwork(nn.Module):
             'value': value,
         }
 
+    def evaluate_actions(self, x: torch.Tensor, directions: torch.Tensor,
+                         jumps: torch.Tensor, hooks: torch.Tensor,
+                         fires: torch.Tensor, weapons: torch.Tensor,
+                         aims: torch.Tensor) -> dict:
+        """Evaluate log probs and entropy for given actions (for PPO update)."""
+        features = self.shared(x)
+
+        # Direction
+        direction_logits = self.direction_head(features)
+        direction_dist = Categorical(logits=direction_logits)
+        direction_log_prob = direction_dist.log_prob(directions)
+
+        # Binary actions - compute log prob of given actions
+        jump_prob = torch.sigmoid(self.jump_head(features)).squeeze(-1)
+        hook_prob = torch.sigmoid(self.hook_head(features)).squeeze(-1)
+        fire_prob = torch.sigmoid(self.fire_head(features)).squeeze(-1)
+
+        jump_log_prob = jumps * torch.log(jump_prob + 1e-8) + (1 - jumps) * torch.log(1 - jump_prob + 1e-8)
+        hook_log_prob = hooks * torch.log(hook_prob + 1e-8) + (1 - hooks) * torch.log(1 - hook_prob + 1e-8)
+        fire_log_prob = fires * torch.log(fire_prob + 1e-8) + (1 - fires) * torch.log(1 - fire_prob + 1e-8)
+
+        # Weapon
+        weapon_logits = self.weapon_head(features)
+        weapon_dist = Categorical(logits=weapon_logits)
+        weapon_log_prob = weapon_dist.log_prob(weapons)
+
+        # Aim (continuous)
+        aim_mean = self.aim_mean(features)
+        aim_log_std = self.aim_log_std(features).clamp(-2, 2)
+        aim_std = aim_log_std.exp()
+        aim_dist = Normal(aim_mean, aim_std)
+        aim_log_prob = aim_dist.log_prob(aims).sum(dim=-1)
+
+        # Value
+        value = self.value_head(features).squeeze(-1)
+
+        # Total log prob
+        total_log_prob = (
+            direction_log_prob + jump_log_prob + hook_log_prob +
+            fire_log_prob + weapon_log_prob + aim_log_prob
+        )
+
+        # Entropy
+        entropy = (
+            direction_dist.entropy() +
+            -(jump_prob * torch.log(jump_prob + 1e-8) + (1 - jump_prob) * torch.log(1 - jump_prob + 1e-8)) +
+            -(hook_prob * torch.log(hook_prob + 1e-8) + (1 - hook_prob) * torch.log(1 - hook_prob + 1e-8)) +
+            -(fire_prob * torch.log(fire_prob + 1e-8) + (1 - fire_prob) * torch.log(1 - fire_prob + 1e-8)) +
+            weapon_dist.entropy() +
+            aim_dist.entropy().sum(dim=-1)
+        )
+
+        return {
+            'log_prob': total_log_prob,
+            'entropy': entropy,
+            'value': value,
+        }
+
 
 class PPOTrainer:
     """PPO trainer for async training."""
@@ -487,11 +545,16 @@ class PPOTrainer:
 
                 mb_indices = indices[start:end]
 
-                # Get current policy outputs
-                result = self.model.get_action_and_value(obs[mb_indices])
-
-                # Recompute log probs for taken actions
-                # This is simplified - ideally we'd separate the action distributions
+                # Evaluate log probs for the actions that were actually taken
+                result = self.model.evaluate_actions(
+                    obs[mb_indices],
+                    directions[mb_indices],
+                    jumps[mb_indices].float(),
+                    hooks[mb_indices].float(),
+                    fires[mb_indices].float(),
+                    weapons[mb_indices],
+                    aims[mb_indices]
+                )
                 new_log_probs = result['log_prob']
                 new_values = result['value']
                 entropy = result['entropy']
@@ -511,8 +574,15 @@ class PPOTrainer:
                 surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * mb_advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss (clipped)
-                value_loss = F.mse_loss(new_values, returns[mb_indices])
+                # Value loss with clipping (PPO-style)
+                mb_returns = returns[mb_indices]
+                mb_old_values = old_values[mb_indices]
+                value_pred_clipped = mb_old_values + torch.clamp(
+                    new_values - mb_old_values, -self.clip_epsilon, self.clip_epsilon
+                )
+                value_loss_unclipped = (new_values - mb_returns) ** 2
+                value_loss_clipped = (value_pred_clipped - mb_returns) ** 2
+                value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
                 # Entropy bonus
                 entropy_loss = -entropy.mean()

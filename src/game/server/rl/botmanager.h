@@ -58,11 +58,17 @@ public:
 		vec2 m_PrevPos = vec2(0, 0);
 		float m_PrevHealth = 0;
 		float m_PrevArmor = 0;
-		int m_PrevCheckpoint = 0;
 
-		// Progress tracking for stuck detection
-		float m_BestProgress = 0.0f;                 // High water mark (best X position reached)
+		// Checkpoint-based progress tracking
+		int m_CurrentCheckpointIndex = -1;           // Current checkpoint reached
+		int m_LastCheckpointRewarded = -1;           // Last checkpoint that gave bonus
+		float m_LastDistToCheckpoint = 10000.0f;     // Distance to next checkpoint
+		float m_BestDistToCheckpoint = 10000.0f;     // High water mark (closest to checkpoint)
 		int m_StuckCounter = 0;                      // Ticks without progress
+
+		// State tracking for rewards
+		int m_LastHookState = 0;                     // Previous hook state
+		bool m_WasFrozen = false;                    // Was frozen last tick
 
 		// Last action (for transition logging)
 		rl::SAction m_LastAction;
@@ -71,6 +77,13 @@ public:
 
 		// Accumulated reward for frame-skip
 		float m_AccumulatedReward = 0.0f;
+	};
+
+	// Checkpoint data extracted from map
+	struct SCheckpoint
+	{
+		vec2 m_Pos;
+		int m_Index;
 	};
 
 	CRLBotManager(CGameContext *pGameServer);
@@ -160,6 +173,12 @@ private:
 	// Frame skip counter
 	int m_FrameCounter = 0;
 
+	// Map checkpoint data
+	std::vector<SCheckpoint> m_vCheckpoints;
+	vec2 m_SpawnPos = vec2(0, 0);
+	vec2 m_FinishPos = vec2(0, 0);
+	bool m_MapAnalyzed = false;
+
 	// Statistics
 	uint64_t m_TotalSteps = 0;
 	uint64_t m_TotalEpisodes = 0;
@@ -185,6 +204,12 @@ private:
 	CPlayer *GetBotPlayer(int BotIndex);
 	CCharacter *GetBotCharacter(int BotIndex);
 	vec2 GetSpawnPosition(int BotIndex);
+
+	// Map analysis
+	void AnalyzeMap();
+	vec2 GetNextCheckpointPos(int CurrentIndex) const;
+	int GetCheckpointAtPos(vec2 Pos, float Radius = 48.0f) const;
+	void ResetBotRewardState(int BotIndex);
 };
 
 #endif // GAME_SERVER_RL_BOTMANAGER_H

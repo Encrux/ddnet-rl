@@ -5,14 +5,18 @@
 #include <game/server/gamecontext.h>
 #include <game/server/gamecontroller.h>
 #include <game/server/player.h>
+#include <game/collision.h>
+#include <game/mapitems.h>
 
 #include <base/log.h>
 #include <base/system.h>
 
 #include <engine/server.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 
 // From generated protocol
 #include <generated/protocol.h>
@@ -279,7 +283,7 @@ void CRLBotManager::Tick()
 			s_DebugCounter = 0;
 			int MaxStep = 0;
 			int TotalSteps = 0;
-			float MaxProgress = 0;
+			int MaxCheckpoint = -1;
 			for(int b = 0; b < (int)m_aBots.size(); b++)
 			{
 				if(m_aBots[b].m_Active)
@@ -287,12 +291,12 @@ void CRLBotManager::Tick()
 					TotalSteps += m_aBots[b].m_EpisodeStep;
 					if(m_aBots[b].m_EpisodeStep > MaxStep)
 						MaxStep = m_aBots[b].m_EpisodeStep;
-					if(m_aBots[b].m_BestProgress > MaxProgress)
-						MaxProgress = m_aBots[b].m_BestProgress;
+					if(m_aBots[b].m_CurrentCheckpointIndex > MaxCheckpoint)
+						MaxCheckpoint = m_aBots[b].m_CurrentCheckpointIndex;
 				}
 			}
-			log_info("rl/botmanager", "Progress: maxStep=%d maxX=%.0f totalEpisodes=%u avgSteps=%d stuckThresh=%d frameSkip=%d",
-				MaxStep, MaxProgress, m_TotalEpisodes, m_ActiveBotCount > 0 ? TotalSteps / m_ActiveBotCount : 0, m_Config.m_StuckThreshold, m_Config.m_FrameSkip);
+			log_info("rl/botmanager", "Progress: maxStep=%d maxCP=%d/%d totalEpisodes=%u avgSteps=%d stuckThresh=%d frameSkip=%d",
+				MaxStep, MaxCheckpoint, (int)m_vCheckpoints.size(), m_TotalEpisodes, m_ActiveBotCount > 0 ? TotalSteps / m_ActiveBotCount : 0, m_Config.m_StuckThreshold, m_Config.m_FrameSkip);
 		}
 
 		// Write transition to shared memory (only on inference frames)
@@ -307,8 +311,8 @@ void CRLBotManager::Tick()
 		{
 			if(IsStuck)
 			{
-				log_info("rl/botmanager", "Bot %d stuck at step %d (no progress for %d ticks, bestX=%.0f)",
-					BotIndex, Bot.m_EpisodeStep, Bot.m_StuckCounter, Bot.m_BestProgress);
+				log_info("rl/botmanager", "Bot %d stuck at step %d (no progress for %d ticks, cp=%d/%d, dist=%.0f)",
+					BotIndex, Bot.m_EpisodeStep, Bot.m_StuckCounter, Bot.m_CurrentCheckpointIndex, (int)m_vCheckpoints.size(), Bot.m_BestDistToCheckpoint);
 			}
 			else
 			{
@@ -379,7 +383,9 @@ int CRLBotManager::SpawnBot()
 	Bot.m_PrevPos = vec2(0, 0);
 	Bot.m_PrevHealth = 10;
 	Bot.m_PrevArmor = 0;
-	Bot.m_PrevCheckpoint = 0;
+
+	// Initialize checkpoint tracking
+	ResetBotRewardState(BotIndex);
 
 	m_ActiveBotCount++;
 
@@ -652,25 +658,94 @@ float CRLBotManager::CalculateReward(int BotIndex)
 	if(!pChar || !pChar->IsAlive())
 	{
 		// Death penalty
-		return -10.0f;
+		return -1.0f;
+	}
+
+	// Analyze map on first call
+	if(!m_MapAnalyzed)
+	{
+		AnalyzeMap();
 	}
 
 	float Reward = 0.0f;
 	const CCharacterCore *pCore = pChar->Core();
-	float CurrentX = pCore->m_Pos.x;
+	vec2 Pos = pCore->m_Pos;
+
+	// Get next checkpoint position
+	vec2 NextCp = GetNextCheckpointPos(Bot.m_CurrentCheckpointIndex);
+
+	// Calculate distance to next checkpoint
+	vec2 ToCheckpoint = NextCp - Pos;
+	float DistToCheckpoint = length(ToCheckpoint);
 
 	// Progress reward using high water mark - only reward NEW progress
-	// This allows agents to backtrack for jumps without penalty
-	if(CurrentX > Bot.m_BestProgress)
+	// This allows agents to backtrack to set up jumps without being punished
+	if(DistToCheckpoint < Bot.m_BestDistToCheckpoint)
 	{
-		float Progress = CurrentX - Bot.m_BestProgress;
-		Reward += Progress * 0.01f;  // Reward for new progress
-		Bot.m_BestProgress = CurrentX;
+		float Progress = Bot.m_BestDistToCheckpoint - DistToCheckpoint;
+		Reward += Progress / 100.0f;
+		Bot.m_BestDistToCheckpoint = DistToCheckpoint;
+	}
+	// No penalty for backtracking - just 0 reward
+
+	// Check if bot reached a new checkpoint
+	int CpAtPos = GetCheckpointAtPos(Pos);
+	if(CpAtPos >= 0 && CpAtPos > Bot.m_CurrentCheckpointIndex)
+	{
+		Bot.m_CurrentCheckpointIndex = CpAtPos;
 	}
 
-	// Stuck detection: check if we're making progress (within tolerance)
-	// Use 32 units (1 tile) tolerance to account for physics oscillations
-	bool MadeProgress = (CurrentX >= Bot.m_BestProgress - 32.0f);
+	// Checkpoint reached bonus (sparse but important)
+	if(Bot.m_CurrentCheckpointIndex > Bot.m_LastCheckpointRewarded)
+	{
+		Reward += 1.0f;  // Scaled down for stability
+		Bot.m_LastCheckpointRewarded = Bot.m_CurrentCheckpointIndex;
+		// Reset distance tracking for new checkpoint
+		vec2 NewNextCp = GetNextCheckpointPos(Bot.m_CurrentCheckpointIndex);
+		float NewDist = length(NewNextCp - Pos);
+		Bot.m_LastDistToCheckpoint = NewDist;
+		Bot.m_BestDistToCheckpoint = NewDist;  // Reset high water mark
+	}
+
+	// Finish reached bonus
+	if(m_FinishPos.x > 0 && distance(Pos, m_FinishPos) < 48.0f)
+	{
+		Reward += 5.0f;  // Scaled down for stability
+	}
+
+	// Time penalty (small)
+	Reward -= 0.0005f;
+
+	// Velocity bonus: reward movement TOWARD checkpoint
+	if(DistToCheckpoint > 0.1f)
+	{
+		vec2 DirToCheckpoint = ToCheckpoint / DistToCheckpoint;
+		vec2 Vel = pCore->m_Vel;
+		float VelTowardCp = dot(Vel, DirToCheckpoint);
+		Reward += std::clamp(VelTowardCp, 0.0f, 20.0f) / 500.0f;
+	}
+
+	// Hook success bonus
+	int HookState = pCore->m_HookState;
+	if(HookState == HOOK_GRABBED && Bot.m_LastHookState != HOOK_GRABBED)
+	{
+		Reward += 0.05f;
+	}
+
+	// Freeze penalty
+	bool IsFrozen = pChar->m_FreezeTime > 0;
+	if(IsFrozen && !Bot.m_WasFrozen)
+	{
+		Reward -= 0.1f;  // Entry penalty (scaled down)
+	}
+	if(IsFrozen)
+	{
+		Reward -= 0.01f;  // Per-tick penalty while frozen (scaled down)
+	}
+
+	// Stuck detection based on lack of progress (not lack of movement)
+	// Use generous tolerance (32 units = 1 tile) for physics oscillations
+	bool MadeProgress = (DistToCheckpoint <= Bot.m_BestDistToCheckpoint + 32.0f);
 	if(MadeProgress)
 	{
 		Bot.m_StuckCounter = 0;
@@ -680,15 +755,11 @@ float CRLBotManager::CalculateReward(int BotIndex)
 		Bot.m_StuckCounter++;
 	}
 
-	// Velocity bonus: reward movement in positive X direction
-	float VelX = pCore->m_Vel.x;
-	Reward += std::max(0.0f, VelX) * 0.0001f;
-
-	// Small time penalty to encourage efficiency
-	Reward -= 0.0005f;
-
-	// Update previous position
-	Bot.m_PrevPos = pCore->m_Pos;
+	// Update state
+	Bot.m_PrevPos = Pos;
+	Bot.m_LastDistToCheckpoint = DistToCheckpoint;
+	Bot.m_LastHookState = HookState;
+	Bot.m_WasFrozen = IsFrozen;
 
 	return Reward;
 }
@@ -723,8 +794,9 @@ void CRLBotManager::HandleEpisodeEnd(int BotIndex, bool Truncated, bool Transiti
 	Bot.m_EpisodeStep = 0;
 	Bot.m_EpisodeReward = 0.0f;
 	Bot.m_AccumulatedReward = 0.0f;
-	Bot.m_BestProgress = 0.0f;
-	Bot.m_StuckCounter = 0;
+
+	// Reset reward tracking state
+	ResetBotRewardState(BotIndex);
 
 	// Respawn the character
 	CPlayer *pPlayer = GetBotPlayer(BotIndex);
@@ -736,14 +808,6 @@ void CRLBotManager::HandleEpisodeEnd(int BotIndex, bool Truncated, bool Transiti
 			pPlayer->KillCharacter(WEAPON_GAME, false);
 		}
 		pPlayer->Respawn();
-
-		// Reset best progress to spawn position
-		CCharacter *pNewChar = pPlayer->GetCharacter();
-		if(pNewChar)
-		{
-			Bot.m_BestProgress = pNewChar->Core()->m_Pos.x;
-			Bot.m_PrevPos = pNewChar->Core()->m_Pos;
-		}
 	}
 }
 
@@ -818,4 +882,207 @@ vec2 CRLBotManager::GetSpawnPosition(int BotIndex)
 	}
 
 	return SpawnPos;
+}
+
+void CRLBotManager::AnalyzeMap()
+{
+	CCollision *pCollision = m_pGameServer->Collision();
+	if(!pCollision)
+		return;
+
+	m_vCheckpoints.clear();
+	m_SpawnPos = vec2(0, 0);
+	m_FinishPos = vec2(0, 0);
+
+	int MapWidth = pCollision->GetWidth();
+	int MapHeight = pCollision->GetHeight();
+
+	// Maps: tile position -> checkpoint index
+	std::map<std::pair<int, int>, int> TileIndices;
+	std::vector<std::pair<int, int>> CheckpointTiles;
+
+	// Get front layer for time checkpoints
+	const CTile *pFront = pCollision->FrontLayer();
+
+	// Scan all tiles
+	for(int y = 0; y < MapHeight; y++)
+	{
+		for(int x = 0; x < MapWidth; x++)
+		{
+			int MapIndex = y * MapWidth + x;
+			int TileIdx = pCollision->GetTileIndex(MapIndex);
+
+			// Check game layer
+			if(TileIdx == TILE_START)
+			{
+				m_SpawnPos = vec2((x + 0.5f) * 32.0f, (y + 0.5f) * 32.0f);
+			}
+			else if(TileIdx == TILE_FINISH)
+			{
+				m_FinishPos = vec2((x + 0.5f) * 32.0f, (y + 0.5f) * 32.0f);
+			}
+			else if(TileIdx == TILE_CP || TileIdx == TILE_CP_F)
+			{
+				// Generic checkpoint
+				CheckpointTiles.push_back(std::make_pair(x, y));
+				TileIndices[std::make_pair(x, y)] = -1;
+			}
+			else if(TileIdx >= TILE_TIME_CHECKPOINT_FIRST && TileIdx <= TILE_TIME_CHECKPOINT_LAST)
+			{
+				// Time checkpoint with index
+				CheckpointTiles.push_back(std::make_pair(x, y));
+				TileIndices[std::make_pair(x, y)] = TileIdx - TILE_TIME_CHECKPOINT_FIRST;
+			}
+
+			// Check front layer for time checkpoints
+			if(pFront)
+			{
+				int FrontIdx = pFront[MapIndex].m_Index;
+				if(FrontIdx >= TILE_TIME_CHECKPOINT_FIRST && FrontIdx <= TILE_TIME_CHECKPOINT_LAST)
+				{
+					auto Key = std::make_pair(x, y);
+					if(TileIndices.find(Key) == TileIndices.end())
+					{
+						CheckpointTiles.push_back(Key);
+						TileIndices[Key] = FrontIdx - TILE_TIME_CHECKPOINT_FIRST;
+					}
+				}
+			}
+		}
+	}
+
+	// Group adjacent tiles into checkpoints (BFS)
+	std::vector<bool> Visited(CheckpointTiles.size(), false);
+
+	for(size_t i = 0; i < CheckpointTiles.size(); i++)
+	{
+		if(Visited[i])
+			continue;
+
+		std::vector<std::pair<int, int>> Group;
+		std::vector<size_t> Queue;
+		Queue.push_back(i);
+		Visited[i] = true;
+
+		while(!Queue.empty())
+		{
+			size_t Idx = Queue.back();
+			Queue.pop_back();
+			Group.push_back(CheckpointTiles[Idx]);
+
+			int cx = CheckpointTiles[Idx].first;
+			int cy = CheckpointTiles[Idx].second;
+
+			// Check adjacent tiles
+			for(size_t j = 0; j < CheckpointTiles.size(); j++)
+			{
+				if(Visited[j])
+					continue;
+
+				int dx = std::abs(CheckpointTiles[j].first - cx);
+				int dy = std::abs(CheckpointTiles[j].second - cy);
+
+				if(dx <= 1 && dy <= 1)
+				{
+					Visited[j] = true;
+					Queue.push_back(j);
+				}
+			}
+		}
+
+		// Calculate center and index of this checkpoint group
+		float SumX = 0, SumY = 0;
+		int MaxIndex = -1;
+
+		for(const auto &Tile : Group)
+		{
+			SumX += (Tile.first + 0.5f) * 32.0f;
+			SumY += (Tile.second + 0.5f) * 32.0f;
+
+			auto It = TileIndices.find(Tile);
+			if(It != TileIndices.end() && It->second > MaxIndex)
+			{
+				MaxIndex = It->second;
+			}
+		}
+
+		SCheckpoint Cp;
+		Cp.m_Pos = vec2(SumX / Group.size(), SumY / Group.size());
+		Cp.m_Index = MaxIndex;
+		m_vCheckpoints.push_back(Cp);
+	}
+
+	// Sort checkpoints by index
+	std::sort(m_vCheckpoints.begin(), m_vCheckpoints.end(),
+		[](const SCheckpoint &a, const SCheckpoint &b) {
+			return a.m_Index < b.m_Index;
+		});
+
+	// Re-assign sequential indices
+	for(size_t i = 0; i < m_vCheckpoints.size(); i++)
+	{
+		m_vCheckpoints[i].m_Index = (int)i;
+	}
+
+	m_MapAnalyzed = true;
+
+	log_info("rl/botmanager", "Map analyzed: %d checkpoints, spawn (%.0f, %.0f), finish (%.0f, %.0f)",
+		(int)m_vCheckpoints.size(), m_SpawnPos.x, m_SpawnPos.y, m_FinishPos.x, m_FinishPos.y);
+}
+
+vec2 CRLBotManager::GetNextCheckpointPos(int CurrentIndex) const
+{
+	// If no checkpoints, target finish
+	if(m_vCheckpoints.empty())
+	{
+		return m_FinishPos.x > 0 ? m_FinishPos : m_SpawnPos;
+	}
+
+	// If before any checkpoint, target first
+	if(CurrentIndex < 0)
+	{
+		return m_vCheckpoints[0].m_Pos;
+	}
+
+	// If at or past last checkpoint, target finish
+	if(CurrentIndex >= (int)m_vCheckpoints.size() - 1)
+	{
+		return m_FinishPos.x > 0 ? m_FinishPos : m_vCheckpoints.back().m_Pos;
+	}
+
+	// Target next checkpoint
+	return m_vCheckpoints[CurrentIndex + 1].m_Pos;
+}
+
+int CRLBotManager::GetCheckpointAtPos(vec2 Pos, float Radius) const
+{
+	for(const auto &Cp : m_vCheckpoints)
+	{
+		if(distance(Pos, Cp.m_Pos) < Radius)
+		{
+			return Cp.m_Index;
+		}
+	}
+	return -1;
+}
+
+void CRLBotManager::ResetBotRewardState(int BotIndex)
+{
+	if(BotIndex < 0 || BotIndex >= (int)m_aBots.size())
+		return;
+
+	SBotState &Bot = m_aBots[BotIndex];
+	Bot.m_CurrentCheckpointIndex = -1;
+	Bot.m_LastCheckpointRewarded = -1;
+	Bot.m_StuckCounter = 0;
+	Bot.m_LastHookState = 0;
+	Bot.m_WasFrozen = false;
+	Bot.m_PrevPos = m_SpawnPos;
+
+	// Initialize distance tracking to actual distance from spawn
+	// This prevents a huge "free" progress reward on first tick
+	vec2 NextCp = GetNextCheckpointPos(-1);  // First checkpoint
+	float InitialDist = length(NextCp - m_SpawnPos);
+	Bot.m_LastDistToCheckpoint = InitialDist;
+	Bot.m_BestDistToCheckpoint = InitialDist;
 }
