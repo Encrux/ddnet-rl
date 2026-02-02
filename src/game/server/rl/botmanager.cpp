@@ -43,9 +43,14 @@ CBotManager::CBotManager(CGameContext *pGameContext) :
 	m_MaxLatencyUs(0)
 {
 	mem_zero(m_aClientIds, sizeof(m_aClientIds));
-	mem_zero(m_aBotState, sizeof(m_aBotState));
 	mem_zero(m_aBotInputs, sizeof(m_aBotInputs));
 	mem_zero(m_aAccumulatedRewards, sizeof(m_aAccumulatedRewards));
+
+	// Initialize bot state (can't use mem_zero due to std::bitset)
+	for(int i = 0; i < MAX_RL_BOTS; i++)
+	{
+		m_aBotState[i] = SBotRewardState{};
+	}
 }
 
 CBotManager::~CBotManager()
@@ -738,6 +743,29 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 		Reward -= 0.1f; // Per-tick penalty while frozen
 	}
 
+	// Exploration bonus - reward visiting new map regions
+	// Uses coarse grid (8x8 tiles = 256 pixels per region)
+	constexpr float REGION_SIZE = 256.0f;  // 8 tiles * 32 pixels
+	int RegionX = (int)(Pos.x / REGION_SIZE);
+	int RegionY = (int)(Pos.y / REGION_SIZE);
+
+	// Clamp to valid range
+	RegionX = std::clamp(RegionX, 0, SBotRewardState::EXPLORATION_GRID_SIZE - 1);
+	RegionY = std::clamp(RegionY, 0, SBotRewardState::EXPLORATION_GRID_SIZE - 1);
+
+	int RegionIdx = RegionY * SBotRewardState::EXPLORATION_GRID_SIZE + RegionX;
+
+	if(!State.m_VisitedRegions.test(RegionIdx))
+	{
+		State.m_VisitedRegions.set(RegionIdx);
+		State.m_NewRegionsThisEpisode++;
+
+		// Decaying exploration bonus to avoid over-exploration
+		// First regions worth more, diminishing returns
+		float ExplorationBonus = 0.1f / (1.0f + 0.05f * State.m_NewRegionsThisEpisode);
+		Reward += ExplorationBonus;
+	}
+
 	// Stuck detection based on lack of progress (not lack of movement)
 	// If we're at or near our best distance, we made progress recently
 	// Use generous tolerance (32 units = 1 tile) to account for physics oscillations
@@ -767,6 +795,9 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 	State.m_LastHookState = Local.m_HookState;
 	State.m_WasFrozen = Local.m_IsFrozen;
 
+	// Scale rewards for PPO stability (adjust as needed)
+	Reward *= 1.0f;
+
 	return Reward;
 }
 
@@ -783,6 +814,10 @@ void CBotManager::ResetRewardState(int BotIndex)
 	State.m_StuckCounter = 0;
 	State.m_WasFrozen = false;
 	State.m_WasDead = false;
+
+	// Reset exploration tracking
+	State.m_VisitedRegions.reset();
+	State.m_NewRegionsThisEpisode = 0;
 }
 
 void CBotManager::RespawnAllBots()

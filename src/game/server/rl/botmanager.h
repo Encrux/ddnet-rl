@@ -11,6 +11,7 @@
 #include <game/rl/rl_protocol.h>
 #include <base/vmath.h>
 #include <generated/protocol.h>
+#include <bitset>
 #include <memory>
 #include <vector>
 #include <map>
@@ -107,6 +108,12 @@ private:
 		int m_StuckCounter;
 		bool m_WasFrozen;
 		bool m_WasDead;
+
+		// Exploration tracking - coarse grid (8x8 tiles per region)
+		// 64x64 regions = 4096 bits = 512 bytes per bot
+		static constexpr int EXPLORATION_GRID_SIZE = 64;
+		std::bitset<EXPLORATION_GRID_SIZE * EXPLORATION_GRID_SIZE> m_VisitedRegions;
+		int m_NewRegionsThisEpisode;
 	};
 	SBotRewardState m_aBotState[MAX_RL_BOTS];
 
