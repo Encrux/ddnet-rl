@@ -237,8 +237,9 @@ class EmbeddingFeatureExtractor(nn.Module):
 
         self.use_cnn_encoder = (tile_encoder == "cnn")
 
-        # Combine tile features with player_state(15) + checkpoint(4)
-        combined_input_size = tile_out_dim + config.player_state_dim + config.checkpoint_dim
+        # Combine tile features with player_state (15 * n_player_state_stack) + checkpoint(4)
+        player_state_size = config.player_state_dim * config.n_player_state_stack
+        combined_input_size = tile_out_dim + player_state_size + config.checkpoint_dim
 
         self.combine = nn.Sequential(
             layer_init(nn.Linear(combined_input_size, config.hidden_dim)),
@@ -530,7 +531,7 @@ class PPOAgent:
                 (ns, ne, cfg.tile_grid_height, cfg.tile_grid_width), dtype=torch.long, device=self.device
             )
             self.obs_player_state = torch.zeros(
-                (ns, ne, cfg.player_state_dim), device=self.device
+                (ns, ne, cfg.player_state_dim * n_player_stack), device=self.device
             )
             self.obs_checkpoint = torch.zeros(
                 (ns, ne, cfg.checkpoint_dim), device=self.device
@@ -718,7 +719,7 @@ class PPOAgent:
         if self.use_embeddings:
             # Embedding mode: tiles as (batch, H, W) long tensor
             b_tiles = self.obs_tiles.reshape(-1, cfg.tile_grid_height, cfg.tile_grid_width)
-            b_player_state = self.obs_player_state.reshape(-1, cfg.player_state_dim)
+            b_player_state = self.obs_player_state.reshape(-1, cfg.player_state_dim * n_player_stack)
             b_checkpoint = self.obs_checkpoint.reshape(-1, cfg.checkpoint_dim)
         elif self.use_cnn:
             # CNN mode: tiles use n_frame_stack, player_state uses n_player_state_stack
