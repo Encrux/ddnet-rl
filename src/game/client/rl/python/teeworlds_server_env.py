@@ -29,6 +29,7 @@ import atexit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
+from teeworlds_env import StructuredObservation
 
 # Try to import numba for JIT acceleration
 try:
