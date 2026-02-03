@@ -63,6 +63,11 @@ class PPOConfig:
     # torch.compile for faster forward/backward passes (PyTorch 2.0+)
     use_compile: bool = True
 
+    # Frame stacking for temporal context
+    # With frame_skip=3: 8 frames × 3 ticks × 20ms = 480ms coverage
+    n_frame_stack: int = 1  # Number of tile frames to stack (1 = no stacking, expensive)
+    n_player_state_stack: int = 8  # Number of player state frames to stack (cheap, enables timing)
+
 
 def layer_init(layer: nn.Module, std: float = np.sqrt(2), bias_const: float = 0.0) -> nn.Module:
     """Initialize layer with orthogonal weights."""
@@ -93,12 +98,14 @@ class CNNFeatureExtractor(nn.Module):
 
         h, w = config.tile_grid_height, config.tile_grid_width
         channels = config.cnn_channels
+        n_stack = config.n_frame_stack
 
         # CNN for tile grid
-        # Input: (1, 31, 43), output after convs: depends on architecture
+        # Input: (n_stack, 31, 43), output after convs: depends on architecture
+        # When frame stacking is enabled, tiles have n_stack channels instead of 1
         self.tile_encoder = nn.Sequential(
             # Conv1: 31x43 -> 15x21 (stride 2 with padding)
-            layer_init(nn.Conv2d(1, channels[0], kernel_size=3, stride=2, padding=1)),
+            layer_init(nn.Conv2d(n_stack, channels[0], kernel_size=3, stride=2, padding=1)),
             nn.ReLU(),
             # Conv2: 15x21 -> 7x10 (stride 2)
             layer_init(nn.Conv2d(channels[0], channels[1], kernel_size=3, stride=2, padding=1)),
@@ -126,7 +133,10 @@ class CNNFeatureExtractor(nn.Module):
         cnn_flat_size = channels[2] * h3 * w3
 
         # Combine CNN features with player state and checkpoint
-        combined_input_size = cnn_flat_size + config.player_state_dim + config.checkpoint_dim
+        # Tiles use n_frame_stack, player_state uses n_player_state_stack (can differ)
+        # Checkpoint stays single (4 features)
+        player_state_size = config.player_state_dim * config.n_player_state_stack
+        combined_input_size = cnn_flat_size + player_state_size + config.checkpoint_dim
 
         self.combine = nn.Sequential(
             layer_init(nn.Linear(combined_input_size, config.hidden_dim)),
@@ -511,6 +521,8 @@ class PPOAgent:
         """Initialize rollout storage buffers."""
         ns, ne = self.num_steps, self.num_envs
         cfg = self.config
+        n_tile_stack = cfg.n_frame_stack
+        n_player_stack = cfg.n_player_state_stack
 
         if self.use_embeddings:
             # Embedding observation storage (tiles as int64 for nn.Embedding)
@@ -525,11 +537,14 @@ class PPOAgent:
             )
         elif self.use_cnn:
             # Dict observation storage (tiles as float32)
+            # Tiles use n_frame_stack channels: (ns, ne, n_tile_stack, H, W)
+            # Player state uses n_player_state_stack: (ns, ne, player_state_dim * n_player_stack)
+            # Checkpoint stays single: (ns, ne, checkpoint_dim)
             self.obs_tiles = torch.zeros(
-                (ns, ne, 1, cfg.tile_grid_height, cfg.tile_grid_width), device=self.device
+                (ns, ne, n_tile_stack, cfg.tile_grid_height, cfg.tile_grid_width), device=self.device
             )
             self.obs_player_state = torch.zeros(
-                (ns, ne, cfg.player_state_dim), device=self.device
+                (ns, ne, cfg.player_state_dim * n_player_stack), device=self.device
             )
             self.obs_checkpoint = torch.zeros(
                 (ns, ne, cfg.checkpoint_dim), device=self.device
@@ -697,14 +712,18 @@ class PPOAgent:
         batch_size = self.num_steps * self.num_envs
         cfg = self.config
 
+        n_tile_stack = cfg.n_frame_stack
+        n_player_stack = cfg.n_player_state_stack
+
         if self.use_embeddings:
             # Embedding mode: tiles as (batch, H, W) long tensor
             b_tiles = self.obs_tiles.reshape(-1, cfg.tile_grid_height, cfg.tile_grid_width)
             b_player_state = self.obs_player_state.reshape(-1, cfg.player_state_dim)
             b_checkpoint = self.obs_checkpoint.reshape(-1, cfg.checkpoint_dim)
         elif self.use_cnn:
-            b_tiles = self.obs_tiles.reshape(-1, 1, cfg.tile_grid_height, cfg.tile_grid_width)
-            b_player_state = self.obs_player_state.reshape(-1, cfg.player_state_dim)
+            # CNN mode: tiles use n_frame_stack, player_state uses n_player_state_stack
+            b_tiles = self.obs_tiles.reshape(-1, n_tile_stack, cfg.tile_grid_height, cfg.tile_grid_width)
+            b_player_state = self.obs_player_state.reshape(-1, cfg.player_state_dim * n_player_stack)
             b_checkpoint = self.obs_checkpoint.reshape(-1, cfg.checkpoint_dim)
         else:
             b_obs = self.obs_buffer.reshape(-1, self.obs_dim)

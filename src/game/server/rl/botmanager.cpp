@@ -778,6 +778,16 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 	else
 	{
 		State.m_StuckCounter++;
+
+		// Escalating penalty for sustained lack of progress
+		// Starts after ~1 second (50 ticks), increases over time
+		// This discourages oscillating/hesitating without penalizing brief backtracks
+		if(State.m_StuckCounter > 50)
+		{
+			float StuckPenalty = 0.01f * (State.m_StuckCounter - 50) / 50.0f;
+			Reward -= StuckPenalty;
+		}
+
 		// Debug: Log when stuck counter is high
 		if(State.m_StuckCounter == 100 || State.m_StuckCounter == 300 || State.m_StuckCounter == 500)
 		{

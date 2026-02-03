@@ -1747,6 +1747,122 @@ class TeeWorldsServerEnv:
         self.close()
 
 
+class FrameStackWrapper:
+    """
+    Stack frames for temporal context with separate control for tiles and player state.
+
+    This wrapper maintains deques of recent observations and stacks them
+    so the agent can see temporal patterns (e.g., velocity trajectory
+    for double-jump timing).
+
+    With frame_skip=3 and n_stack=8: 8 frames × 3 ticks × 20ms = 480ms coverage.
+
+    Tiles and player_state can be stacked independently:
+    - Tile stacking is expensive (8x VRAM) but useful for tracking other players
+    - Player state stacking is cheap and sufficient for timing/velocity patterns
+    """
+
+    def __init__(self, env: TeeWorldsServerEnv, n_tile_stack: int = 1, n_player_state_stack: int = 8):
+        """
+        Args:
+            env: The underlying TeeWorldsServerEnv (must use dict observations)
+            n_tile_stack: Number of tile frames to stack (default: 1, no stacking)
+            n_player_state_stack: Number of player state frames to stack (default: 8)
+        """
+        from collections import deque
+
+        self.env = env
+        self.n_tile_stack = n_tile_stack
+        self.n_player_state_stack = n_player_state_stack
+
+        # Separate deques for tiles and player state (can have different sizes)
+        self.tile_frames = deque(maxlen=n_tile_stack)
+        self.player_frames = deque(maxlen=n_player_state_stack)
+
+        # Forward attributes from wrapped env
+        self.num_bots = env.num_bots
+        self.num_envs = env.num_envs
+        self.config = env.config
+
+    def reset(self, seed=None):
+        """Reset and initialize frame stacks with copies of first observation."""
+        obs, info = self.env.reset(seed=seed)
+
+        # Initialize tile stack
+        self.tile_frames.clear()
+        for _ in range(self.n_tile_stack):
+            self.tile_frames.append(obs['tiles'].copy())
+
+        # Initialize player state stack
+        self.player_frames.clear()
+        for _ in range(self.n_player_state_stack):
+            self.player_frames.append(obs['player_state'].copy())
+
+        # Keep latest checkpoint (not stacked)
+        self._latest_checkpoint = obs['checkpoint'].copy()
+
+        return self._get_stacked_obs(), info
+
+    def step(self, action):
+        """Step environment and update frame stacks."""
+        obs, reward, done, truncated, info = self.env.step(action)
+
+        # Add new frames to stacks
+        self.tile_frames.append(obs['tiles'].copy())
+        self.player_frames.append(obs['player_state'].copy())
+        self._latest_checkpoint = obs['checkpoint'].copy()
+
+        # Handle episode resets (per-env): reset frame history for done envs
+        reset_mask = done | truncated
+        if np.any(reset_mask):
+            for i in np.where(reset_mask)[0]:
+                # Reset this env's tile history
+                for frame in self.tile_frames:
+                    frame[i] = obs['tiles'][i]
+                # Reset this env's player state history
+                for frame in self.player_frames:
+                    frame[i] = obs['player_state'][i]
+
+        return self._get_stacked_obs(), reward, done, truncated, info
+
+    def _get_stacked_obs(self):
+        """Stack observations along channel/feature dimension."""
+        # Stack tiles: (n_envs, 1, H, W) * n_tile_stack -> (n_envs, n_tile_stack, H, W)
+        stacked_tiles = np.concatenate(
+            [f for f in self.tile_frames], axis=1
+        )
+
+        # Stack player_state: (n_envs, 15) * n_player_stack -> (n_envs, 15*n_player_stack)
+        stacked_player = np.concatenate(
+            [f for f in self.player_frames], axis=1
+        )
+
+        # Checkpoint stays single (doesn't change rapidly)
+        return {
+            'tiles': stacked_tiles,
+            'player_state': stacked_player,
+            'checkpoint': self._latest_checkpoint,
+        }
+
+    def pause(self):
+        """Forward pause to underlying env."""
+        self.env.pause()
+
+    def unpause(self):
+        """Forward unpause to underlying env."""
+        self.env.unpause()
+
+    def close(self):
+        """Forward close to underlying env."""
+        self.env.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
 def make_server_env(num_bots: int = 63, num_servers: int = 1, **kwargs) -> TeeWorldsServerEnv:
     """Create a server-side Teeworlds environment."""
     config = ServerEnvConfig(**kwargs)

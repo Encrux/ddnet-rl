@@ -30,7 +30,7 @@ from torch.utils.tensorboard import SummaryWriter
 torch.set_float32_matmul_precision('high')
 
 from teeworlds_vec_env import TeeWorldsVecEnv, EnvConfig
-from teeworlds_server_env import TeeWorldsServerEnv, ServerEnvConfig
+from teeworlds_server_env import TeeWorldsServerEnv, ServerEnvConfig, FrameStackWrapper
 from ppo_hybrid import PPOAgent, PPOConfig
 
 
@@ -132,6 +132,12 @@ def parse_args():
                         choices=["mlp", "cnn"],
                         help="Encoder for embedded tiles: mlp or cnn (default: mlp)")
 
+    # Frame stacking for temporal context
+    parser.add_argument("--n-frame-stack", type=int, default=1,
+                        help="Number of tile frames to stack (default: 1, expensive - use for multi-agent)")
+    parser.add_argument("--n-player-state-stack", type=int, default=8,
+                        help="Number of player state frames to stack (default: 8, cheap - enables timing)")
+
     # Curriculum learning
     parser.add_argument("--curriculum", type=str, default="none",
                         choices=["none", "map", "segment", "both"],
@@ -175,6 +181,12 @@ def main():
     # Log hyperparameters
     writer.add_text("hyperparameters", str(vars(args)))
 
+    # Frame/player state stacking requires CNN mode (dict observations)
+    needs_stacking = args.n_frame_stack > 1 or args.n_player_state_stack > 1
+    if needs_stacking and not args.use_cnn:
+        print(f"Note: Stacking (tiles={args.n_frame_stack}, player={args.n_player_state_stack}) requires CNN mode, enabling --use-cnn")
+        args.use_cnn = True
+
     # Create environment
     if args.server_side:
         # Server-side bots (more efficient, single process per server)
@@ -196,9 +208,24 @@ def main():
         env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)
         # Update num_envs to reflect total bots for training loop
         args.num_envs = total_bots
+
+        # Wrap with frame stacking for temporal context
+        if args.n_frame_stack > 1 or args.n_player_state_stack > 1:
+            env = FrameStackWrapper(env, n_tile_stack=args.n_frame_stack, n_player_state_stack=args.n_player_state_stack)
+            tile_coverage_ms = args.n_frame_stack * args.frame_skip * 20
+            player_coverage_ms = args.n_player_state_stack * args.frame_skip * 20
+            print(f"Frame stacking: tiles={args.n_frame_stack} (~{tile_coverage_ms}ms), player_state={args.n_player_state_stack} (~{player_coverage_ms}ms)")
     else:
         # Client-side environments (original approach)
         print(f"\nCreating CLIENT-SIDE environment with {args.num_envs} parallel instances...")
+
+        # Stacking not supported for client-side, disable if requested
+        if args.n_frame_stack > 1 or args.n_player_state_stack > 1:
+            print("Warning: Frame stacking not supported for client-side. Use --server-side for stacking.")
+            print("         Disabling stacking for this run.")
+            args.n_frame_stack = 1
+            args.n_player_state_stack = 1
+
         env_config = EnvConfig(
             ddnet_path=args.ddnet_path,
             server_path=args.server_path,
@@ -239,6 +266,8 @@ def main():
             use_embeddings=args.use_embeddings,
             tile_embed_dim=args.tile_embed_dim,
             tile_encoder=args.tile_encoder,
+            n_frame_stack=args.n_frame_stack,
+            n_player_state_stack=args.n_player_state_stack,
         )
 
         # Create agent
