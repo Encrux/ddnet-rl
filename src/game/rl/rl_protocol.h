@@ -182,7 +182,7 @@ struct SBotData
 // New size: 32 + 1400 + 16 = 1448 bytes
 static_assert(sizeof(SBotData) == 1448, "SBotData must be 1448 bytes");
 
-// Full shared memory layout
+// Legacy interleaved shared memory layout (kept for reference)
 // Total size: 32 + 128 * 1448 = 185,376 bytes (~181 KB)
 #pragma pack(push, 1)
 struct SServerRLSharedMemory
@@ -191,6 +191,34 @@ struct SServerRLSharedMemory
 	SBotData m_aBots[MAX_RL_BOTS];
 };
 #pragma pack(pop)
+
+// ============================================================================
+// Contiguous Shared Memory Layout (Optimized for batch operations)
+// ============================================================================
+
+// New contiguous layout - single memcpy for actions/observations
+// Layout: [Header][Action0..N][Obs0..N][Reward0..N][Done0..N][Truncated0..N][BotClientId0..N]
+#pragma pack(push, 1)
+struct SContiguousServerRLShm
+{
+	SServerRLHeader m_Header;
+	SAction m_aActions[MAX_RL_BOTS];
+	SStructuredObservation m_aObservations[MAX_RL_BOTS];
+	float m_aRewards[MAX_RL_BOTS];
+	int32_t m_aDones[MAX_RL_BOTS];
+	int32_t m_aTruncated[MAX_RL_BOTS];
+	int32_t m_aBotClientIds[MAX_RL_BOTS];
+};
+#pragma pack(pop)
+
+// Helper functions for contiguous layout offsets (used by Python)
+inline constexpr size_t GetContiguousActionsOffset() { return sizeof(SServerRLHeader); }
+inline constexpr size_t GetContiguousObservationsOffset() { return GetContiguousActionsOffset() + MAX_RL_BOTS * sizeof(SAction); }
+inline constexpr size_t GetContiguousRewardsOffset() { return GetContiguousObservationsOffset() + MAX_RL_BOTS * sizeof(SStructuredObservation); }
+inline constexpr size_t GetContiguousDonesOffset() { return GetContiguousRewardsOffset() + MAX_RL_BOTS * sizeof(float); }
+inline constexpr size_t GetContiguousTruncatedOffset() { return GetContiguousDonesOffset() + MAX_RL_BOTS * sizeof(int32_t); }
+inline constexpr size_t GetContiguousBotClientIdsOffset() { return GetContiguousTruncatedOffset() + MAX_RL_BOTS * sizeof(int32_t); }
+inline constexpr size_t GetContiguousServerRLShmSize() { return sizeof(SContiguousServerRLShm); }
 
 // ============================================================================
 // Helper Functions

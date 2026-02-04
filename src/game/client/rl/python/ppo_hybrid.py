@@ -513,6 +513,7 @@ class PPOAgent:
 
         # Rollout storage
         self.num_steps = self.config.num_steps
+        self._use_async_transfers = False  # Will be set by _init_async_transfer_buffers
         self._init_storage()
 
         # Training stats
@@ -565,6 +566,121 @@ class PPOAgent:
         self.dones = torch.zeros((ns, ne), device=self.device)
         self.values = torch.zeros((ns, ne), device=self.device)
 
+        # Initialize async transfer buffers for CUDA
+        self._init_async_transfer_buffers()
+
+    def _init_async_transfer_buffers(self):
+        """Initialize pinned memory buffers for async GPU transfers."""
+        if self.device.type != "cuda":
+            self._use_async_transfers = False
+            return
+
+        self._use_async_transfers = True
+        ne = self.num_envs
+        cfg = self.config
+        n_tile_stack = cfg.n_frame_stack
+        n_player_stack = cfg.n_player_state_stack
+
+        # Create CUDA streams for async transfers
+        self._transfer_stream = torch.cuda.Stream()
+
+        if self.use_embeddings:
+            # Embedding mode: tiles as long
+            self._pinned_tiles = torch.empty(
+                (ne, cfg.tile_grid_height, cfg.tile_grid_width),
+                dtype=torch.long, pin_memory=True
+            )
+            self._gpu_tiles = torch.empty(
+                (ne, cfg.tile_grid_height, cfg.tile_grid_width),
+                dtype=torch.long, device=self.device
+            )
+        elif self.use_cnn:
+            # CNN mode: tiles as float with frame stacking
+            self._pinned_tiles = torch.empty(
+                (ne, n_tile_stack, cfg.tile_grid_height, cfg.tile_grid_width),
+                dtype=torch.float32, pin_memory=True
+            )
+            self._gpu_tiles = torch.empty(
+                (ne, n_tile_stack, cfg.tile_grid_height, cfg.tile_grid_width),
+                dtype=torch.float32, device=self.device
+            )
+        else:
+            # Flat mode
+            self._pinned_obs = torch.empty(
+                (ne, self.obs_dim), dtype=torch.float32, pin_memory=True
+            )
+            self._gpu_obs = torch.empty(
+                (ne, self.obs_dim), dtype=torch.float32, device=self.device
+            )
+
+        # Player state and checkpoint buffers (for CNN/embedding modes)
+        # Note: These match the raw observation dimensions, NOT the stacked dimensions
+        # Frame stacking is handled by FrameStackWrapper before calling get_action
+        if self.use_cnn or self.use_embeddings:
+            # For inference: use stacked dimensions (what get_action receives)
+            self._pinned_player = torch.empty(
+                (ne, cfg.player_state_dim * n_player_stack),
+                dtype=torch.float32, pin_memory=True
+            )
+            self._pinned_checkpoint = torch.empty(
+                (ne, cfg.checkpoint_dim), dtype=torch.float32, pin_memory=True
+            )
+            self._gpu_player = torch.empty(
+                (ne, cfg.player_state_dim * n_player_stack),
+                dtype=torch.float32, device=self.device
+            )
+            self._gpu_checkpoint = torch.empty(
+                (ne, cfg.checkpoint_dim), dtype=torch.float32, device=self.device
+            )
+
+        # Action output buffer (for D2H transfer)
+        total_discrete = len(cfg.discrete_dims)
+        self._pinned_discrete = torch.empty(
+            (ne, total_discrete), dtype=torch.long, pin_memory=True
+        )
+        self._pinned_continuous = torch.empty(
+            (ne, cfg.continuous_dim), dtype=torch.float32, pin_memory=True
+        )
+
+    def _obs_to_tensor_async(self, obs: Union[np.ndarray, Dict[str, np.ndarray]]) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Convert numpy observation to tensor using async pinned memory transfers."""
+        if not self._use_async_transfers:
+            return self._obs_to_tensor(obs)
+
+        if isinstance(obs, dict):
+            # Copy to pinned memory (fast CPU memcpy)
+            if self.use_embeddings:
+                self._pinned_tiles.copy_(torch.from_numpy(obs['tiles']))
+            else:
+                self._pinned_tiles.copy_(torch.from_numpy(obs['tiles']))
+            self._pinned_player.copy_(torch.from_numpy(obs['player_state']))
+            self._pinned_checkpoint.copy_(torch.from_numpy(obs['checkpoint']))
+
+            # Async H2D transfer on separate stream
+            with torch.cuda.stream(self._transfer_stream):
+                self._gpu_tiles.copy_(self._pinned_tiles, non_blocking=True)
+                self._gpu_player.copy_(self._pinned_player, non_blocking=True)
+                self._gpu_checkpoint.copy_(self._pinned_checkpoint, non_blocking=True)
+
+            # Sync default stream with transfer stream
+            torch.cuda.current_stream().wait_stream(self._transfer_stream)
+
+            return {
+                'tiles': self._gpu_tiles,
+                'player_state': self._gpu_player,
+                'checkpoint': self._gpu_checkpoint,
+            }
+        else:
+            # Flat observation
+            self._pinned_obs.copy_(torch.from_numpy(obs))
+
+            with torch.cuda.stream(self._transfer_stream):
+                self._gpu_obs.copy_(self._pinned_obs, non_blocking=True)
+
+            torch.cuda.current_stream().wait_stream(self._transfer_stream)
+
+            return self._gpu_obs
+
     def _obs_to_tensor(self, obs: Union[np.ndarray, Dict[str, np.ndarray]]) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """Convert numpy observation to tensor(s)."""
         # Auto-detect observation type (dict vs flat array)
@@ -609,6 +725,8 @@ class PPOAgent:
         """
         Get action for given observation.
 
+        Uses async pinned memory transfers on CUDA for reduced latency.
+
         Args:
             obs: Either flat numpy array or dict with 'tiles', 'player_state', 'checkpoint'
             deterministic: If True, use mode instead of sampling
@@ -618,16 +736,39 @@ class PPOAgent:
             log_prob: Log probability numpy array
             value: Value estimate numpy array
         """
-        obs_t = self._obs_to_tensor(obs)
+        # Use async transfers on CUDA, sync transfers on CPU
+        if self._use_async_transfers:
+            obs_t = self._obs_to_tensor_async(obs)
+        else:
+            obs_t = self._obs_to_tensor(obs)
 
         action, log_prob, _ = self.actor.get_action(obs_t, deterministic=deterministic)
         value = self.critic(obs_t)
 
-        return (
-            {k: v.cpu().numpy() for k, v in action.items()},
-            log_prob.cpu().numpy(),
-            value.squeeze(-1).cpu().numpy()
-        )
+        # Use async D2H transfer for actions on CUDA
+        if self._use_async_transfers:
+            with torch.cuda.stream(self._transfer_stream):
+                self._transfer_stream.wait_stream(torch.cuda.current_stream())
+                self._pinned_discrete.copy_(action['discrete'], non_blocking=True)
+                self._pinned_continuous.copy_(action['continuous'], non_blocking=True)
+
+            # Sync to ensure action data is ready
+            self._transfer_stream.synchronize()
+
+            return (
+                {
+                    'discrete': self._pinned_discrete.numpy().copy(),
+                    'continuous': self._pinned_continuous.numpy().copy()
+                },
+                log_prob.cpu().numpy(),
+                value.squeeze(-1).cpu().numpy()
+            )
+        else:
+            return (
+                {k: v.cpu().numpy() for k, v in action.items()},
+                log_prob.cpu().numpy(),
+                value.squeeze(-1).cpu().numpy()
+            )
 
     @torch.no_grad()
     def get_action_profiled(

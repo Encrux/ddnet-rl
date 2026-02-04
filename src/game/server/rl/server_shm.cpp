@@ -43,7 +43,7 @@ bool CServerShm::Init(int NumBots, int ServerIndex)
 	}
 
 	m_NumBots = NumBots;
-	m_ShmSize = sizeof(SServerRLSharedMemory);
+	m_ShmSize = sizeof(SContiguousServerRLShm);
 
 	// Use indexed name from protocol (shm_open expects name without /dev/shm/)
 	GetServerRLShmName(m_aShmPath, sizeof(m_aShmPath), ServerIndex);
@@ -141,28 +141,115 @@ SServerRLHeader *CServerShm::GetHeader()
 {
 	if(!m_pShmPtr)
 		return nullptr;
-	return &static_cast<SServerRLSharedMemory *>(m_pShmPtr)->m_Header;
+	return &static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_Header;
 }
 
 const SServerRLHeader *CServerShm::GetHeader() const
 {
 	if(!m_pShmPtr)
 		return nullptr;
-	return &static_cast<const SServerRLSharedMemory *>(m_pShmPtr)->m_Header;
+	return &static_cast<const SContiguousServerRLShm *>(m_pShmPtr)->m_Header;
 }
 
-SBotData *CServerShm::GetBotData(int BotIndex)
+// Contiguous layout accessors
+SAction *CServerShm::GetAction(int BotIndex)
 {
 	if(!m_pShmPtr || BotIndex < 0 || BotIndex >= m_NumBots)
 		return nullptr;
-	return &static_cast<SServerRLSharedMemory *>(m_pShmPtr)->m_aBots[BotIndex];
+	return &static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aActions[BotIndex];
+}
+
+const SAction *CServerShm::GetAction(int BotIndex) const
+{
+	if(!m_pShmPtr || BotIndex < 0 || BotIndex >= m_NumBots)
+		return nullptr;
+	return &static_cast<const SContiguousServerRLShm *>(m_pShmPtr)->m_aActions[BotIndex];
+}
+
+SStructuredObservation *CServerShm::GetObservation(int BotIndex)
+{
+	if(!m_pShmPtr || BotIndex < 0 || BotIndex >= m_NumBots)
+		return nullptr;
+	return &static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aObservations[BotIndex];
+}
+
+const SStructuredObservation *CServerShm::GetObservation(int BotIndex) const
+{
+	if(!m_pShmPtr || BotIndex < 0 || BotIndex >= m_NumBots)
+		return nullptr;
+	return &static_cast<const SContiguousServerRLShm *>(m_pShmPtr)->m_aObservations[BotIndex];
+}
+
+float *CServerShm::GetReward(int BotIndex)
+{
+	if(!m_pShmPtr || BotIndex < 0 || BotIndex >= m_NumBots)
+		return nullptr;
+	return &static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aRewards[BotIndex];
+}
+
+int32_t *CServerShm::GetDone(int BotIndex)
+{
+	if(!m_pShmPtr || BotIndex < 0 || BotIndex >= m_NumBots)
+		return nullptr;
+	return &static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aDones[BotIndex];
+}
+
+int32_t *CServerShm::GetTruncated(int BotIndex)
+{
+	if(!m_pShmPtr || BotIndex < 0 || BotIndex >= m_NumBots)
+		return nullptr;
+	return &static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aTruncated[BotIndex];
+}
+
+int32_t *CServerShm::GetBotClientId(int BotIndex)
+{
+	if(!m_pShmPtr || BotIndex < 0 || BotIndex >= m_NumBots)
+		return nullptr;
+	return &static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aBotClientIds[BotIndex];
+}
+
+// Batch accessors
+SAction *CServerShm::GetActionsArray()
+{
+	if(!m_pShmPtr)
+		return nullptr;
+	return static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aActions;
+}
+
+SStructuredObservation *CServerShm::GetObservationsArray()
+{
+	if(!m_pShmPtr)
+		return nullptr;
+	return static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aObservations;
+}
+
+float *CServerShm::GetRewardsArray()
+{
+	if(!m_pShmPtr)
+		return nullptr;
+	return static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aRewards;
+}
+
+int32_t *CServerShm::GetDonesArray()
+{
+	if(!m_pShmPtr)
+		return nullptr;
+	return static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aDones;
+}
+
+// Legacy accessor (deprecated)
+SBotData *CServerShm::GetBotData(int BotIndex)
+{
+	(void)BotIndex;
+	dbg_msg("rl/server", "WARNING: GetBotData() deprecated - use contiguous accessors");
+	return nullptr;
 }
 
 const SBotData *CServerShm::GetBotData(int BotIndex) const
 {
-	if(!m_pShmPtr || BotIndex < 0 || BotIndex >= m_NumBots)
-		return nullptr;
-	return &static_cast<const SServerRLSharedMemory *>(m_pShmPtr)->m_aBots[BotIndex];
+	(void)BotIndex;
+	dbg_msg("rl/server", "WARNING: GetBotData() deprecated - use contiguous accessors");
+	return nullptr;
 }
 
 void CServerShm::SignalObservationsReady()

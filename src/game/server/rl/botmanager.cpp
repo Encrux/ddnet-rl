@@ -198,11 +198,11 @@ bool CBotManager::CreateBotPlayers()
 		// Initialize reward state
 		ResetRewardState(i);
 
-		// Store bot client ID in shared memory
-		SBotData *pBotData = m_pShm->GetBotData(i);
-		if(pBotData)
+		// Store bot client ID in shared memory (contiguous layout)
+		int32_t *pBotClientId = m_pShm->GetBotClientId(i);
+		if(pBotClientId)
 		{
-			pBotData->m_BotClientId = NextClientId;
+			*pBotClientId = NextClientId;
 		}
 
 		NextClientId--;
@@ -340,16 +340,16 @@ void CBotManager::InjectBotInputs()
 	{
 		int ClientId = m_aClientIds[i];
 
-		// Get action from shared memory
-		SBotData *pBotData = m_pShm->GetBotData(i);
-		if(!pBotData)
+		// Get action from shared memory (contiguous layout)
+		SAction *pAction = m_pShm->GetAction(i);
+		if(!pAction)
 			continue;
 
 		// Check if we have a real player for this bot
 		CPlayer *pPlayer = m_pGameContext->m_apPlayers[ClientId];
 
 		// Handle reset request
-		if(pBotData->m_Action.m_Reset)
+		if(pAction->m_Reset)
 		{
 			if(pPlayer && pPlayer->GetCharacter())
 			{
@@ -364,11 +364,11 @@ void CBotManager::InjectBotInputs()
 				pPlayer->ForceSpawn(SpawnPos);
 			}
 			ResetRewardState(i);
-			pBotData->m_Action.m_Reset = 0;
+			pAction->m_Reset = 0;
 		}
 
 		// Convert action to input
-		ConvertActionToInput(&pBotData->m_Action, &m_aBotInputs[i]);
+		ConvertActionToInput(pAction, &m_aBotInputs[i]);
 
 		// Only inject if we have a real player
 		if(pPlayer)
@@ -427,9 +427,13 @@ void CBotManager::ExtractObservations()
 	for(int i = 0; i < m_NumBots; i++)
 	{
 		int ClientId = m_aClientIds[i];
-		SBotData *pBotData = m_pShm->GetBotData(i);
 
-		if(!pBotData)
+		// Get pointers from contiguous layout
+		SStructuredObservation *pObs = m_pShm->GetObservation(i);
+		float *pReward = m_pShm->GetReward(i);
+		int32_t *pDone = m_pShm->GetDone(i);
+
+		if(!pObs || !pReward || !pDone)
 			continue;
 
 		// Check if we have a real player with character
@@ -445,7 +449,6 @@ void CBotManager::ExtractObservations()
 			// On non-decision ticks, we still need to calculate reward for accumulation
 			if(IsDecisionTick)
 			{
-				SStructuredObservation *pObs = &pBotData->m_Observation;
 				mem_zero(pObs, sizeof(SStructuredObservation));
 
 				pObs->m_Tick = CurrentTick;
@@ -550,8 +553,8 @@ void CBotManager::ExtractObservations()
 		// On decision tick, write accumulated reward to shared memory and reset
 		if(IsDecisionTick)
 		{
-			pBotData->m_Reward = m_aAccumulatedRewards[i];
-			pBotData->m_Done = IsDone ? 1 : 0;
+			*pReward = m_aAccumulatedRewards[i];
+			*pDone = IsDone ? 1 : 0;
 			m_aAccumulatedRewards[i] = 0.0f; // Reset for next cycle
 		}
 	}
