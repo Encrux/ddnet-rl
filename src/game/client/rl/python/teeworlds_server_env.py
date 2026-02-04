@@ -57,6 +57,8 @@ def _warmup_numba_jit():
 
     # Create tiny dummy arrays to trigger JIT compilation
     n = 2
+
+    # Legacy interleaved layout warmup
     raw = np.zeros(n * 1448, dtype=np.uint8)
     features = np.zeros((n, 68), dtype=np.float32)
     player_state = np.zeros((n, 15), dtype=np.float32)
@@ -67,6 +69,10 @@ def _warmup_numba_jit():
     # Trigger compilation (first call compiles, subsequent calls are fast)
     _parse_flat_obs_numba(raw, n, features, rewards, dones)
     _parse_cnn_obs_numba(raw, n, player_state, checkpoint, rewards, dones)
+
+    # Contiguous layout warmup
+    obs_arr = np.zeros((n, 1400), dtype=np.uint8)
+    _parse_flat_obs_contiguous_numba(obs_arr, n, features, rewards, dones)
 
 # Constants matching C++ rl_protocol.h
 MAX_RL_BOTS = 128
@@ -82,7 +88,17 @@ def get_shm_path(server_index: int = 0) -> str:
 HEADER_SIZE = 32        # SServerRLHeader
 ACTION_SIZE = 32        # SAction
 OBS_SIZE = 1400         # SStructuredObservation (CNN-optimized: tiles + player + checkpoint)
-BOT_DATA_SIZE = 1448    # SBotData (32 + 1400 + 16)
+BOT_DATA_SIZE = 1448    # SBotData (legacy interleaved layout: 32 + 1400 + 16)
+
+# Contiguous layout offsets (matches SContiguousServerRLShm in rl_protocol.h)
+# Layout: [Header][Action0..N][Obs0..N][Reward0..N][Done0..N][Truncated0..N][BotClientId0..N]
+CONTIGUOUS_ACTIONS_OFFSET = HEADER_SIZE  # 32
+CONTIGUOUS_OBS_OFFSET = CONTIGUOUS_ACTIONS_OFFSET + MAX_RL_BOTS * ACTION_SIZE  # 32 + 128*32 = 4128
+CONTIGUOUS_REWARDS_OFFSET = CONTIGUOUS_OBS_OFFSET + MAX_RL_BOTS * OBS_SIZE  # 4128 + 128*1400 = 183328
+CONTIGUOUS_DONES_OFFSET = CONTIGUOUS_REWARDS_OFFSET + MAX_RL_BOTS * 4  # 183328 + 512 = 183840
+CONTIGUOUS_TRUNCATED_OFFSET = CONTIGUOUS_DONES_OFFSET + MAX_RL_BOTS * 4  # 183840 + 512 = 184352
+CONTIGUOUS_BOTIDS_OFFSET = CONTIGUOUS_TRUNCATED_OFFSET + MAX_RL_BOTS * 4  # 184352 + 512 = 184864
+CONTIGUOUS_SHM_SIZE = CONTIGUOUS_BOTIDS_OFFSET + MAX_RL_BOTS * 4  # 184864 + 512 = 185376
 
 # Global reference for signal handler cleanup
 _active_server_env: Optional['TeeWorldsServerEnv'] = None
@@ -301,6 +317,85 @@ def _parse_cnn_obs_numba(raw_arr: np.ndarray, n: int,
         checkpoint[i, 3] = total_cp / 20.0
 
 
+# ============================================================================
+# Contiguous Layout Numba Functions (for optimized SHM layout)
+# ============================================================================
+
+@jit(nopython=True, cache=True, parallel=True)
+def _parse_flat_obs_contiguous_numba(obs_arr: np.ndarray, n: int,
+                                       features: np.ndarray,
+                                       rewards: np.ndarray,
+                                       dones: np.ndarray) -> None:
+    """Parse flat observations from CONTIGUOUS layout for MLP policy.
+
+    obs_arr: shape (n, 1400) - contiguous observations
+    rewards/dones: already extracted from contiguous arrays
+    """
+    # Offsets within SStructuredObservation (1400 bytes)
+    LOCAL_PLAYER = 8
+    TILES = LOCAL_PLAYER + 36  # 44
+    EXTRA_STATE = TILES + 1333  # 1377
+    CHECKPOINT = EXTRA_STATE + 4  # 1381
+
+    # Tile grid center (player at center of 43x31)
+    TILE_CENTER_X = 21
+    TILE_CENTER_Y = 15
+
+    for i in prange(n):
+        # Local player floats (pos_x, pos_y, vel_x, vel_y)
+        pf = obs_arr[i, LOCAL_PLAYER:LOCAL_PLAYER + 16].view(np.float32)
+        pos_x, pos_y, vel_x, vel_y = pf[0], pf[1], pf[2], pf[3]
+
+        # Single-byte fields from SPlayerObs
+        direction = np.int8(obs_arr[i, LOCAL_PLAYER + 16])
+        jumped = obs_arr[i, LOCAL_PLAYER + 17]
+        hook_state = obs_arr[i, LOCAL_PLAYER + 18]
+        is_frozen = obs_arr[i, LOCAL_PLAYER + 30]
+        health = obs_arr[i, LOCAL_PLAYER + 32]
+        armor = obs_arr[i, LOCAL_PLAYER + 33]
+
+        # Extra state
+        is_grounded = obs_arr[i, EXTRA_STATE]
+        jumps_remaining = obs_arr[i, EXTRA_STATE + 1]
+        can_hook = obs_arr[i, EXTRA_STATE + 2]
+
+        # Player state (15 features) - indices 0-14
+        features[i, 0] = vel_x / 50.0
+        features[i, 1] = vel_y / 50.0
+        features[i, 2] = float(is_grounded)
+        features[i, 3] = float(jumps_remaining) / 2.0
+        features[i, 4] = float(can_hook)
+        features[i, 5] = float(direction)
+        features[i, 6] = float(is_frozen)
+        features[i, 7] = 1.0 if hook_state == 0 else 0.0
+        features[i, 8] = 1.0 if hook_state == 1 else 0.0
+        features[i, 9] = 1.0 if hook_state == 2 else 0.0
+        features[i, 10] = 0.0  # aim placeholder
+        features[i, 11] = 0.0  # aim placeholder
+        features[i, 12] = float(health) / 10.0
+        features[i, 13] = float(armor) / 10.0
+        features[i, 14] = float(jumped) / 3.0
+
+        # Checkpoint (4 features) - indices 15-18
+        cp_floats = obs_arr[i, CHECKPOINT:CHECKPOINT + 8].view(np.float32)
+        cp_ints = obs_arr[i, CHECKPOINT + 8:CHECKPOINT + 16].view(np.int32)
+        cp_x, cp_y = cp_floats[0], cp_floats[1]
+        cp_idx, total_cp = float(cp_ints[0]), float(cp_ints[1])
+
+        features[i, 15] = max(-1.0, min(1.0, (cp_x - pos_x) / 2000.0))
+        features[i, 16] = max(-1.0, min(1.0, (cp_y - pos_y) / 2000.0))
+        features[i, 17] = cp_idx / max(1.0, total_cp)
+        features[i, 18] = total_cp / 20.0
+
+        # 7x7 center tile crop (49 features) - indices 19-67
+        for ty in range(7):
+            for tx in range(7):
+                grid_y = TILE_CENTER_Y - 3 + ty  # 12 to 18
+                grid_x = TILE_CENTER_X - 3 + tx  # 18 to 24
+                tile_offset = TILES + grid_y * 43 + grid_x
+                features[i, 19 + ty * 7 + tx] = float(obs_arr[i, tile_offset]) / 15.0
+
+
 def _parse_tiles_vectorized(raw_arr: np.ndarray, n: int, tiles: np.ndarray) -> None:
     """Parse tile grids using numpy strided view (no Python loops).
 
@@ -347,8 +442,11 @@ class ServerShmClient:
         self.shm_mmap = None
         self._connected = False
 
-        # Calculate total shared memory size
-        self.total_size = HEADER_SIZE + (BOT_DATA_SIZE * MAX_RL_BOTS)
+        # Use contiguous layout size
+        self.total_size = CONTIGUOUS_SHM_SIZE
+
+        # Pre-allocate action buffer for single memcpy writes
+        self._action_buffer = np.zeros((MAX_RL_BOTS, 8), dtype=np.int32)
 
     def connect(self, max_retries: int = 60, retry_delay: float = 0.5) -> bool:
         """Connect to the server's shared memory."""
@@ -437,7 +535,7 @@ class ServerShmClient:
         self.shm_mmap.write(action_data)
 
     def write_actions_batch(self, actions: Dict[str, np.ndarray]):
-        """Write actions for all bots at once (vectorized, single memcpy)."""
+        """Write actions for all bots at once (single memcpy with contiguous layout)."""
         discrete_actions = actions['discrete']  # (num_bots, 3)
         continuous_actions = actions['continuous']  # (num_bots, 2)
         resets = actions.get('reset', np.zeros(self.num_bots, dtype=np.int32))
@@ -454,28 +552,21 @@ class ServerShmClient:
         aim_x = (np.cos(aim_angle) * aim_magnitude * 200).astype(np.int32)
         aim_y = (np.sin(aim_angle) * aim_magnitude * 200).astype(np.int32)
 
-        # Build action array: SAction is 8 int32s = 32 bytes
-        # Layout: direction, jump, hook, fire, aim_x, aim_y, weapon, reset
-        action_array = np.zeros((n, 8), dtype=np.int32)
-        action_array[:, 0] = direction
-        action_array[:, 1] = jump
-        action_array[:, 2] = hook
-        action_array[:, 3] = 0  # fire
-        action_array[:, 4] = aim_x
-        action_array[:, 5] = aim_y
-        action_array[:, 6] = 0  # weapon
-        action_array[:, 7] = resets.astype(np.int32)
+        # Build action array using pre-allocated buffer
+        # SAction layout: direction, jump, hook, fire, aim_x, aim_y, weapon, reset
+        self._action_buffer[:n, 0] = direction
+        self._action_buffer[:n, 1] = jump
+        self._action_buffer[:n, 2] = hook
+        self._action_buffer[:n, 3] = 0  # fire
+        self._action_buffer[:n, 4] = aim_x
+        self._action_buffer[:n, 5] = aim_y
+        self._action_buffer[:n, 6] = 0  # weapon
+        self._action_buffer[:n, 7] = resets.astype(np.int32)
 
-        # Write all actions with strided writes (actions are at start of each SBotData)
-        # Each SBotData is 3072 bytes, action is first 32 bytes
-        raw_bytes = action_array.tobytes()  # n * 32 bytes contiguous
-
-        # Write each action to the correct offset (unfortunately can't do single write due to stride)
-        # But we can minimize syscalls by writing all actions first, then seeking once
-        for i in range(n):
-            offset = HEADER_SIZE + (i * BOT_DATA_SIZE)
-            self.shm_mmap.seek(offset)
-            self.shm_mmap.write(raw_bytes[i*32:(i+1)*32])
+        # CONTIGUOUS LAYOUT: Single memcpy for all actions!
+        # Actions are stored contiguously at CONTIGUOUS_ACTIONS_OFFSET
+        self.shm_mmap.seek(CONTIGUOUS_ACTIONS_OFFSET)
+        self.shm_mmap.write(self._action_buffer[:n].tobytes())
 
     def read_observation(self, bot_index: int) -> Tuple[Optional[StructuredObservation], float, bool]:
         """Read observation, reward, and done flag for a specific bot."""
@@ -517,37 +608,36 @@ class ServerShmClient:
     def read_observations_batch_fast(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Read all observations as flat arrays directly (for MLP policy).
 
-        Optimized for speed - only parses what's needed for MLP:
-        - Player state (15 features)
-        - Checkpoint (4 features)
-        - 7x7 center tile crop (49 features)
+        Uses CONTIGUOUS layout for efficient single-memcpy reads.
 
         Returns:
-            observations: np.ndarray of shape (num_bots, 68)
+            observations: np.ndarray of shape (num_bots, 68) - 15 player + 4 checkpoint + 49 tiles
             rewards: np.ndarray of shape (num_bots,)
             dones: np.ndarray of shape (num_bots,)
         """
         n = self.num_bots
 
-        # Read ALL bot data at once (single memcpy)
-        start_offset = HEADER_SIZE
-        total_size = n * BOT_DATA_SIZE
-        self.shm_mmap.seek(start_offset)
-        raw = self.shm_mmap.read(total_size)
+        # CONTIGUOUS LAYOUT: Read observations, rewards, dones in single memcpy ops
+        self.shm_mmap.seek(CONTIGUOUS_OBS_OFFSET)
+        obs_raw = self.shm_mmap.read(n * OBS_SIZE)
+        obs_arr = np.frombuffer(obs_raw, dtype=np.uint8).reshape(n, OBS_SIZE).copy()
 
-        # Create numpy array from bytes (copy needed for Numba)
-        raw_arr = np.frombuffer(raw, dtype=np.uint8).copy()
+        # Read rewards (contiguous float32 array)
+        self.shm_mmap.seek(CONTIGUOUS_REWARDS_OFFSET)
+        rewards = np.frombuffer(self.shm_mmap.read(n * 4), dtype=np.float32).copy()
+
+        # Read dones (contiguous int32 array)
+        self.shm_mmap.seek(CONTIGUOUS_DONES_OFFSET)
+        dones = np.frombuffer(self.shm_mmap.read(n * 4), dtype=np.int32).astype(np.bool_)
 
         # Pre-allocate outputs - 68 features (15 + 4 + 49)
         features = np.zeros((n, 68), dtype=np.float32)
-        rewards = np.zeros(n, dtype=np.float32)
-        dones = np.zeros(n, dtype=np.bool_)
 
         # Use Numba-accelerated parsing if available
         if NUMBA_AVAILABLE:
-            _parse_flat_obs_numba(raw_arr, n, features, rewards, dones)
+            _parse_flat_obs_contiguous_numba(obs_arr, n, features, rewards, dones)
         else:
-            self._parse_observations_flat_python(raw, raw_arr, n, features, rewards, dones)
+            self._parse_observations_flat_contiguous_python(obs_arr, n, features)
 
         # Sanitize NaN/inf (fast in-place operation)
         np.nan_to_num(features, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -557,66 +647,61 @@ class ServerShmClient:
     def read_observations_batch_cnn(self) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
         """Read all observations as dict for CNN policy.
 
-        Uses pure numpy with strided views for maximum speed (no Numba, no loops).
+        Uses CONTIGUOUS layout for efficient single-memcpy reads.
         """
-        from numpy.lib.stride_tricks import as_strided
-        import struct
-
         n = self.num_bots
 
-        # Read ALL bot data at once
-        self.shm_mmap.seek(HEADER_SIZE)
-        raw = self.shm_mmap.read(n * BOT_DATA_SIZE)
-        raw_arr = np.frombuffer(raw, dtype=np.uint8)
+        # CONTIGUOUS LAYOUT: Read observations, rewards, dones in single memcpy ops
+        # Observations are stored contiguously at CONTIGUOUS_OBS_OFFSET
+        self.shm_mmap.seek(CONTIGUOUS_OBS_OFFSET)
+        obs_raw = self.shm_mmap.read(n * OBS_SIZE)
+        obs_arr = np.frombuffer(obs_raw, dtype=np.uint8).reshape(n, OBS_SIZE)
 
-        # Offsets within SBotData (1448 bytes)
-        OBS_START = 32
-        LOCAL_PLAYER = OBS_START + 8  # 40
-        TILES = LOCAL_PLAYER + 36      # 76
-        EXTRA_STATE = TILES + 1333     # 1409
-        CHECKPOINT = EXTRA_STATE + 4   # 1413
-        REWARD_OFF = OBS_START + 1400  # 1432
-        DONE_OFF = REWARD_OFF + 4      # 1436
+        # Read rewards (contiguous float32 array)
+        self.shm_mmap.seek(CONTIGUOUS_REWARDS_OFFSET)
+        rewards = np.frombuffer(self.shm_mmap.read(n * 4), dtype=np.float32).copy()
+
+        # Read dones (contiguous int32 array)
+        self.shm_mmap.seek(CONTIGUOUS_DONES_OFFSET)
+        dones = np.frombuffer(self.shm_mmap.read(n * 4), dtype=np.int32).astype(np.bool_)
 
         # Pre-allocate outputs
         tiles = np.empty((n, 1, 31, 43), dtype=np.float32)
         player_state = np.empty((n, 15), dtype=np.float32)
         checkpoint = np.empty((n, 4), dtype=np.float32)
-        rewards = np.empty(n, dtype=np.float32)
-        dones = np.empty(n, dtype=np.bool_)
 
-        # ===== TILES: strided view, no loop =====
-        tile_view = as_strided(raw_arr[TILES:], shape=(n, 31, 43), strides=(BOT_DATA_SIZE, 43, 1), writeable=False)
-        np.multiply(tile_view, 1.0/15.0, out=tiles[:, 0, :, :], casting='unsafe')
+        # Offsets within SStructuredObservation (1400 bytes)
+        # Layout: header(8) + LocalPlayer(36) + TileGrid(1333) + ExtraState(4) + Checkpoint(16) + Reserved(3)
+        LOCAL_PLAYER = 8
+        TILES = LOCAL_PLAYER + 36  # 44
+        EXTRA_STATE = TILES + 1333  # 1377
+        CHECKPOINT = EXTRA_STATE + 4  # 1381
 
-        # ===== REWARDS & DONES: extract using struct (strided view can't reinterpret dtype) =====
-        for i in range(n):
-            base = i * BOT_DATA_SIZE
-            rewards[i] = struct.unpack_from('<f', raw, base + REWARD_OFF)[0]
-            dones[i] = struct.unpack_from('<i', raw, base + DONE_OFF)[0] != 0
+        # ===== TILES: direct contiguous access, no strided view needed! =====
+        # Each observation's tiles are at bytes 44:1377 (1333 bytes = 31*43)
+        tile_data = obs_arr[:, TILES:TILES+1333].reshape(n, 31, 43)
+        np.multiply(tile_data, 1.0/15.0, out=tiles[:, 0, :, :], casting='unsafe')
 
-        # ===== PLAYER STATE: byte fields via strided view, float fields via struct =====
-        bot_offsets = np.arange(n) * BOT_DATA_SIZE
+        # ===== PLAYER STATE: extract from contiguous observations =====
+        # Float fields: pos_x(4), pos_y(4), vel_x(4), vel_y(4) at LOCAL_PLAYER
+        float_data = obs_arr[:, LOCAL_PLAYER:LOCAL_PLAYER+16].view(np.float32).reshape(n, 4)
+        pos_x = float_data[:, 0]
+        pos_y = float_data[:, 1]
+        vel_x = float_data[:, 2]
+        vel_y = float_data[:, 3]
 
-        # Float fields (vel_x, vel_y, pos_x, pos_y) - use struct for float reinterpretation
-        pos_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER)[0] for o in bot_offsets], dtype=np.float32)
-        pos_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 4)[0] for o in bot_offsets], dtype=np.float32)
-        vel_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 8)[0] for o in bot_offsets], dtype=np.float32)
-        vel_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 12)[0] for o in bot_offsets], dtype=np.float32)
+        # Byte fields
+        direction = obs_arr[:, LOCAL_PLAYER + 16].astype(np.int8).astype(np.float32)
+        jumped = obs_arr[:, LOCAL_PLAYER + 17].astype(np.float32)
+        hook_state = obs_arr[:, LOCAL_PLAYER + 18].astype(np.float32)
+        is_frozen = obs_arr[:, LOCAL_PLAYER + 30].astype(np.float32)
+        health = obs_arr[:, LOCAL_PLAYER + 32].astype(np.float32)
+        armor = obs_arr[:, LOCAL_PLAYER + 33].astype(np.float32)
 
-        # Byte fields via strided view (fast vectorized)
-        def byte_col(offset):
-            return as_strided(raw_arr[offset:], shape=(n,), strides=(BOT_DATA_SIZE,), writeable=False)
-
-        direction = byte_col(LOCAL_PLAYER + 16).astype(np.int8).astype(np.float32)
-        jumped = byte_col(LOCAL_PLAYER + 17).astype(np.float32)
-        hook_state = byte_col(LOCAL_PLAYER + 18).astype(np.float32)
-        is_frozen = byte_col(LOCAL_PLAYER + 30).astype(np.float32)
-        health = byte_col(LOCAL_PLAYER + 32).astype(np.float32)
-        armor = byte_col(LOCAL_PLAYER + 33).astype(np.float32)
-        is_grounded = byte_col(EXTRA_STATE).astype(np.float32)
-        jumps_remaining = byte_col(EXTRA_STATE + 1).astype(np.float32)
-        can_hook = byte_col(EXTRA_STATE + 2).astype(np.float32)
+        # Extra state
+        is_grounded = obs_arr[:, EXTRA_STATE].astype(np.float32)
+        jumps_remaining = obs_arr[:, EXTRA_STATE + 1].astype(np.float32)
+        can_hook = obs_arr[:, EXTRA_STATE + 2].astype(np.float32)
 
         player_state[:, 0] = vel_x / 50.0
         player_state[:, 1] = vel_y / 50.0
@@ -635,10 +720,12 @@ class ServerShmClient:
         player_state[:, 14] = jumped / 3.0
 
         # ===== CHECKPOINT =====
-        cp_x = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT)[0] for o in bot_offsets], dtype=np.float32)
-        cp_y = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT + 4)[0] for o in bot_offsets], dtype=np.float32)
-        cp_idx = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 8)[0] for o in bot_offsets], dtype=np.float32)
-        total_cp = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 12)[0] for o in bot_offsets], dtype=np.float32)
+        cp_floats = obs_arr[:, CHECKPOINT:CHECKPOINT+8].view(np.float32).reshape(n, 2)
+        cp_ints = obs_arr[:, CHECKPOINT+8:CHECKPOINT+16].view(np.int32).reshape(n, 2)
+        cp_x = cp_floats[:, 0]
+        cp_y = cp_floats[:, 1]
+        cp_idx = cp_ints[:, 0].astype(np.float32)
+        total_cp = cp_ints[:, 1].astype(np.float32)
 
         checkpoint[:, 0] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
         checkpoint[:, 1] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
@@ -655,7 +742,7 @@ class ServerShmClient:
         """Read all observations for embedding-based policy.
 
         Returns raw tile IDs (int64) for nn.Embedding lookup instead of normalized floats.
-        Uses pure numpy with strided views for maximum speed.
+        Uses CONTIGUOUS layout for efficient single-memcpy reads.
 
         Returns:
             observations: Dict with:
@@ -665,65 +752,53 @@ class ServerShmClient:
             rewards: np.ndarray of shape (n,)
             dones: np.ndarray of shape (n,)
         """
-        from numpy.lib.stride_tricks import as_strided
-        import struct
-
         n = self.num_bots
 
-        # Read ALL bot data at once
-        self.shm_mmap.seek(HEADER_SIZE)
-        raw = self.shm_mmap.read(n * BOT_DATA_SIZE)
-        raw_arr = np.frombuffer(raw, dtype=np.uint8)
+        # CONTIGUOUS LAYOUT: Read observations, rewards, dones in single memcpy ops
+        self.shm_mmap.seek(CONTIGUOUS_OBS_OFFSET)
+        obs_raw = self.shm_mmap.read(n * OBS_SIZE)
+        obs_arr = np.frombuffer(obs_raw, dtype=np.uint8).reshape(n, OBS_SIZE)
 
-        # Offsets within SBotData (1448 bytes)
-        OBS_START = 32
-        LOCAL_PLAYER = OBS_START + 8  # 40
-        TILES = LOCAL_PLAYER + 36      # 76
-        EXTRA_STATE = TILES + 1333     # 1409
-        CHECKPOINT = EXTRA_STATE + 4   # 1413
-        REWARD_OFF = OBS_START + 1400  # 1432
-        DONE_OFF = REWARD_OFF + 4      # 1436
+        # Read rewards (contiguous float32 array)
+        self.shm_mmap.seek(CONTIGUOUS_REWARDS_OFFSET)
+        rewards = np.frombuffer(self.shm_mmap.read(n * 4), dtype=np.float32).copy()
+
+        # Read dones (contiguous int32 array)
+        self.shm_mmap.seek(CONTIGUOUS_DONES_OFFSET)
+        dones = np.frombuffer(self.shm_mmap.read(n * 4), dtype=np.int32).astype(np.bool_)
 
         # Pre-allocate outputs
-        # Tiles as int64 for embedding lookup (no normalization)
         tiles = np.empty((n, 31, 43), dtype=np.int64)
         player_state = np.empty((n, 15), dtype=np.float32)
         checkpoint = np.empty((n, 4), dtype=np.float32)
-        rewards = np.empty(n, dtype=np.float32)
-        dones = np.empty(n, dtype=np.bool_)
 
-        # ===== TILES: strided view, cast to int64 for embedding =====
-        tile_view = as_strided(raw_arr[TILES:], shape=(n, 31, 43), strides=(BOT_DATA_SIZE, 43, 1), writeable=False)
-        tiles[:] = tile_view.astype(np.int64)
+        # Offsets within SStructuredObservation (1400 bytes)
+        LOCAL_PLAYER = 8
+        TILES = LOCAL_PLAYER + 36  # 44
+        EXTRA_STATE = TILES + 1333  # 1377
+        CHECKPOINT = EXTRA_STATE + 4  # 1381
 
-        # ===== REWARDS & DONES =====
-        for i in range(n):
-            base = i * BOT_DATA_SIZE
-            rewards[i] = struct.unpack_from('<f', raw, base + REWARD_OFF)[0]
-            dones[i] = struct.unpack_from('<i', raw, base + DONE_OFF)[0] != 0
+        # ===== TILES: cast to int64 for embedding =====
+        tile_data = obs_arr[:, TILES:TILES+1333].reshape(n, 31, 43)
+        tiles[:] = tile_data.astype(np.int64)
 
         # ===== PLAYER STATE =====
-        bot_offsets = np.arange(n) * BOT_DATA_SIZE
+        float_data = obs_arr[:, LOCAL_PLAYER:LOCAL_PLAYER+16].view(np.float32).reshape(n, 4)
+        pos_x = float_data[:, 0]
+        pos_y = float_data[:, 1]
+        vel_x = float_data[:, 2]
+        vel_y = float_data[:, 3]
 
-        # Float fields via struct
-        pos_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER)[0] for o in bot_offsets], dtype=np.float32)
-        pos_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 4)[0] for o in bot_offsets], dtype=np.float32)
-        vel_x = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 8)[0] for o in bot_offsets], dtype=np.float32)
-        vel_y = np.array([struct.unpack_from('<f', raw, int(o) + LOCAL_PLAYER + 12)[0] for o in bot_offsets], dtype=np.float32)
+        direction = obs_arr[:, LOCAL_PLAYER + 16].astype(np.int8).astype(np.float32)
+        jumped = obs_arr[:, LOCAL_PLAYER + 17].astype(np.float32)
+        hook_state = obs_arr[:, LOCAL_PLAYER + 18].astype(np.float32)
+        is_frozen = obs_arr[:, LOCAL_PLAYER + 30].astype(np.float32)
+        health = obs_arr[:, LOCAL_PLAYER + 32].astype(np.float32)
+        armor = obs_arr[:, LOCAL_PLAYER + 33].astype(np.float32)
 
-        # Byte fields via strided view
-        def byte_col(offset):
-            return as_strided(raw_arr[offset:], shape=(n,), strides=(BOT_DATA_SIZE,), writeable=False)
-
-        direction = byte_col(LOCAL_PLAYER + 16).astype(np.int8).astype(np.float32)
-        jumped = byte_col(LOCAL_PLAYER + 17).astype(np.float32)
-        hook_state = byte_col(LOCAL_PLAYER + 18).astype(np.float32)
-        is_frozen = byte_col(LOCAL_PLAYER + 30).astype(np.float32)
-        health = byte_col(LOCAL_PLAYER + 32).astype(np.float32)
-        armor = byte_col(LOCAL_PLAYER + 33).astype(np.float32)
-        is_grounded = byte_col(EXTRA_STATE).astype(np.float32)
-        jumps_remaining = byte_col(EXTRA_STATE + 1).astype(np.float32)
-        can_hook = byte_col(EXTRA_STATE + 2).astype(np.float32)
+        is_grounded = obs_arr[:, EXTRA_STATE].astype(np.float32)
+        jumps_remaining = obs_arr[:, EXTRA_STATE + 1].astype(np.float32)
+        can_hook = obs_arr[:, EXTRA_STATE + 2].astype(np.float32)
 
         player_state[:, 0] = vel_x / 50.0
         player_state[:, 1] = vel_y / 50.0
@@ -742,10 +817,12 @@ class ServerShmClient:
         player_state[:, 14] = jumped / 3.0
 
         # ===== CHECKPOINT =====
-        cp_x = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT)[0] for o in bot_offsets], dtype=np.float32)
-        cp_y = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT + 4)[0] for o in bot_offsets], dtype=np.float32)
-        cp_idx = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 8)[0] for o in bot_offsets], dtype=np.float32)
-        total_cp = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 12)[0] for o in bot_offsets], dtype=np.float32)
+        cp_floats = obs_arr[:, CHECKPOINT:CHECKPOINT+8].view(np.float32).reshape(n, 2)
+        cp_ints = obs_arr[:, CHECKPOINT+8:CHECKPOINT+16].view(np.int32).reshape(n, 2)
+        cp_x = cp_floats[:, 0]
+        cp_y = cp_floats[:, 1]
+        cp_idx = cp_ints[:, 0].astype(np.float32)
+        total_cp = cp_ints[:, 1].astype(np.float32)
 
         checkpoint[:, 0] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
         checkpoint[:, 1] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
@@ -921,6 +998,75 @@ class ServerShmClient:
                 grid_x = TILE_CENTER_X - 3 + tx
                 tile_idx = grid_y * 43 + grid_x
                 features[:, 19 + ty * 7 + tx] = raw_arr[bot_offsets + TILES + tile_idx].astype(np.float32) / 15.0
+
+    def _parse_observations_flat_contiguous_python(self, obs_arr: np.ndarray, n: int,
+                                                     features: np.ndarray) -> None:
+        """Fallback Python parsing for flat MLP observations with CONTIGUOUS layout."""
+        # Offsets within SStructuredObservation (1400 bytes)
+        LOCAL_PLAYER = 8
+        TILES = LOCAL_PLAYER + 36  # 44
+        EXTRA_STATE = TILES + 1333  # 1377
+        CHECKPOINT = EXTRA_STATE + 4  # 1381
+
+        # Tile grid center
+        TILE_CENTER_X = 21
+        TILE_CENTER_Y = 15
+
+        # Extract player floats
+        float_data = obs_arr[:, LOCAL_PLAYER:LOCAL_PLAYER+16].view(np.float32).reshape(n, 4)
+        pos_x = float_data[:, 0]
+        pos_y = float_data[:, 1]
+        vel_x = float_data[:, 2]
+        vel_y = float_data[:, 3]
+
+        # Single-byte fields
+        direction = obs_arr[:, LOCAL_PLAYER + 16].astype(np.int8).astype(np.float32)
+        jumped = obs_arr[:, LOCAL_PLAYER + 17].astype(np.float32)
+        hook_state = obs_arr[:, LOCAL_PLAYER + 18].astype(np.float32)
+        is_frozen = obs_arr[:, LOCAL_PLAYER + 30].astype(np.float32)
+        health = obs_arr[:, LOCAL_PLAYER + 32].astype(np.float32)
+        armor = obs_arr[:, LOCAL_PLAYER + 33].astype(np.float32)
+        is_grounded = obs_arr[:, EXTRA_STATE].astype(np.float32)
+        jumps_remaining = obs_arr[:, EXTRA_STATE + 1].astype(np.float32)
+        can_hook = obs_arr[:, EXTRA_STATE + 2].astype(np.float32)
+
+        # Player state (15 features) - indices 0-14
+        features[:, 0] = vel_x / 50.0
+        features[:, 1] = vel_y / 50.0
+        features[:, 2] = is_grounded
+        features[:, 3] = jumps_remaining / 2.0
+        features[:, 4] = can_hook
+        features[:, 5] = direction
+        features[:, 6] = is_frozen
+        features[:, 7] = (hook_state == 0).astype(np.float32)
+        features[:, 8] = (hook_state == 1).astype(np.float32)
+        features[:, 9] = (hook_state == 2).astype(np.float32)
+        features[:, 10] = 0.0
+        features[:, 11] = 0.0
+        features[:, 12] = health / 10.0
+        features[:, 13] = armor / 10.0
+        features[:, 14] = jumped / 3.0
+
+        # Checkpoint (4 features) - indices 15-18
+        cp_floats = obs_arr[:, CHECKPOINT:CHECKPOINT+8].view(np.float32).reshape(n, 2)
+        cp_ints = obs_arr[:, CHECKPOINT+8:CHECKPOINT+16].view(np.int32).reshape(n, 2)
+        cp_x = cp_floats[:, 0]
+        cp_y = cp_floats[:, 1]
+        cp_idx = cp_ints[:, 0].astype(np.float32)
+        total_cp = cp_ints[:, 1].astype(np.float32)
+
+        features[:, 15] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
+        features[:, 16] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
+        features[:, 17] = cp_idx / np.maximum(1.0, total_cp)
+        features[:, 18] = total_cp / 20.0
+
+        # 7x7 center tile crop (49 features) - indices 19-67
+        for ty in range(7):
+            for tx in range(7):
+                grid_y = TILE_CENTER_Y - 3 + ty
+                grid_x = TILE_CENTER_X - 3 + tx
+                tile_idx = TILES + grid_y * 43 + grid_x
+                features[:, 19 + ty * 7 + tx] = obs_arr[:, tile_idx].astype(np.float32) / 15.0
 
     def wait_for_observations(self, timeout: float = 1.0) -> bool:
         """Wait for server to signal observations are ready."""

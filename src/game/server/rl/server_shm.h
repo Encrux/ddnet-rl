@@ -29,13 +29,29 @@ public:
 	// Get number of bots
 	int NumBots() const { return m_NumBots; }
 
-	// Access bot data
-	SBotData *GetBotData(int BotIndex);
-	const SBotData *GetBotData(int BotIndex) const;
-
 	// Access header
 	SServerRLHeader *GetHeader();
 	const SServerRLHeader *GetHeader() const;
+
+	// Contiguous layout accessors (preferred for performance)
+	SAction *GetAction(int BotIndex);
+	const SAction *GetAction(int BotIndex) const;
+	SStructuredObservation *GetObservation(int BotIndex);
+	const SStructuredObservation *GetObservation(int BotIndex) const;
+	float *GetReward(int BotIndex);
+	int32_t *GetDone(int BotIndex);
+	int32_t *GetTruncated(int BotIndex);
+	int32_t *GetBotClientId(int BotIndex);
+
+	// Batch accessors
+	SAction *GetActionsArray();
+	SStructuredObservation *GetObservationsArray();
+	float *GetRewardsArray();
+	int32_t *GetDonesArray();
+
+	// Legacy accessor (deprecated - use contiguous accessors)
+	SBotData *GetBotData(int BotIndex);
+	const SBotData *GetBotData(int BotIndex) const;
 
 	// Synchronization
 	void SignalObservationsReady();  // Server has written observations
