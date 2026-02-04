@@ -629,6 +629,63 @@ class PPOAgent:
             value.squeeze(-1).cpu().numpy()
         )
 
+    @torch.no_grad()
+    def get_action_profiled(
+        self,
+        obs: Union[np.ndarray, Dict[str, np.ndarray]],
+        deterministic: bool = False,
+        cuda_sync: bool = True
+    ) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, Dict[str, float]]:
+        """
+        Get action with detailed timing breakdown.
+
+        Args:
+            obs: Either flat numpy array or dict with 'tiles', 'player_state', 'checkpoint'
+            deterministic: If True, use mode instead of sampling
+            cuda_sync: If True, synchronize CUDA for accurate timing
+
+        Returns:
+            action: Dict with 'discrete' and 'continuous' numpy arrays
+            log_prob: Log probability numpy array
+            value: Value estimate numpy array
+            timings: Dict with timing breakdown in milliseconds
+        """
+        import time
+        timings = {}
+
+        # Numpy -> Tensor conversion
+        t0 = time.perf_counter()
+        obs_t = self._obs_to_tensor(obs)
+        if cuda_sync and self.device.type == "cuda":
+            torch.cuda.synchronize()
+        timings["obs_to_tensor_ms"] = (time.perf_counter() - t0) * 1000
+
+        # Actor forward
+        t0 = time.perf_counter()
+        action, log_prob, _ = self.actor.get_action(obs_t, deterministic=deterministic)
+        if cuda_sync and self.device.type == "cuda":
+            torch.cuda.synchronize()
+        timings["actor_forward_ms"] = (time.perf_counter() - t0) * 1000
+
+        # Critic forward
+        t0 = time.perf_counter()
+        value = self.critic(obs_t)
+        if cuda_sync and self.device.type == "cuda":
+            torch.cuda.synchronize()
+        timings["critic_forward_ms"] = (time.perf_counter() - t0) * 1000
+
+        # Tensor -> Numpy conversion
+        t0 = time.perf_counter()
+        action_np = {k: v.cpu().numpy() for k, v in action.items()}
+        log_prob_np = log_prob.cpu().numpy()
+        value_np = value.squeeze(-1).cpu().numpy()
+        timings["tensor_to_numpy_ms"] = (time.perf_counter() - t0) * 1000
+
+        # Total
+        timings["total_ms"] = sum(timings.values())
+
+        return action_np, log_prob_np, value_np, timings
+
     def store_transition(
         self,
         step: int,

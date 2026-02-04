@@ -1699,6 +1699,68 @@ class TeeWorldsServerEnv:
         for shm_client in self.shm_clients:
             shm_client.signal_unpause()
 
+    def get_detailed_timings(self) -> dict:
+        """
+        Get detailed timing breakdown for profiling.
+
+        Returns timing stats accumulated since last reset_timing_stats() call,
+        or since environment creation.
+
+        Returns:
+            dict with timing breakdown in milliseconds:
+                - write_actions_ms: Average time to write actions
+                - wait_for_obs_ms: Average time waiting for server
+                - read_obs_ms: Average time to read observations
+                - total_step_ms: Average total step time
+                - step_count: Number of steps since last reset
+                - per_server_wait_ms: List of avg wait times per server
+                - per_server_read_ms: List of avg read times per server
+        """
+        if not hasattr(self, '_step_count') or self._step_count == 0:
+            return {
+                "write_actions_ms": 0.0,
+                "wait_for_obs_ms": 0.0,
+                "read_obs_ms": 0.0,
+                "total_step_ms": 0.0,
+                "step_count": 0,
+                "per_server_wait_ms": [],
+                "per_server_read_ms": [],
+            }
+
+        n = self._step_count
+        result = {
+            "write_actions_ms": self._timing_write / n * 1000,
+            "wait_for_obs_ms": self._timing_wait / n * 1000,
+            "read_obs_ms": self._timing_read / n * 1000,
+            "total_step_ms": self._timing_total / n * 1000,
+            "step_count": n,
+        }
+
+        # Add per-server timings if available
+        if hasattr(self, '_server_wait_times') and self._server_wait_times:
+            result["per_server_wait_ms"] = [wt / n for wt in self._server_wait_times]
+        else:
+            result["per_server_wait_ms"] = []
+
+        if hasattr(self, '_server_read_times') and self._server_read_times:
+            result["per_server_read_ms"] = [rt / n for rt in self._server_read_times]
+        else:
+            result["per_server_read_ms"] = []
+
+        return result
+
+    def reset_timing_stats(self):
+        """Reset timing statistics for fresh profiling."""
+        self._step_count = 0
+        self._timing_write = 0.0
+        self._timing_wait = 0.0
+        self._timing_read = 0.0
+        self._timing_total = 0.0
+        if hasattr(self, '_server_wait_times'):
+            self._server_wait_times = [0.0] * len(self._server_wait_times)
+        if hasattr(self, '_server_read_times'):
+            self._server_read_times = [0.0] * len(self._server_read_times)
+
     def close(self):
         """Clean up all resources."""
         if self._closed:

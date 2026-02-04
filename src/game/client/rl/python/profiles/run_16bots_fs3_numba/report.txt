@@ -1,0 +1,33 @@
+============================================================
+DDNet-RL Training Profile Report
+============================================================
+
+Samples: 500 steps
+
+Per-Step Breakdown (ms):
+-------------------------------------------------------
+Component              Mean      P50      P95      P99
+-------------------------------------------------------
+Inference             4.05     3.30     9.66    12.56  (20%)
+Env Step             11.88    13.52    15.84    16.24  (60%)
+Buffer                4.04     1.76    11.25    12.60  (20%)
+Total                19.97    19.99    28.95    30.83  
+
+Update Breakdown (ms):
+-------------------------------------------------------
+Rollout            2559.84  2562.15  2569.33  2571.57
+PPO Update          269.71   176.81   678.01   934.81
+
+Theoretical Max FPS:
+----------------------------------------
+  At P50 latency: 50 FPS
+  At P95 latency: 35 FPS
+  At P99 latency: 32 FPS
+
+Bottleneck Analysis:
+----------------------------------------
+  -> Balanced: Inference 20%, Env 60%
+     Both components contribute significantly
+  -> High inference variance (CV=0.51): possible JIT or GC stalls
+
+============================================================

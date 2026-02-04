@@ -1,0 +1,32 @@
+============================================================
+DDNet-RL Training Profile Report
+============================================================
+
+Samples: 200 steps
+
+Per-Step Breakdown (ms):
+-------------------------------------------------------
+Component              Mean      P50      P95      P99
+-------------------------------------------------------
+Inference             5.49     5.42     6.09     6.74  (25%)
+Env Step             14.94    14.26    18.95    23.83  (68%)
+Buffer                1.54     1.46     2.08     3.20  (7%)
+Total                21.98    21.39    25.68    30.85  
+
+Update Breakdown (ms):
+-------------------------------------------------------
+Rollout            2902.33  2902.33  2941.12  2944.57
+PPO Update         5594.86  5594.86  5985.81  6020.56
+
+Theoretical Max FPS:
+----------------------------------------
+  At P50 latency: 47 FPS
+  At P95 latency: 39 FPS
+  At P99 latency: 32 FPS
+
+Bottleneck Analysis:
+----------------------------------------
+  -> Environment-bound: Env step is 68% of step time
+     Recommendations: Check server tick rate, reduce obs size
+
+============================================================

@@ -32,6 +32,7 @@ torch.set_float32_matmul_precision('high')
 from teeworlds_vec_env import TeeWorldsVecEnv, EnvConfig
 from teeworlds_server_env import TeeWorldsServerEnv, ServerEnvConfig, FrameStackWrapper
 from ppo_hybrid import PPOAgent, PPOConfig
+from profiler import TrainingProfiler, ProfileConfig, StepTimings
 
 
 def parse_args():
@@ -148,6 +149,20 @@ def parse_args():
                         help="Starting difficulty category for curriculum")
     parser.add_argument("--success-threshold", type=float, default=0.8,
                         help="Success rate threshold to advance curriculum")
+
+    # Profiling
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling mode")
+    parser.add_argument("--profile-warmup", type=int, default=10,
+                        help="Steps to skip before profiling (JIT warmup)")
+    parser.add_argument("--profile-steps", type=int, default=100,
+                        help="Number of steps to profile")
+    parser.add_argument("--profile-output", type=str, default="./profiles",
+                        help="Directory for profiling output")
+    parser.add_argument("--profile-tensorboard", action="store_true",
+                        help="Export PyTorch profiler traces for TensorBoard")
+    parser.add_argument("--profile-memory", action="store_true",
+                        help="Track CUDA memory allocation")
 
     return parser.parse_args()
 
@@ -287,6 +302,21 @@ def main():
         # This triggers CUDA graph capture for reduce-overhead mode
         agent.warmup(obs, num_iters=10)
 
+        # Initialize profiler
+        profile_config = ProfileConfig(
+            enabled=args.profile,
+            warmup_steps=args.profile_warmup,
+            profile_steps=args.profile_steps,
+            output_dir=args.profile_output,
+            tensorboard=args.profile_tensorboard,
+            memory=args.profile_memory,
+        )
+        profiler = TrainingProfiler(profile_config)
+
+        # Start PyTorch profiler if deep profiling requested
+        if args.profile and args.profile_tensorboard:
+            profiler.start_torch_profiler()
+
         # Training loop
         num_updates = args.total_timesteps // (args.num_steps * args.num_envs)
         print(f"\nStarting training for {args.total_timesteps:,} timesteps ({num_updates} updates)")
@@ -326,25 +356,45 @@ def main():
                     param_group['lr'] = lr
 
             # Collect rollout
+            step_timings_list = []  # For profiling
             for step in range(args.num_steps):
                 global_step += args.num_envs
+                t_step_start = time.perf_counter()
 
                 # Get action (optionally pause during inference to prevent stale actions)
                 if args.server_side and args.sync_inference:
                     env.pause()
-                t_inf_start = time.time()
+                t_inf_start = time.perf_counter()
                 action, log_prob, value = agent.get_action(obs)
-                t_inf = time.time() - t_inf_start
+                t_inf = time.perf_counter() - t_inf_start
                 if t_inf > 0.5:  # Log slow inference (>500ms)
                     print(f"  [SLOW] Inference took {t_inf*1000:.0f}ms at step {step}")
                 if args.server_side and args.sync_inference:
                     env.unpause()
 
                 # Environment step
+                t_env_start = time.perf_counter()
                 next_obs, reward, done, truncated, infos = env.step(action)
+                t_env = time.perf_counter() - t_env_start
 
                 # Store transition
+                t_buffer_start = time.perf_counter()
                 agent.store_transition(step, obs, action, log_prob, reward, done, value)
+                t_buffer = time.perf_counter() - t_buffer_start
+
+                t_step_total = time.perf_counter() - t_step_start
+
+                # Record profiling data
+                if args.profile:
+                    step_timing = StepTimings(
+                        inference_ms=t_inf * 1000,
+                        env_step_ms=t_env * 1000,
+                        buffer_store_ms=t_buffer * 1000,
+                        total_ms=t_step_total * 1000,
+                    )
+                    step_timings_list.append(step_timing)
+                    profiler.record_step_timing(step_timing)
+                    profiler.increment_step()
 
                 obs = next_obs
 
@@ -364,6 +414,14 @@ def main():
                 env.unpause()
             update_time = time.time() - update_start
             agent.global_step = global_step
+
+            # Record update timing for profiler
+            if args.profile:
+                profiler.record_update_timing(rollout_time * 1000, update_time * 1000)
+
+                # Print step timing summary every update when profiling
+                if step_timings_list:
+                    profiler.print_step_summary(step_timings_list)
 
             # Console logging (every update)
             elapsed = time.time() - start_time
@@ -418,6 +476,12 @@ def main():
         total_time = time.time() - start_time
         print(f"Total time: {total_time / 3600:.2f} hours")
         print(f"Average FPS: {global_step / total_time:.0f}")
+
+        # Export profiling results
+        if args.profile:
+            profiler.export_timing_stats()
+            if args.profile_tensorboard:
+                profiler.stop_torch_profiler()
 
     except KeyboardInterrupt:
         print("\n\nTraining interrupted by user")
