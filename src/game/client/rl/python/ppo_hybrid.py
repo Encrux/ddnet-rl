@@ -575,11 +575,6 @@ class PPOAgent:
             self._use_async_transfers = False
             return
 
-        # TEMPORARILY DISABLED: async transfers cause memory corruption at large scale
-        # TODO: Debug the copy_() dtype mismatch with pinned buffers
-        self._use_async_transfers = False
-        return
-
         self._use_async_transfers = True
         ne = self.num_envs
         cfg = self.config
@@ -750,15 +745,12 @@ class PPOAgent:
         action, log_prob, _ = self.actor.get_action(obs_t, deterministic=deterministic)
         value = self.critic(obs_t)
 
-        # Use async D2H transfer for actions on CUDA
+        # Use pinned memory for faster D2H transfer on CUDA
         if self._use_async_transfers:
-            with torch.cuda.stream(self._transfer_stream):
-                self._transfer_stream.wait_stream(torch.cuda.current_stream())
-                self._pinned_discrete.copy_(action['discrete'], non_blocking=True)
-                self._pinned_continuous.copy_(action['continuous'], non_blocking=True)
-
-            # Sync to ensure action data is ready
-            self._transfer_stream.synchronize()
+            # Synchronous copy to pinned memory (copy_() implicitly syncs on the source tensor)
+            # Faster than .cpu() because it avoids allocation and uses pre-pinned DMA buffers
+            self._pinned_discrete.copy_(action['discrete'])
+            self._pinned_continuous.copy_(action['continuous'])
 
             return (
                 {
