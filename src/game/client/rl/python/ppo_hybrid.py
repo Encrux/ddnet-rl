@@ -575,6 +575,11 @@ class PPOAgent:
             self._use_async_transfers = False
             return
 
+        # TEMPORARILY DISABLED: async transfers cause memory corruption at large scale
+        # TODO: Debug the copy_() dtype mismatch with pinned buffers
+        self._use_async_transfers = False
+        return
+
         self._use_async_transfers = True
         ne = self.num_envs
         cfg = self.config
@@ -783,7 +788,14 @@ class PPOAgent:
         """Store a transition in the rollout buffer."""
         if self.use_embeddings:
             # Embedding mode: tiles as long for nn.Embedding
-            self.obs_tiles[step] = torch.from_numpy(obs['tiles']).long().to(self.device)
+            tiles = obs['tiles']
+            # Validate tile values for embedding (must be 0-255 for nn.Embedding(256, ...))
+            if tiles.min() < 0 or tiles.max() >= 256:
+                raise ValueError(
+                    f"[store_transition] Invalid tile values at step {step}: "
+                    f"min={tiles.min()}, max={tiles.max()} (expected 0-255)"
+                )
+            self.obs_tiles[step] = torch.from_numpy(tiles).long().to(self.device)
             self.obs_player_state[step] = torch.from_numpy(obs['player_state']).to(self.device)
             self.obs_checkpoint[step] = torch.from_numpy(obs['checkpoint']).to(self.device)
         elif self.use_cnn:
@@ -793,7 +805,18 @@ class PPOAgent:
         else:
             self.obs_buffer[step] = torch.from_numpy(obs).to(self.device)
 
-        self.discrete_actions[step] = torch.from_numpy(action['discrete']).to(self.device)
+        # Validate discrete actions before storing
+        discrete = action['discrete']
+        for i, dim in enumerate(self.config.discrete_dims):
+            if (discrete[:, i] < 0).any() or (discrete[:, i] >= dim).any():
+                invalid_mask = (discrete[:, i] < 0) | (discrete[:, i] >= dim)
+                invalid_vals = discrete[invalid_mask, i].tolist()
+                raise ValueError(
+                    f"[store_transition] Invalid discrete action at step {step}, dim {i} (max={dim-1}): "
+                    f"found values {invalid_vals[:5]}{'...' if len(invalid_vals) > 5 else ''}"
+                )
+
+        self.discrete_actions[step] = torch.from_numpy(discrete).to(self.device)
         self.continuous_actions[step] = torch.from_numpy(action['continuous']).to(self.device)
         self.log_probs[step] = torch.from_numpy(log_prob).to(self.device)
         self.rewards[step] = torch.from_numpy(reward).to(self.device)
@@ -915,6 +938,17 @@ class PPOAgent:
                 mb_advantages = b_advantages[mb_indices]
                 mb_returns = b_returns[mb_indices]
                 mb_values = b_values[mb_indices]
+
+                # Validate discrete actions are within bounds (debug CUDA scatter/gather errors)
+                for i, dim in enumerate(cfg.discrete_dims):
+                    action_col = mb_action['discrete'][:, i]
+                    if (action_col < 0).any() or (action_col >= dim).any():
+                        invalid_mask = (action_col < 0) | (action_col >= dim)
+                        invalid_vals = action_col[invalid_mask].cpu().tolist()
+                        raise ValueError(
+                            f"Invalid discrete action for dimension {i} (max={dim-1}): "
+                            f"found values {invalid_vals[:5]}{'...' if len(invalid_vals) > 5 else ''}"
+                        )
 
                 # Forward pass (with optional mixed precision)
                 with torch.amp.autocast("cuda", enabled=self.use_amp):

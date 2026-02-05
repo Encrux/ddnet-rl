@@ -19,12 +19,104 @@ import os
 import sys
 import time
 import argparse
+import signal
+import atexit
+import subprocess
 from datetime import datetime
 from typing import Optional
 
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
+
+
+# Global reference to environment for cleanup
+_global_env = None
+_global_writer = None
+_cleanup_done = False
+
+
+def cleanup_system_resources():
+    """
+    Force cleanup of DDNet servers and SHM files.
+    This is the nuclear option - kills all DDNet-Server processes and removes SHM files.
+    """
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
+
+    print("\n[Cleanup] Cleaning up system resources...")
+
+    # Kill any DDNet-Server processes
+    try:
+        result = subprocess.run(
+            ["pkill", "-9", "-f", "DDNet-Server"],
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            print("[Cleanup] Killed DDNet-Server processes")
+    except Exception as e:
+        print(f"[Cleanup] pkill failed: {e}")
+
+    # Remove SHM files
+    try:
+        import glob
+        shm_files = glob.glob("/dev/shm/ddnet_rl_server*")
+        for f in shm_files:
+            try:
+                os.unlink(f)
+            except:
+                pass
+        if shm_files:
+            print(f"[Cleanup] Removed {len(shm_files)} SHM files")
+    except Exception as e:
+        print(f"[Cleanup] SHM cleanup failed: {e}")
+
+    print("[Cleanup] Done")
+
+
+def graceful_cleanup():
+    """Try graceful cleanup first, then force cleanup."""
+    global _global_env, _global_writer
+
+    # Try graceful close first
+    if _global_env is not None:
+        try:
+            _global_env.close()
+        except:
+            pass
+        _global_env = None
+
+    if _global_writer is not None:
+        try:
+            _global_writer.close()
+        except:
+            pass
+        _global_writer = None
+
+    # Always force cleanup to ensure nothing is left behind
+    cleanup_system_resources()
+
+
+def signal_handler(signum, frame):
+    """Handle termination signals."""
+    sig_name = signal.Signals(signum).name
+    print(f"\n[Signal] Received {sig_name}, cleaning up...")
+    graceful_cleanup()
+    sys.exit(128 + signum)
+
+
+# Register atexit handler (catches normal exits, exceptions, sys.exit)
+atexit.register(graceful_cleanup)
+
+# Register signal handlers
+for sig in [signal.SIGTERM, signal.SIGINT, signal.SIGHUP]:
+    try:
+        signal.signal(sig, signal_handler)
+    except (OSError, ValueError):
+        pass  # Some signals may not be available on all platforms
 
 # Enable TF32 for faster matmul on Ampere+ GPUs (RTX 30xx/40xx)
 torch.set_float32_matmul_precision('high')
@@ -160,6 +252,8 @@ def get_device(device_str: str) -> torch.device:
 
 
 def main():
+    global _global_env, _global_writer
+
     args = parse_args()
 
     # Setup device
@@ -177,6 +271,7 @@ def main():
 
     # Create TensorBoard writer
     writer = SummaryWriter(run_dir)
+    _global_writer = writer
 
     # Log hyperparameters
     writer.add_text("hyperparameters", str(vars(args)))
@@ -206,12 +301,14 @@ def main():
         )
         # Use default server_path (resolved relative to teeworlds_server_env.py)
         env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)
+        _global_env = env  # Register for global cleanup
         # Update num_envs to reflect total bots for training loop
         args.num_envs = total_bots
 
         # Wrap with frame stacking for temporal context
         if args.n_frame_stack > 1 or args.n_player_state_stack > 1:
             env = FrameStackWrapper(env, n_tile_stack=args.n_frame_stack, n_player_state_stack=args.n_player_state_stack)
+            _global_env = env  # Update global reference to wrapper
             tile_coverage_ms = args.n_frame_stack * args.frame_skip * 20
             player_coverage_ms = args.n_player_state_stack * args.frame_skip * 20
             print(f"Frame stacking: tiles={args.n_frame_stack} (~{tile_coverage_ms}ms), player_state={args.n_player_state_stack} (~{player_coverage_ms}ms)")
@@ -234,6 +331,7 @@ def main():
             max_episode_steps=args.max_episode_steps,
         )
         env = TeeWorldsVecEnv(num_envs=args.num_envs, config=env_config)
+        _global_env = env  # Register for global cleanup
 
     try:
         # Get observation dimension
@@ -441,9 +539,19 @@ def main():
                 pass
 
     finally:
-        # Cleanup
-        env.close()
-        writer.close()
+        # Cleanup - use graceful cleanup with forced resource cleanup
+        _global_env = None  # Clear reference so atexit doesn't double-close
+        _global_writer = None
+        try:
+            env.close()
+        except:
+            pass
+        try:
+            writer.close()
+        except:
+            pass
+        # Force cleanup any remaining processes/SHM
+        cleanup_system_resources()
 
 
 if __name__ == "__main__":
