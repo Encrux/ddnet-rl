@@ -16,7 +16,7 @@ import time
 import numpy as np
 import torch
 
-from teeworlds_server_env import TeeWorldsServerEnv, ServerEnvConfig
+from teeworlds_server_env import TeeWorldsServerEnv, ServerEnvConfig, FrameStackWrapper
 from ppo_hybrid import PPOAgent, PPOConfig
 
 
@@ -35,6 +35,10 @@ def parse_args():
                         help="Device (cpu, cuda, auto)")
     parser.add_argument("--port", type=int, default=8303,
                         help="Server port")
+    parser.add_argument("--frame-skip", type=int, default=None,
+                        help="Frame skip (default: use value from checkpoint)")
+    parser.add_argument("--max-episode-steps", type=int, default=100000,
+                        help="Max steps per episode before reset (default: 100000 = ~33 min)")
 
     return parser.parse_args()
 
@@ -56,17 +60,34 @@ def main():
     saved_config = checkpoint.get('config', PPOConfig())
     use_cnn = saved_config.use_cnn
 
+    # Get stacking config from saved model
+    n_frame_stack = getattr(saved_config, 'n_frame_stack', 1)
+    n_player_state_stack = getattr(saved_config, 'n_player_state_stack', 1)
+    needs_stacking = n_frame_stack > 1 or n_player_state_stack > 1
+
+    # Get frame_skip from checkpoint or command line
+    frame_skip = args.frame_skip if args.frame_skip is not None else getattr(saved_config, 'frame_skip', 3)
+
     # Create environment
     print(f"\nStarting server with {args.num_bots} bots on map '{args.map}'...")
     print(f"Connect to localhost:{args.port} to watch!")
+    print(f"Frame skip: {frame_skip} (decision rate: {50 // frame_skip} Hz)")
+    if needs_stacking:
+        print(f"Frame stacking: tiles={n_frame_stack}, player_state={n_player_state_stack}")
 
     config = ServerEnvConfig(
         server_port=args.port,
         map_name=args.map,
         sv_name="RL Eval",
         use_dict_obs=use_cnn,  # Match training config
+        frame_skip=frame_skip,
+        max_episode_steps=args.max_episode_steps,
     )
     env = TeeWorldsServerEnv(num_bots=args.num_bots, config=config)
+
+    # Wrap with frame stacking if needed
+    if needs_stacking:
+        env = FrameStackWrapper(env, n_tile_stack=n_frame_stack, n_player_state_stack=n_player_state_stack)
 
     try:
         # Get observation to determine dimensions

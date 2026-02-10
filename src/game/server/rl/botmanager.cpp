@@ -25,6 +25,7 @@ CBotManager::CBotManager(CGameContext *pGameContext) :
 	m_Enabled(false),
 	m_PlayersCreated(false),
 	m_NumBots(0),
+	m_NumTeleCheckpoints(0),
 	m_SpawnPos(0, 0),
 	m_FinishPos(0, 0),
 	m_MapAnalyzed(false),
@@ -487,21 +488,37 @@ void CBotManager::ExtractObservations()
 
 				pObs->m_CanHook = (pChar->Core()->m_HookState == HOOK_IDLE) ? 1 : 0;
 
-				// Checkpoint navigation info
-				int CurrentCpIdx = m_aBotState[i].m_CurrentCheckpointIndex;
-				vec2 NextCpPos = GetNextCheckpointPos(CurrentCpIdx);
+				// Checkpoint tracking
+				SBotRewardState &State = m_aBotState[i];
+
+				// Teleport checkpoint from DDNet (1-255, 0 = none)
+				int TeleCheckpoint = pChar->m_TeleCheckpoint;
+				if(TeleCheckpoint > 0 && !State.m_VisitedCheckpoints.test(TeleCheckpoint))
+				{
+					State.m_VisitedCheckpoints.set(TeleCheckpoint);
+					State.m_NumCheckpointsReached++;
+					State.m_LastCheckpointNumber = TeleCheckpoint;
+				}
+
+				// Time checkpoint tracking — read from game's native detection
+				int TimeCp = pChar->m_LastTimeCp;
+				if(TimeCp > State.m_HighestTimeCp)
+				{
+					State.m_HighestTimeCp = TimeCp;
+					State.m_NumCheckpointsReached++;
+				}
+
+				// Navigation: target next sequential time checkpoint
+				vec2 NextCpPos;
+				int NextTimeCp = State.m_HighestTimeCp + 1;
+				if(NextTimeCp < (int)m_vCheckpoints.size())
+					NextCpPos = m_vCheckpoints[NextTimeCp].m_Pos;
+				else
+					NextCpPos = m_FinishPos.x > 0 ? m_FinishPos : m_SpawnPos;
 				pObs->m_NextCheckpointX = NextCpPos.x;
 				pObs->m_NextCheckpointY = NextCpPos.y;
-				pObs->m_CheckpointIndex = CurrentCpIdx;
-				pObs->m_TotalCheckpoints = (int)m_vCheckpoints.size();
-
-				// Check if bot reached a new checkpoint
-				vec2 CharPos = pChar->GetPos();
-				int CpAtPos = GetCheckpointAtPos(CharPos);
-				if(CpAtPos >= 0 && CpAtPos > CurrentCpIdx)
-				{
-					m_aBotState[i].m_CurrentCheckpointIndex = CpAtPos;
-				}
+				pObs->m_CheckpointIndex = State.m_NumCheckpointsReached;
+				pObs->m_TotalCheckpoints = std::max(m_NumTeleCheckpoints, (int)m_vCheckpoints.size());
 
 				// Calculate reward for this tick
 				TickReward = CalculateReward(i, pObs);
@@ -515,18 +532,34 @@ void CBotManager::ExtractObservations()
 				ExtractPlayerObs(pChar, &TempObs.m_LocalPlayer, true);
 
 				// Checkpoint tracking
-				int CurrentCpIdx = m_aBotState[i].m_CurrentCheckpointIndex;
-				vec2 NextCpPos = GetNextCheckpointPos(CurrentCpIdx);
+				SBotRewardState &State = m_aBotState[i];
+
+				int TeleCheckpoint = pChar->m_TeleCheckpoint;
+				if(TeleCheckpoint > 0 && !State.m_VisitedCheckpoints.test(TeleCheckpoint))
+				{
+					State.m_VisitedCheckpoints.set(TeleCheckpoint);
+					State.m_NumCheckpointsReached++;
+					State.m_LastCheckpointNumber = TeleCheckpoint;
+				}
+
+				// Time checkpoint tracking — read from game's native detection
+				int TimeCp = pChar->m_LastTimeCp;
+				if(TimeCp > State.m_HighestTimeCp)
+				{
+					State.m_HighestTimeCp = TimeCp;
+					State.m_NumCheckpointsReached++;
+				}
+
+				// Navigation: target next sequential time checkpoint
+				vec2 NextCpPos;
+				int NextTimeCp = State.m_HighestTimeCp + 1;
+				if(NextTimeCp < (int)m_vCheckpoints.size())
+					NextCpPos = m_vCheckpoints[NextTimeCp].m_Pos;
+				else
+					NextCpPos = m_FinishPos.x > 0 ? m_FinishPos : m_SpawnPos;
 				TempObs.m_NextCheckpointX = NextCpPos.x;
 				TempObs.m_NextCheckpointY = NextCpPos.y;
-				TempObs.m_CheckpointIndex = CurrentCpIdx;
-
-				vec2 CharPos = pChar->GetPos();
-				int CpAtPos = GetCheckpointAtPos(CharPos);
-				if(CpAtPos >= 0 && CpAtPos > CurrentCpIdx)
-				{
-					m_aBotState[i].m_CurrentCheckpointIndex = CpAtPos;
-				}
+				TempObs.m_CheckpointIndex = State.m_NumCheckpointsReached;
 
 				TickReward = CalculateReward(i, &TempObs);
 			}
@@ -699,17 +732,15 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 	}
 	// No penalty for backtracking - just 0 reward
 
-	// Checkpoint reached (sparse but important)
-	int CurrentCp = State.m_CurrentCheckpointIndex;
-	if(CurrentCp > State.m_LastCheckpointRewarded)
+	// Checkpoint reached (sparse but important) - reward based on count of unique checkpoints
+	int NumCheckpoints = State.m_NumCheckpointsReached;
+	if(NumCheckpoints > State.m_LastCheckpointRewarded)
 	{
 		Reward += 10.0f;
-		State.m_LastCheckpointRewarded = CurrentCp;
-		// Reset distance tracking for new checkpoint
-		vec2 NewNextCp = GetNextCheckpointPos(CurrentCp);
-		float NewDist = length(NewNextCp - Pos);
-		State.m_LastDistToCheckpoint = NewDist;
-		State.m_BestDistToCheckpoint = NewDist;  // Reset high water mark for new checkpoint
+		State.m_LastCheckpointRewarded = NumCheckpoints;
+		// Reset high-water mark — gives fresh progress reward headroom
+		State.m_BestDistToCheckpoint = DistToCheckpoint;
+		State.m_LastDistToCheckpoint = DistToCheckpoint;
 	}
 
 	// Finish reached
@@ -819,16 +850,19 @@ void CBotManager::ResetRewardState(int BotIndex)
 	SBotRewardState &State = m_aBotState[BotIndex];
 	State.m_LastPosX = m_SpawnPos.x;
 	State.m_LastPosY = m_SpawnPos.y;
-	State.m_CurrentCheckpointIndex = -1;
-	State.m_LastCheckpointRewarded = -1;  // Reset so checkpoints give rewards again
+	State.m_NumCheckpointsReached = 0;
+	State.m_LastCheckpointNumber = 0;  // 0 = no checkpoint touched yet
+	State.m_LastCheckpointRewarded = 0;  // Reset so checkpoints give rewards again
 	State.m_LastDistToCheckpoint = 10000.0f; // Will be set properly on first tick
 	State.m_BestDistToCheckpoint = 10000.0f; // High water mark for progress
 	State.m_LastHookState = 0;
 	State.m_StuckCounter = 0;
 	State.m_WasFrozen = false;
 	State.m_WasDead = false;
+	State.m_HighestTimeCp = -1;
 
-	// Reset exploration tracking
+	// Reset checkpoint and exploration tracking
+	State.m_VisitedCheckpoints.reset();
 	State.m_VisitedRegions.reset();
 	State.m_NewRegionsThisEpisode = 0;
 }
@@ -1002,34 +1036,42 @@ void CBotManager::AnalyzeMap()
 		m_vCheckpoints[i].m_Index = (int)i;
 	}
 
+	// Count teleport checkpoints (DDNet uses 0-indexed numbers for TeleCheckOuts)
+	// Find the highest checkpoint number that has teleport-out positions
+	m_NumTeleCheckpoints = 0;
+	for(int i = 0; i < 255; i++)  // DDNet supports up to 255 tele numbers
+	{
+		const auto &TeleOuts = m_pCollision->TeleCheckOuts(i);
+		if(!TeleOuts.empty())
+			m_NumTeleCheckpoints = i + 1;  // 0-indexed, so +1 for count
+	}
+
 	m_MapAnalyzed = true;
 
-	dbg_msg("rl/bots", "Map analyzed: %d checkpoints, spawn (%.0f, %.0f), finish (%.0f, %.0f)",
-		(int)m_vCheckpoints.size(), m_SpawnPos.x, m_SpawnPos.y, m_FinishPos.x, m_FinishPos.y);
+	dbg_msg("rl/bots", "Map analyzed: %d time checkpoints, %d tele checkpoints, spawn (%.0f, %.0f), finish (%.0f, %.0f)",
+		(int)m_vCheckpoints.size(), m_NumTeleCheckpoints, m_SpawnPos.x, m_SpawnPos.y, m_FinishPos.x, m_FinishPos.y);
 }
 
 vec2 CBotManager::GetNextCheckpointPos(int CurrentIndex) const
 {
-	// If no checkpoints, target finish
-	if(m_vCheckpoints.empty())
+	int NextIdx = CurrentIndex + 1;
+
+	// Try teleport checkpoint first (more common in DDNet maps)
+	// TeleCheckOuts uses 0-indexed checkpoint numbers
+	const auto &TeleOuts = m_pCollision->TeleCheckOuts(NextIdx);
+	if(!TeleOuts.empty())
 	{
-		return m_FinishPos.x > 0 ? m_FinishPos : m_SpawnPos;
+		return TeleOuts[0];  // Return first teleport-out position
 	}
 
-	// If before any checkpoint, target first
-	if(CurrentIndex < 0)
+	// Fall back to time checkpoint array
+	if(NextIdx >= 0 && NextIdx < (int)m_vCheckpoints.size())
 	{
-		return m_vCheckpoints[0].m_Pos;
+		return m_vCheckpoints[NextIdx].m_Pos;
 	}
 
-	// If at or past last checkpoint, target finish
-	if(CurrentIndex >= (int)m_vCheckpoints.size() - 1)
-	{
-		return m_FinishPos.x > 0 ? m_FinishPos : m_vCheckpoints.back().m_Pos;
-	}
-
-	// Target next checkpoint
-	return m_vCheckpoints[CurrentIndex + 1].m_Pos;
+	// No more checkpoints, target finish
+	return m_FinishPos.x > 0 ? m_FinishPos : m_SpawnPos;
 }
 
 int CBotManager::GetCheckpointAtPos(vec2 Pos, float Radius) const

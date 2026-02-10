@@ -32,6 +32,13 @@ BOT_DATA_SIZE = 1448
 MAX_RL_BOTS = 128
 SHM_PATH_BASE = "/dev/shm/ddnet_rl_server"
 
+# Contiguous memory layout offsets (new layout used by server)
+CONTIGUOUS_ACTIONS_OFFSET = HEADER_SIZE  # 32
+CONTIGUOUS_OBS_OFFSET = CONTIGUOUS_ACTIONS_OFFSET + MAX_RL_BOTS * ACTION_SIZE  # 4128
+CONTIGUOUS_REWARDS_OFFSET = CONTIGUOUS_OBS_OFFSET + MAX_RL_BOTS * OBS_SIZE  # 183328
+CONTIGUOUS_DONES_OFFSET = CONTIGUOUS_REWARDS_OFFSET + MAX_RL_BOTS * 4  # 183840
+CONTIGUOUS_TOTAL_SIZE = CONTIGUOUS_DONES_OFFSET + MAX_RL_BOTS * 4  # 184352
+
 # Tile type names (for raw IDs - common DDNet tiles)
 TILE_NAMES = {
     0: "AIR",
@@ -89,8 +96,7 @@ class ObservationReader:
 
         try:
             self.shm_file = open(self.shm_path, 'rb')
-            total_size = HEADER_SIZE + (BOT_DATA_SIZE * MAX_RL_BOTS)
-            self.shm_mmap = mmap.mmap(self.shm_file.fileno(), total_size, access=mmap.ACCESS_READ)
+            self.shm_mmap = mmap.mmap(self.shm_file.fileno(), CONTIGUOUS_TOTAL_SIZE, access=mmap.ACCESS_READ)
             return True
         except Exception as e:
             print(f"Failed to connect: {e}")
@@ -116,55 +122,62 @@ class ObservationReader:
         }
 
     def read_observation(self, bot_index: int, use_embeddings: bool = False) -> dict:
-        """Read observation for a specific bot."""
-        offset = HEADER_SIZE + (bot_index * BOT_DATA_SIZE)
+        """Read observation for a specific bot using contiguous memory layout."""
+        # Contiguous layout offsets for this bot
+        action_offset = CONTIGUOUS_ACTIONS_OFFSET + bot_index * ACTION_SIZE
+        obs_offset = CONTIGUOUS_OBS_OFFSET + bot_index * OBS_SIZE
+        reward_offset = CONTIGUOUS_REWARDS_OFFSET + bot_index * 4
+        done_offset = CONTIGUOUS_DONES_OFFSET + bot_index * 4
 
-        # Offsets within SBotData
-        OBS_START = 32
-        LOCAL_PLAYER = OBS_START + 8
+        # Offsets within observation data (SObservation struct)
+        LOCAL_PLAYER = 8  # After 2 padding ints
         TILES = LOCAL_PLAYER + 36
         EXTRA_STATE = TILES + 1333
         CHECKPOINT = EXTRA_STATE + 4
-        REWARD_OFF = OBS_START + 1400
-        DONE_OFF = REWARD_OFF + 4
 
-        # Read raw data
-        self.shm_mmap.seek(offset)
-        raw = self.shm_mmap.read(BOT_DATA_SIZE)
+        # Read action data
+        self.shm_mmap.seek(action_offset)
+        action_raw = self.shm_mmap.read(ACTION_SIZE)
+        action = struct.unpack_from('<iiiiiiii', action_raw, 0)
 
-        # Parse action (what Python last sent)
-        action = struct.unpack_from('<iiiiiiii', raw, 0)
+        # Read observation data
+        self.shm_mmap.seek(obs_offset)
+        obs_raw = self.shm_mmap.read(OBS_SIZE)
 
         # Parse player floats
-        pos_x, pos_y, vel_x, vel_y = struct.unpack_from('<ffff', raw, LOCAL_PLAYER)
+        pos_x, pos_y, vel_x, vel_y = struct.unpack_from('<ffff', obs_raw, LOCAL_PLAYER)
 
         # Parse player bytes
-        direction = struct.unpack_from('<b', raw, LOCAL_PLAYER + 16)[0]
-        jumped = raw[LOCAL_PLAYER + 17]
-        hook_state = raw[LOCAL_PLAYER + 18]
-        is_frozen = raw[LOCAL_PLAYER + 30]
-        health = raw[LOCAL_PLAYER + 32]
-        armor = raw[LOCAL_PLAYER + 33]
+        direction = struct.unpack_from('<b', obs_raw, LOCAL_PLAYER + 16)[0]
+        jumped = obs_raw[LOCAL_PLAYER + 17]
+        hook_state = obs_raw[LOCAL_PLAYER + 18]
+        is_frozen = obs_raw[LOCAL_PLAYER + 30]
+        health = obs_raw[LOCAL_PLAYER + 32]
+        armor = obs_raw[LOCAL_PLAYER + 33]
 
         # Parse extra state
-        is_grounded = raw[EXTRA_STATE]
-        jumps_remaining = raw[EXTRA_STATE + 1]
-        can_hook = raw[EXTRA_STATE + 2]
+        is_grounded = obs_raw[EXTRA_STATE]
+        jumps_remaining = obs_raw[EXTRA_STATE + 1]
+        can_hook = obs_raw[EXTRA_STATE + 2]
 
         # Parse checkpoint
-        cp_x, cp_y = struct.unpack_from('<ff', raw, CHECKPOINT)
-        cp_idx, total_cp = struct.unpack_from('<ii', raw, CHECKPOINT + 8)
+        cp_x, cp_y = struct.unpack_from('<ff', obs_raw, CHECKPOINT)
+        cp_idx, total_cp = struct.unpack_from('<ii', obs_raw, CHECKPOINT + 8)
 
         # Parse tiles
-        tile_raw = raw[TILES:TILES + TILE_GRID_SIZE]
+        tile_raw = obs_raw[TILES:TILES + TILE_GRID_SIZE]
         if use_embeddings:
             tiles = np.frombuffer(tile_raw, dtype=np.uint8).reshape(TILE_GRID_HEIGHT, TILE_GRID_WIDTH).astype(np.int64)
         else:
             tiles = np.frombuffer(tile_raw, dtype=np.uint8).reshape(TILE_GRID_HEIGHT, TILE_GRID_WIDTH).astype(np.float32) / 15.0
 
-        # Parse reward/done
-        reward = struct.unpack_from('<f', raw, REWARD_OFF)[0]
-        done = struct.unpack_from('<i', raw, DONE_OFF)[0]
+        # Read reward
+        self.shm_mmap.seek(reward_offset)
+        reward = struct.unpack('<f', self.shm_mmap.read(4))[0]
+
+        # Read done
+        self.shm_mmap.seek(done_offset)
+        done = struct.unpack('<i', self.shm_mmap.read(4))[0]
 
         return {
             'action': {

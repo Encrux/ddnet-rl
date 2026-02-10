@@ -504,6 +504,9 @@ class PPOAgent:
             eps=1e-5
         )
 
+        # Cache parameter list for gradient clipping (avoid recreating 384x per update)
+        self._all_params = list(self.actor.parameters()) + list(self.critic.parameters())
+
         # Mixed precision training
         self.use_amp = self.config.use_amp and self.device.type == "cuda"
         if self.use_amp:
@@ -984,23 +987,17 @@ class PPOAgent:
                     clipfracs.append(((ratio - 1.0).abs() > self.config.clip_coef).float().mean().item())
                     all_approx_kl.append(approx_kl.item())
 
-                # Optimize (with optional mixed precision)
+                # Optimize (outside autocast)
                 self.optimizer.zero_grad()
                 if self.use_amp:
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(
-                        list(self.actor.parameters()) + list(self.critic.parameters()),
-                        self.config.max_grad_norm
-                    )
+                    nn.utils.clip_grad_norm_(self._all_params, self.config.max_grad_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     loss.backward()
-                    nn.utils.clip_grad_norm_(
-                        list(self.actor.parameters()) + list(self.critic.parameters()),
-                        self.config.max_grad_norm
-                    )
+                    nn.utils.clip_grad_norm_(self._all_params, self.config.max_grad_norm)
                     self.optimizer.step()
 
                 all_pg_losses.append(pg_loss.item())

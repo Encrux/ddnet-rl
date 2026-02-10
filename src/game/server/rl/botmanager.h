@@ -102,12 +102,18 @@ private:
 		float m_LastPosY;
 		float m_LastDistToCheckpoint;
 		float m_BestDistToCheckpoint;  // High water mark - closest we've ever been
-		int m_CurrentCheckpointIndex;
-		int m_LastCheckpointRewarded;  // Last checkpoint that gave bonus (reset on respawn)
+		int m_NumCheckpointsReached;   // Count of unique checkpoints reached (for progress)
+		int m_LastCheckpointNumber;    // Last checkpoint number touched (1-255, for navigation)
+		int m_LastCheckpointRewarded;  // Count when last rewarded (reset on respawn)
 		int m_LastHookState;
 		int m_StuckCounter;
 		bool m_WasFrozen;
 		bool m_WasDead;
+		int m_HighestTimeCp;  // Highest time checkpoint index reached (-1 = none)
+
+		// Track which checkpoint NUMBERS have been visited (supports any ordering)
+		// DDNet checkpoint numbers are 1-255 (0 = none)
+		std::bitset<256> m_VisitedCheckpoints;
 
 		// Exploration tracking - coarse grid (8x8 tiles per region)
 		// 64x64 regions = 4096 bits = 512 bytes per bot
@@ -119,6 +125,7 @@ private:
 
 	// Map checkpoint data
 	std::vector<SCheckpoint> m_vCheckpoints;
+	int m_NumTeleCheckpoints;  // Count of teleport checkpoints on map
 	vec2 m_SpawnPos;
 	vec2 m_FinishPos;
 	bool m_MapAnalyzed;
