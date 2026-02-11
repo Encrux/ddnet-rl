@@ -1898,93 +1898,117 @@ class FrameStackWrapper:
     """
     Stack frames for temporal context with separate control for tiles and player state.
 
-    This wrapper maintains deques of recent observations and stacks them
-    so the agent can see temporal patterns (e.g., velocity trajectory
-    for double-jump timing).
+    Uses a pre-allocated ring buffer for player state stacking to avoid
+    per-step allocations. Tiles are passed through by reference when not
+    stacked (n_tile_stack=1), since the underlying env returns fresh arrays.
 
     With frame_skip=3 and n_stack=8: 8 frames × 3 ticks × 20ms = 480ms coverage.
-
-    Tiles and player_state can be stacked independently:
-    - Tile stacking is expensive (8x VRAM) but useful for tracking other players
-    - Player state stacking is cheap and sufficient for timing/velocity patterns
     """
 
     def __init__(self, env: TeeWorldsServerEnv, n_tile_stack: int = 1, n_player_state_stack: int = 8):
-        """
-        Args:
-            env: The underlying TeeWorldsServerEnv (must use dict observations)
-            n_tile_stack: Number of tile frames to stack (default: 1, no stacking)
-            n_player_state_stack: Number of player state frames to stack (default: 8)
-        """
-        from collections import deque
-
         self.env = env
         self.n_tile_stack = n_tile_stack
         self.n_player_state_stack = n_player_state_stack
-
-        # Separate deques for tiles and player state (can have different sizes)
-        self.tile_frames = deque(maxlen=n_tile_stack)
-        self.player_frames = deque(maxlen=n_player_state_stack)
+        self._stack_tiles = n_tile_stack > 1
 
         # Forward attributes from wrapped env
         self.num_bots = env.num_bots
         self.num_envs = env.num_envs
         self.config = env.config
 
+        n_envs = env.num_envs
+        player_feat = 15
+
+        if self._stack_tiles:
+            from collections import deque
+            self.tile_frames = deque(maxlen=n_tile_stack)
+
+        # Pre-allocated ring buffer for player state: (n_envs, feat * n_stack)
+        # Layout: [oldest_frame_feats ... newest_frame_feats]
+        self._player_ring = np.zeros((n_envs, player_feat * n_player_state_stack), dtype=np.float32)
+        self._player_feat = player_feat
+        # Write pointer: index of the slot to write next (0..n_player_state_stack-1)
+        self._player_ptr = 0
+
     def reset(self, seed=None):
         """Reset and initialize frame stacks with copies of first observation."""
         obs, info = self.env.reset(seed=seed)
+        n_ps = self.n_player_state_stack
+        feat = self._player_feat
 
-        # Initialize tile stack
-        self.tile_frames.clear()
-        for _ in range(self.n_tile_stack):
-            self.tile_frames.append(obs['tiles'].copy())
+        # Initialize tiles
+        if self._stack_tiles:
+            self.tile_frames.clear()
+            for _ in range(self.n_tile_stack):
+                self.tile_frames.append(obs['tiles'].copy())
+        else:
+            self._latest_tiles = obs['tiles']
 
-        # Initialize player state stack
-        self.player_frames.clear()
-        for _ in range(self.n_player_state_stack):
-            self.player_frames.append(obs['player_state'].copy())
+        # Initialize player state ring buffer: tile all slots with the same observation
+        ps = obs['player_state']  # (n_envs, 15)
+        for i in range(n_ps):
+            self._player_ring[:, i * feat:(i + 1) * feat] = ps
+        self._player_ptr = 0
 
-        # Keep latest checkpoint (not stacked)
-        self._latest_checkpoint = obs['checkpoint'].copy()
+        # Checkpoint: just keep a reference (underlying env returns fresh arrays)
+        self._latest_checkpoint = obs['checkpoint']
 
         return self._get_stacked_obs(), info
 
     def step(self, action):
         """Step environment and update frame stacks."""
         obs, reward, done, truncated, info = self.env.step(action)
+        n_ps = self.n_player_state_stack
+        feat = self._player_feat
 
-        # Add new frames to stacks
-        self.tile_frames.append(obs['tiles'].copy())
-        self.player_frames.append(obs['player_state'].copy())
-        self._latest_checkpoint = obs['checkpoint'].copy()
+        # Update tiles
+        if self._stack_tiles:
+            self.tile_frames.append(obs['tiles'].copy())
+        else:
+            self._latest_tiles = obs['tiles']
 
-        # Handle episode resets (per-env): reset frame history for done envs
+        # Write new player state into the ring buffer at current pointer
+        ptr = self._player_ptr
+        np.copyto(self._player_ring[:, ptr * feat:(ptr + 1) * feat], obs['player_state'])
+        self._player_ptr = (ptr + 1) % n_ps
+
+        # Checkpoint: just keep a reference
+        self._latest_checkpoint = obs['checkpoint']
+
+        # Handle episode resets: fill all ring buffer slots for done envs
         reset_mask = done | truncated
         if np.any(reset_mask):
-            for i in np.where(reset_mask)[0]:
-                # Reset this env's tile history
+            if self._stack_tiles:
                 for frame in self.tile_frames:
-                    frame[i] = obs['tiles'][i]
-                # Reset this env's player state history
-                for frame in self.player_frames:
-                    frame[i] = obs['player_state'][i]
+                    frame[reset_mask] = obs['tiles'][reset_mask]
+            # Vectorized reset: tile the current player_state across all slots
+            ps_reset = obs['player_state'][reset_mask]  # (n_reset, 15)
+            self._player_ring[reset_mask] = np.tile(ps_reset, n_ps)
 
         return self._get_stacked_obs(), reward, done, truncated, info
 
     def _get_stacked_obs(self):
-        """Stack observations along channel/feature dimension."""
-        # Stack tiles: (n_envs, 1, H, W) * n_tile_stack -> (n_envs, n_tile_stack, H, W)
-        stacked_tiles = np.concatenate(
-            [f for f in self.tile_frames], axis=1
-        )
+        """Build stacked observation dict."""
+        # Tiles: either stacked from deque or pass-through reference
+        if self._stack_tiles:
+            stacked_tiles = np.concatenate(list(self.tile_frames), axis=1)
+        else:
+            stacked_tiles = self._latest_tiles
 
-        # Stack player_state: (n_envs, 15) * n_player_stack -> (n_envs, 15*n_player_stack)
-        stacked_player = np.concatenate(
-            [f for f in self.player_frames], axis=1
-        )
+        # Player state: reorder ring buffer so oldest frame is first
+        ptr = self._player_ptr
+        feat = self._player_feat
+        n_ps = self.n_player_state_stack
+        if ptr == 0:
+            # Already in order: slot 0 is oldest, slot n-1 is newest
+            stacked_player = self._player_ring
+        else:
+            # ptr points to the oldest slot, so roll: [ptr..n-1, 0..ptr-1]
+            stacked_player = np.concatenate([
+                self._player_ring[:, ptr * feat:],
+                self._player_ring[:, :ptr * feat],
+            ], axis=1)
 
-        # Checkpoint stays single (doesn't change rapidly)
         return {
             'tiles': stacked_tiles,
             'player_state': stacked_player,

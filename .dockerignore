@@ -1,0 +1,13 @@
+build/
+runs/
+.git/
+ddnet-libs/
+__pycache__/
+.venv/
+benchmark_logs/
+*.pyc
+*.log
+*.sqlite
+.cache/
+.idea/
+.vscode/

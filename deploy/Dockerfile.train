@@ -1,0 +1,80 @@
+# Stage 1: Build DDNet-Server (server-only, minimal deps)
+FROM ubuntu:22.04 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    cargo \
+    rustc \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    libsqlite3-dev \
+    libpng-dev \
+    zlib1g-dev \
+    python3 \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN mkdir build && cd build \
+    && cmake -GNinja \
+        -DCLIENT=OFF \
+        -DTOOLS=OFF \
+        -DVULKAN=OFF \
+        -DVIDEORECORDER=OFF \
+        -DPREFER_BUNDLED_LIBS=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        .. \
+    && ninja DDNet-Server
+
+# Stage 2: Runtime image with CUDA + Python
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime libraries for DDNet-Server
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libcurl4 \
+    libssl3 \
+    libsqlite3-0 \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Install Python via uv
+RUN uv python install 3.11
+
+WORKDIR /app
+
+# Copy pyproject.toml first for dependency caching
+COPY pyproject.toml ./
+
+# Create venv and install dependencies
+RUN uv venv && uv sync
+
+# Copy built server binary and data
+COPY --from=builder /src/build/DDNet-Server build/DDNet-Server
+COPY --from=builder /src/build/data/ build/data/
+
+# Copy Python source (preserving directory structure for relative path resolution)
+COPY src/game/client/rl/python/ src/game/client/rl/python/
+
+# Copy deploy scripts
+COPY deploy/train.sh deploy/train.sh
+RUN chmod +x deploy/train.sh
+
+# Ensure server binary is executable
+RUN chmod +x build/DDNet-Server
+
+# Verify the layout
+RUN ls -la build/DDNet-Server && ls build/data/maps/Tutorial.map
+
+ENTRYPOINT ["deploy/train.sh"]

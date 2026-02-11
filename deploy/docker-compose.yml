@@ -1,0 +1,16 @@
+services:
+  train:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.train
+    runtime: nvidia
+    shm_size: '512m'
+    volumes:
+      - ../runs:/app/runs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -1,0 +1,185 @@
+======================================================================
+OVERNIGHT BENCHMARK REPORT - 2026-02-11 09:05
+Hardware: RTX 3080 10GB, Ryzen 7 5800X3D 8c/16t, 32GB RAM
+======================================================================
+
+RESULTS SUMMARY
+----------------------------------------------------------------------
+Name                            FPS  Peak Rew  Avg Rew        R/U        Steps
+----------------------------------------------------------------------
+01_baseline_cnn_stack4        21625      88.0     84.6   4.5/5.0s   45,061,632
+02_cnn_nostack                21764      84.6     73.9   4.9/5.0s   45,451,776
+03_cnn_stack8                 20510      75.9     63.2   5.1/5.0s   42,720,768
+04_embed_cnn_stack4           12354      20.2     19.7  4.5/11.3s   25,749,504
+05_lr_1e3                     20660      75.9     72.3   5.0/4.9s   43,110,912
+06_lr_1e4                     22330      24.4     24.1   3.8/5.0s   46,622,208
+07_ent_high                   20939      72.5     61.1   4.9/5.0s   43,696,128
+08_ent_low                    21580      81.0     68.8   5.0/5.0s   45,061,632
+09_mb32                       23534      88.3     67.0   4.6/4.3s   49,158,144
+10_steps256                   22412      70.0     61.5  10.0/8.5s   46,427,136
+11_hidden512                  21555      23.8     22.7   4.0/5.1s   45,061,632
+12_8servers                   18901     137.2    105.9   3.6/3.9s   39,404,544
+15_best_combo                 17988      25.1     24.6   3.4/3.8s   48,377,856
+----------------------------------------------------------------------
+
+DETAILED RESULTS
+======================================================================
+
+--- 01_baseline_cnn_stack4 ---
+  Description: Baseline: CNN tiles + player_state stack=4 (user's current config)
+  Flags: --use-cnn --n-player-state-stack 4 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 21625
+  Peak reward: 87.95
+  Avg reward (last 10 updates): 84.58
+  Avg R/U time: 4.5/5.0s
+  Total updates: 231
+  Total steps: 45,061,632
+  Reward trajectory: -14.2 -> 15.8 -> 57.0 -> 71.2 -> 86.4
+
+--- 02_cnn_nostack ---
+  Description: CNN tiles, no player state stacking (isolate stacking overhead)
+  Flags: --use-cnn --n-player-state-stack 1 --n-frame-stack 1 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 21764
+  Peak reward: 84.60
+  Avg reward (last 10 updates): 73.89
+  Avg R/U time: 4.9/5.0s
+  Total updates: 233
+  Total steps: 45,451,776
+  Reward trajectory: -12.9 -> 16.6 -> 20.9 -> 22.6 -> 80.1
+
+--- 03_cnn_stack8 ---
+  Description: CNN tiles + player_state stack=8 (more temporal context)
+  Flags: --use-cnn --n-player-state-stack 8 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 20510
+  Peak reward: 75.88
+  Avg reward (last 10 updates): 63.22
+  Avg R/U time: 5.1/5.0s
+  Total updates: 219
+  Total steps: 42,720,768
+  Reward trajectory: -12.5 -> 13.7 -> 45.9 -> 61.6 -> 59.6
+
+--- 04_embed_cnn_stack4 ---
+  Description: Learned tile embeddings + CNN encoder + stack=4
+  Flags: --use-embeddings --tile-encoder cnn --n-player-state-stack 4 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 12354
+  Peak reward: 20.25
+  Avg reward (last 10 updates): 19.66
+  Avg R/U time: 4.5/11.3s
+  Total updates: 132
+  Total steps: 25,749,504
+  Reward trajectory: -11.1 -> 16.1 -> 17.5 -> 18.8 -> 19.7
+
+--- 05_lr_1e3 ---
+  Description: Higher learning rate (1e-3 vs default 3e-4)
+  Flags: --use-cnn --n-player-state-stack 4 --learning-rate 1e-3 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 20660
+  Peak reward: 75.92
+  Avg reward (last 10 updates): 72.28
+  Avg R/U time: 5.0/4.9s
+  Total updates: 221
+  Total steps: 43,110,912
+  Reward trajectory: -12.7 -> 16.7 -> 57.1 -> 59.2 -> 75.5
+
+--- 06_lr_1e4 ---
+  Description: Lower learning rate (1e-4 vs default 3e-4)
+  Flags: --use-cnn --n-player-state-stack 4 --learning-rate 1e-4 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 22330
+  Peak reward: 24.38
+  Avg reward (last 10 updates): 24.12
+  Avg R/U time: 3.8/5.0s
+  Total updates: 239
+  Total steps: 46,622,208
+  Reward trajectory: -13.1 -> 20.2 -> 22.4 -> 23.1 -> 24.4
+
+--- 07_ent_high ---
+  Description: Higher entropy coefficient (0.05 vs default 0.01)
+  Flags: --use-cnn --n-player-state-stack 4 --ent-coef 0.05 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 20939
+  Peak reward: 72.52
+  Avg reward (last 10 updates): 61.10
+  Avg R/U time: 4.9/5.0s
+  Total updates: 224
+  Total steps: 43,696,128
+  Reward trajectory: -12.7 -> 30.3 -> 55.4 -> 63.1 -> 61.3
+
+--- 08_ent_low ---
+  Description: Lower entropy coefficient (0.001 vs default 0.01)
+  Flags: --use-cnn --n-player-state-stack 4 --ent-coef 0.001 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 21580
+  Peak reward: 80.95
+  Avg reward (last 10 updates): 68.79
+  Avg R/U time: 5.0/5.0s
+  Total updates: 231
+  Total steps: 45,061,632
+  Reward trajectory: -12.6 -> 18.5 -> 21.9 -> 54.1 -> 69.2
+
+--- 09_mb32 ---
+  Description: Fewer minibatches (32 vs 64) = 2x larger minibatch, half the forward/backward passes
+  Flags: --use-cnn --n-player-state-stack 4 --num-minibatches 32 --num-steps 128 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 23534
+  Peak reward: 88.26
+  Avg reward (last 10 updates): 67.05
+  Avg R/U time: 4.6/4.3s
+  Total updates: 252
+  Total steps: 49,158,144
+  Reward trajectory: -13.5 -> 18.6 -> 21.3 -> 86.5 -> 65.0
+
+--- 10_steps256 ---
+  Description: Longer rollouts (256 vs 128 steps) = better advantage estimation
+  Flags: --use-cnn --n-player-state-stack 4 --num-steps 256 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 22412
+  Peak reward: 70.05
+  Avg reward (last 10 updates): 61.46
+  Avg R/U time: 10.0/8.5s
+  Total updates: 119
+  Total steps: 46,427,136
+  Reward trajectory: -9.2 -> 11.5 -> 21.3 -> 67.4 -> 60.8
+
+--- 11_hidden512 ---
+  Description: Larger network (hidden_dim=512 vs 256)
+  Flags: --use-cnn --n-player-state-stack 4 --hidden-dim 512 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 21555
+  Peak reward: 23.75
+  Avg reward (last 10 updates): 22.69
+  Avg R/U time: 4.0/5.1s
+  Total updates: 231
+  Total steps: 45,061,632
+  Reward trajectory: -12.4 -> 18.1 -> 20.1 -> 21.2 -> 22.4
+
+--- 12_8servers ---
+  Description: CPU scaling: 8 servers (1016 bots) vs 12 (1524 bots)
+  Flags: --use-cnn --n-player-state-stack 4 --num-servers 8 --num-envs 127 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 35.0 min
+  Avg FPS (last 10 updates): 18901
+  Peak reward: 137.17
+  Avg reward (last 10 updates): 105.93
+  Avg R/U time: 3.6/3.9s
+  Total updates: 303
+  Total steps: 39,404,544
+  Reward trajectory: -17.4 -> 22.0 -> 42.7 -> 97.2 -> 112.1
+
+--- 15_best_combo ---
+  Description: Adaptive: best config from Phase 1 (based on 12_8servers), 45 min run
+  Flags: --use-cnn --n-player-state-stack 4 --num-servers 8 --num-envs 127 --num-steps 128 --num-minibatches 64 --update-epochs 4
+  Wall time: 45.0 min
+  Avg FPS (last 10 updates): 17988
+  Peak reward: 25.14
+  Avg reward (last 10 updates): 24.61
+  Avg R/U time: 3.4/3.8s
+  Total updates: 372
+  Total steps: 48,377,856
+  Reward trajectory: -14.9 -> 21.9 -> 22.8 -> 23.6 -> 24.6
+
+======================================================================
+END OF REPORT
