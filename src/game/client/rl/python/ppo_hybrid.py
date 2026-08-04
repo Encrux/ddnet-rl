@@ -40,9 +40,26 @@ class PPOConfig:
     hidden_dim: int = 256
     num_layers: int = 2
 
-    # Action space
-    discrete_dims: Tuple[int, ...] = (3, 2, 2)  # direction, jump, hook
-    continuous_dim: int = 2  # aim_angle, aim_magnitude
+    # Action space.
+    #
+    # Aim is FACTORED: a Categorical over angular sectors times a continuous
+    # residual within the chosen sector. Neither half works alone.
+    #
+    # A pure Gaussian over the angle is unimodal, so at a fork where the correct
+    # action is "hook hard left OR hard right, never straight" it collapses to
+    # the mean - the one action that fails. Hook movement is full of these.
+    #
+    # Pure binning is too coarse: m_HookLength is 380, so one bin of a 32-way
+    # split (11.25 deg) subtends ~75 world units (2.3 tiles) at full hook range,
+    # which misses the block. The residual restores full precision.
+    #
+    # Aim MAGNITUDE is gone. DDNet only uses the direction of m_TargetX/Y, so it
+    # was a free dimension the entropy bonus could inflate forever at zero cost -
+    # 1.42 of the observed 5.33 nats, 27% of the entropy budget, spent on an
+    # action the game ignores.
+    aim_sectors: int = 16
+    discrete_dims: Tuple[int, ...] = (3, 2, 2, 16)  # direction, jump, hook, aim sector
+    continuous_dim: int = 1  # aim residual within the sector
 
     # CNN Feature Extractor (for dict observations)
     use_cnn: bool = False

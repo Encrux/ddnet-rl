@@ -94,6 +94,11 @@ BOT_DATA_SIZE = 1504    # SBotData (legacy interleaved layout: 36 + 1452 + 16)
 # Navigation block: normalised progress + geometric path lookahead.
 # Replaces the old 4-feature checkpoint block, which encoded mapper-authored
 # time checkpoints (see rl_protocol.h for why those are unusable across maps).
+# Aim discretisation. Sector count trades multimodality against head width; the
+# residual means precision does not depend on it.
+AIM_SECTORS = 16
+AIM_RADIUS = 200.0  # arbitrary; only the direction of (aim_x, aim_y) is used
+
 NUM_LOOKAHEAD = 8
 NAV_DIM = 1 + 2 * NUM_LOOKAHEAD  # progress + (x, y) per lookahead point
 FLAT_OBS_DIM = 15 + NAV_DIM + 49  # MLP mode: player + nav + 7x7 tile crop
@@ -618,8 +623,8 @@ class ServerShmClient:
 
     def write_actions_batch(self, actions: Dict[str, np.ndarray]):
         """Write actions for all bots at once (single memcpy with contiguous layout)."""
-        discrete_actions = actions['discrete']  # (num_bots, 3)
-        continuous_actions = actions['continuous']  # (num_bots, 2)
+        discrete_actions = actions['discrete']  # (num_bots, 4) - dir, jump, hook, aim sector
+        continuous_actions = actions['continuous']  # (num_bots, 1) - aim residual
         resets = actions.get('reset', np.zeros(self.num_bots, dtype=np.int32))
 
         # Vectorized action computation
@@ -628,11 +633,15 @@ class ServerShmClient:
         jump = discrete_actions[:, 1].astype(np.int32)
         hook = discrete_actions[:, 2].astype(np.int32)
 
-        # Continuous aim (vectorized)
-        aim_angle = continuous_actions[:, 0] * np.pi
-        aim_magnitude = (continuous_actions[:, 1] + 1.0) / 2.0
-        aim_x = (np.cos(aim_angle) * aim_magnitude * 200).astype(np.int32)
-        aim_y = (np.sin(aim_angle) * aim_magnitude * 200).astype(np.int32)
+        # Factored aim: Categorical sector + continuous residual within it.
+        # The sector gives multimodality, the residual gives precision.
+        sector = discrete_actions[:, 3]
+        sector_center = (sector.astype(np.float32) + 0.5) * (2.0 * np.pi / AIM_SECTORS) - np.pi
+        residual = np.tanh(continuous_actions[:, 0]) * (np.pi / AIM_SECTORS)
+        aim_angle = sector_center + residual
+        # Magnitude is fixed: DDNet uses only the direction of m_TargetX/Y.
+        aim_x = (np.cos(aim_angle) * AIM_RADIUS).astype(np.int32)
+        aim_y = (np.sin(aim_angle) * AIM_RADIUS).astype(np.int32)
 
         spawn_checkpoints = actions.get('spawn_checkpoint', np.full(n, -1, dtype=np.int32))
 
@@ -1278,13 +1287,13 @@ class TeeWorldsServerEnv:
         return {
             'discrete': {
                 'type': 'multi_discrete',
-                'nvec': [3, 2, 2],  # direction, jump, hook
+                'nvec': [3, 2, 2, AIM_SECTORS],  # direction, jump, hook, aim sector
             },
             'continuous': {
                 'type': 'box',
                 'low': -1.0,
                 'high': 1.0,
-                'shape': (2,),  # aim_angle, aim_magnitude
+                'shape': (1,),  # aim residual within the chosen sector
             }
         }
 
@@ -1513,8 +1522,8 @@ class TeeWorldsServerEnv:
         # Send reset signal for all bots on all servers
         for server_idx, shm_client in enumerate(self.shm_clients):
             reset_actions = {
-                'discrete': np.zeros((self.num_bots_per_server, 3), dtype=np.int32),
-                'continuous': np.zeros((self.num_bots_per_server, 2), dtype=np.float32),
+                'discrete': np.zeros((self.num_bots_per_server, 4), dtype=np.int32),
+                'continuous': np.zeros((self.num_bots_per_server, 1), dtype=np.float32),
                 'reset': np.ones(self.num_bots_per_server, dtype=np.int32),
             }
             shm_client.write_actions_batch(reset_actions)
@@ -1899,8 +1908,8 @@ class TeeWorldsServerEnv:
                 continue
 
             reset_actions = {
-                'discrete': np.zeros((self.num_bots_per_server, 3), dtype=np.int32),
-                'continuous': np.zeros((self.num_bots_per_server, 2), dtype=np.float32),
+                'discrete': np.zeros((self.num_bots_per_server, 4), dtype=np.int32),
+                'continuous': np.zeros((self.num_bots_per_server, 1), dtype=np.float32),
                 'reset': server_mask.astype(np.int32),
             }
             if spawn_checkpoints is not None:
@@ -1959,8 +1968,8 @@ class TeeWorldsServerEnv:
                 continue
 
             reset_actions = {
-                'discrete': np.zeros((self.num_bots_per_server, 3), dtype=np.int32),
-                'continuous': np.zeros((self.num_bots_per_server, 2), dtype=np.float32),
+                'discrete': np.zeros((self.num_bots_per_server, 4), dtype=np.int32),
+                'continuous': np.zeros((self.num_bots_per_server, 1), dtype=np.float32),
                 'reset': server_mask.astype(np.int32),
             }
             shm_client.write_actions_batch(reset_actions)
