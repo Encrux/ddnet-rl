@@ -503,6 +503,11 @@ def main():
                     tracker.record_step(base_env._step_positions,
                                         base_env._last_progress,
                                         base_env._stalled)
+                    tracker.record_diagnostics(
+                        base_env._step_positions, base_env._stuck, base_env._thrash,
+                        base_env._frozen, base_env._heading_cos, base_env._heading_valid,
+                        base_env._oscillated, base_env._dwell_done,
+                        base_env._dwell_steps_done)
 
                 # Track episodes
                 ep_batch = []
@@ -555,7 +560,9 @@ def main():
                     if ts:
                         head = (f"Fin {ts.get('episodes/finish_rate_from_start', 0.0):5.1%} | "
                                 f"Prog {ts['progress/p50']:.3f}/{ts['progress/max']:.3f} | "
-                                f"Stall {ts.get('stall/fraction', 0.0):4.0%} | "
+                                f"Stk {ts.get('stall/stuck_fraction', 0.0):3.0%}/"
+                                f"Thr {ts.get('stall/thrash_fraction', 0.0):3.0%} | "
+                                f"Head {ts.get('stall/heading_cos', 0.0):+.2f} | "
                                 f"Fr {ts.get('stall/frontier_progress', -1.0):.3f} | ")
                 print(f"Update {update:5d} | Step {global_step:9,d} | "
                       f"FPS {fps:6.0f} | "
@@ -595,7 +602,10 @@ def main():
                         writer.add_histogram("progress/hist", prog_vals, global_step)
                     if update % (args.log_freq * 10) == 0:
                         for src, tag in (("deaths", "progress/death_heatmap"),
-                                         ("stalls", "progress/stall_heatmap")):
+                                         ("stalls", "progress/stall_heatmap"),
+                                         ("stuck", "progress/stuck_heatmap"),
+                                         ("thrash", "progress/thrash_heatmap"),
+                                         ("oscillation", "progress/oscillation_heatmap")):
                             img = tracker.heatmap_image(base_env.path_progress.xy, source=src)
                             if img is not None:
                                 writer.add_image(tag, img, global_step, dataformats='HWC')

@@ -83,6 +83,30 @@ class EpisodeTracker:
         self.total_steps = 0
         self.stalled_steps = 0
 
+        # Stall decomposition. "Didn't beat high-water progress" fuses four
+        # different behaviours; these separate them so a fix can be chosen.
+        self.stuck = np.zeros((self.grid_h, self.grid_w), dtype=np.int64)
+        self.thrash = np.zeros((self.grid_h, self.grid_w), dtype=np.int64)
+        self.oscillation = np.zeros((self.grid_h, self.grid_w), dtype=np.int64)
+        self.stuck_steps = 0
+        self.thrash_steps = 0
+        self.frozen_steps = 0
+        self.osc_events = 0
+        self.heading_sum = 0.0
+        self.heading_n = 0
+        # Split heading by whether the step made progress. The aggregate alone is
+        # ambiguous: a low mean could mean undirected motion everywhere, or good
+        # heading while advancing and noise while not. The gap is the signal.
+        self.heading_prog_sum = 0.0
+        self.heading_prog_n = 0
+        self.heading_thrash_sum = 0.0
+        self.heading_thrash_n = 0
+        # Dwell: mean steps spent in a bin before advancing out of it. Unlike
+        # stall rate this is not confounded by off-path motion, deliberate
+        # backtracking, or the spawn dead zone where progress is pinned at 0.
+        self.bin_dwell_sum = np.zeros(num_bins, dtype=np.int64)
+        self.bin_dwell_n = np.zeros(num_bins, dtype=np.int64)
+
         self._progress = deque(maxlen=history)
         self._from_start = deque(maxlen=history)
         self._finished = deque(maxlen=history)
@@ -92,6 +116,42 @@ class EpisodeTracker:
         self.best_progress = 0.0
 
     # ------------------------------------------------------------------- stall
+
+    def record_diagnostics(self, positions, stuck, thrash, frozen, heading_cos,
+                           heading_valid, oscillated, dwell_bin, dwell_steps) -> None:
+        """Record the stall decomposition for one step across all envs."""
+        self.stuck_steps += int(stuck.sum())
+        self.thrash_steps += int(thrash.sum())
+        self.frozen_steps += int(frozen.sum())
+        self.osc_events += int(oscillated.sum())
+        if heading_valid.any():
+            self.heading_sum += float(heading_cos[heading_valid].sum())
+            self.heading_n += int(heading_valid.sum())
+            th = heading_valid & thrash
+            pr = heading_valid & ~(thrash | stuck)
+            if th.any():
+                self.heading_thrash_sum += float(heading_cos[th].sum()); self.heading_thrash_n += int(th.sum())
+            if pr.any():
+                self.heading_prog_sum += float(heading_cos[pr].sum()); self.heading_prog_n += int(pr.sum())
+
+        cells = ((positions - self.origin) / self.cell_size).astype(np.int32)
+        np.clip(cells[:, 0], 0, self.grid_w - 1, out=cells[:, 0])
+        np.clip(cells[:, 1], 0, self.grid_h - 1, out=cells[:, 1])
+        for mask, grid in ((stuck, self.stuck), (thrash, self.thrash),
+                           (oscillated, self.oscillation)):
+            if mask.any():
+                np.add.at(grid, (cells[mask, 1], cells[mask, 0]), 1)
+
+        done = dwell_bin >= 0
+        if done.any():
+            np.add.at(self.bin_dwell_sum, dwell_bin[done], dwell_steps[done])
+            np.add.at(self.bin_dwell_n, dwell_bin[done], 1)
+
+    def mean_dwell(self) -> np.ndarray:
+        out = np.zeros(self.num_bins, dtype=np.float64)
+        ok = self.bin_dwell_n > 0
+        out[ok] = self.bin_dwell_sum[ok] / self.bin_dwell_n[ok]
+        return out
 
     def record_step(self, positions: np.ndarray, progress: np.ndarray,
                     stalled: np.ndarray) -> None:
@@ -140,6 +200,14 @@ class EpisodeTracker:
         # stalled steps. Total stalls, not rate: a bin nobody reaches can have a
         # 100% stall rate and still be irrelevant.
         lo = max(0, edge - 2 * 12)
+        # Prefer mean dwell — it measures difficulty directly. Stall counts are a
+        # leaky proxy: they also fire for off-path motion and for the spawn dead
+        # zone where progress is pinned at 0 regardless of behaviour.
+        dwell = self.mean_dwell()
+        enough = self.bin_dwell_n >= 20
+        window = np.where(enough, dwell, 0.0)[lo:edge + 1]
+        if window.sum() > 0:
+            return int(lo + np.argmax(window))
         window = self.bin_stalls[lo:edge + 1]
         if window.sum() == 0:
             return edge
@@ -212,7 +280,22 @@ class EpisodeTracker:
             "episodes/n": int(len(prog)),
         }
         if self.total_steps:
-            out["stall/fraction"] = self.stalled_steps / self.total_steps
+            t = self.total_steps
+            out["stall/fraction"] = self.stalled_steps / t
+            out["stall/stuck_fraction"] = self.stuck_steps / t
+            out["stall/thrash_fraction"] = self.thrash_steps / t
+            out["stall/frozen_fraction"] = self.frozen_steps / t
+            out["stall/oscillations_per_1k"] = 1000.0 * self.osc_events / t
+        if self.heading_n:
+            out["stall/heading_cos"] = self.heading_sum / self.heading_n
+        if self.heading_prog_n:
+            out["stall/heading_cos_progressing"] = self.heading_prog_sum / self.heading_prog_n
+        if self.heading_thrash_n:
+            out["stall/heading_cos_thrashing"] = self.heading_thrash_sum / self.heading_thrash_n
+        d = self.mean_dwell()
+        if (self.bin_dwell_n > 0).any():
+            out["stall/dwell_max"] = float(d.max())
+            out["stall/dwell_mean"] = float(d[self.bin_dwell_n > 0].mean())
         fb = self.frontier_bin()
         if fb is not None:
             out["stall/frontier_bin"] = float(fb)
@@ -245,7 +328,8 @@ class EpisodeTracker:
         once the agent stops dying, when the death map degenerates into an
         isochrone.
         """
-        grid = self.stalls if source == "stalls" else self.deaths
+        grid = {"stalls": self.stalls, "stuck": self.stuck, "thrash": self.thrash,
+                "oscillation": self.oscillation}.get(source, self.deaths)
         if grid.sum() == 0:
             return None
 

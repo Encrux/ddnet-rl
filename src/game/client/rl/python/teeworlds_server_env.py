@@ -100,6 +100,13 @@ AIM_SECTORS = 16
 AIM_RADIUS = 200.0  # arbitrary; only the direction of (aim_x, aim_y) is used
 
 NUM_LOOKAHEAD = 8
+
+# Diagnostics tuning. STUCK_DIST is displacement summed over STUCK_WINDOW steps;
+# below it the tee is genuinely not moving, as opposed to moving without gaining
+# arc-length progress.
+STUCK_WINDOW = 10
+STUCK_DIST = 64.0
+NUM_PROGRESS_BINS = 200
 NAV_DIM = 1 + 2 * NUM_LOOKAHEAD  # progress + (x, y) per lookahead point
 FLAT_OBS_DIM = 15 + NAV_DIM + 49  # MLP mode: player + nav + 7x7 tile crop
 # Per-index normalisation: lookahead k sits ~64 * 2^k units ahead, so dividing by
@@ -1314,6 +1321,23 @@ class TeeWorldsServerEnv:
         self._best_progress = np.zeros(self.num_bots, dtype=np.float32)
         self._stalled = np.zeros(self.num_bots, dtype=bool)
         self._step_positions = np.zeros((self.num_bots, 2), dtype=np.float32)
+        # Diagnostics that disambiguate "stall" into its distinct causes.
+        # "Didn't beat high-water progress" fuses being stuck, thrashing, moving
+        # off-path, and deliberately backing up for a jump — which need opposite
+        # fixes. These separate them.
+        self._prev_positions = np.zeros((self.num_bots, 2), dtype=np.float32)
+        self._disp_window = np.zeros((self.num_bots, STUCK_WINDOW), dtype=np.float32)
+        self._disp_ptr = 0
+        self._frozen = np.zeros(self.num_bots, dtype=bool)
+        self._stuck = np.zeros(self.num_bots, dtype=bool)
+        self._thrash = np.zeros(self.num_bots, dtype=bool)
+        self._heading_cos = np.zeros(self.num_bots, dtype=np.float32)
+        self._cur_bin = np.zeros(self.num_bots, dtype=np.int32)
+        self._bin_dwell = np.zeros(self.num_bots, dtype=np.int32)
+        self._oscillated = np.zeros(self.num_bots, dtype=bool)
+        self._dwell_done = np.full(self.num_bots, -1, dtype=np.int32)  # -1 = none this step
+        self._dwell_steps_done = np.zeros(self.num_bots, dtype=np.int32)
+        self._heading_valid = np.zeros(self.num_bots, dtype=bool)
 
         # Checkpoint respawn manager
         self.spawn_manager = None
@@ -1895,6 +1919,7 @@ class TeeWorldsServerEnv:
             self._stalled = self._last_progress <= self._best_progress + 1e-6
             np.maximum(self._best_progress, self._last_progress, out=self._best_progress)
             self._step_positions = positions
+            self._update_diagnostics(positions)
             finished = self._last_progress >= self.config.finish_progress
             # A virtual finish ends the episode just like a server-side done.
             dones = dones | finished
@@ -1955,6 +1980,12 @@ class TeeWorldsServerEnv:
                 start_progress = self.path_progress.update(landed)
                 self._last_progress[reset_mask] = start_progress[reset_mask]
                 self._best_progress[reset_mask] = start_progress[reset_mask]
+                self._prev_positions[reset_mask] = landed[reset_mask]
+                self._disp_window[reset_mask] = 0.0
+                self._bin_dwell[reset_mask] = 0
+                self._cur_bin[reset_mask] = np.clip(
+                    (start_progress[reset_mask] * NUM_PROGRESS_BINS).astype(np.int32),
+                    0, NUM_PROGRESS_BINS - 1)
                 self._episode_from_start[reset_mask] = start_progress[reset_mask] < 0.002
             else:
                 self._best_progress[reset_mask] = 0.0
@@ -2119,6 +2150,64 @@ class TeeWorldsServerEnv:
             xy = obs_arr[:, POS_OFFSET:POS_OFFSET + 8].copy().view(np.float32).reshape(n, 2)
             result[start_idx:start_idx + n] = xy
         return result
+
+    def _update_diagnostics(self, positions: np.ndarray) -> None:
+        """Split "stall" into stuck / thrash / frozen, plus heading and dwell."""
+        delta = positions - self._prev_positions
+        step_disp = np.linalg.norm(delta, axis=1)
+        self._prev_positions = positions.copy()
+
+        # Displacement summed over a window: one slow step is not "stuck".
+        self._disp_window[:, self._disp_ptr] = step_disp
+        self._disp_ptr = (self._disp_ptr + 1) % STUCK_WINDOW
+        windowed = self._disp_window.sum(axis=1)
+
+        self._frozen = self._read_frozen()
+        # Stuck = barely moved at all. Thrash = moved plenty, gained nothing.
+        # These are opposite failures and the old metric counted them as one.
+        self._stuck = self._stalled & (windowed < STUCK_DIST)
+        self._thrash = self._stalled & (windowed >= STUCK_DIST)
+
+        # Heading alignment: is the agent actually driving the wrong way, or just
+        # flailing? Persistently negative means committed to a wrong direction
+        # (a navigation failure); near zero means undirected (an execution one).
+        idx = np.minimum(self.path_progress._idx + 4, len(self.path_progress.xy) - 1)
+        to_wp = self.path_progress.xy[idx] - positions
+        n1 = np.linalg.norm(delta, axis=1)
+        n2 = np.linalg.norm(to_wp, axis=1)
+        ok = (n1 > 1e-3) & (n2 > 1e-3)
+        self._heading_cos = np.zeros(self.num_envs, dtype=np.float32)
+        self._heading_cos[ok] = ((delta[ok] * to_wp[ok]).sum(1) / (n1[ok] * n2[ok])).astype(np.float32)
+        self._heading_valid = ok
+
+        # Dwell per progress bin: honest "how long does this bit take", free of
+        # the off-path and spawn-dead-zone confounds that leak into stall rate.
+        new_bin = np.clip((self._last_progress * NUM_PROGRESS_BINS).astype(np.int32),
+                          0, NUM_PROGRESS_BINS - 1)
+        self._oscillated = new_bin < self._cur_bin
+        advanced = new_bin > self._cur_bin
+        self._dwell_done = np.where(advanced, self._cur_bin, -1)
+        self._dwell_steps_done = np.where(advanced, self._bin_dwell, 0)
+        self._bin_dwell = np.where(advanced | self._oscillated, 0, self._bin_dwell + 1)
+        self._cur_bin = new_bin
+
+    def _read_frozen(self) -> np.ndarray:
+        """Read every bot's DDNet freeze flag. Returns (num_envs,) bool.
+
+        Unlike every other "stuck" signal this one is game-mechanical rather than
+        inferred: no threshold, no window, no confound. It partitions the rest.
+        """
+        # m_IsFrozen sits at byte 30 of SPlayerObs, which follows the 8-byte header.
+        FROZEN_OFFSET = 8 + 30
+        out = np.zeros(self.num_envs, dtype=bool)
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            start_idx = server_idx * self.num_bots_per_server
+            n = self.num_bots_per_server
+            shm_client.shm_mmap.seek(CONTIGUOUS_OBS_OFFSET)
+            arr = np.frombuffer(shm_client.shm_mmap.read(n * OBS_SIZE),
+                                dtype=np.uint8).reshape(n, OBS_SIZE)
+            out[start_idx:start_idx + n] = arr[:, FROZEN_OFFSET] != 0
+        return out
 
     def _read_checkpoint_indices(self) -> np.ndarray:
         """Read checkpoint indices from raw shm observations for all bots."""
