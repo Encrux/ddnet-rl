@@ -29,6 +29,7 @@ CBotManager::CBotManager(CGameContext *pGameContext) :
 	m_SpawnPos(0, 0),
 	m_FinishPos(0, 0),
 	m_MapAnalyzed(false),
+	m_SnapshotsCaptured(0),
 	m_MaxAdvance(8),
 	m_TotalPathLength(0.0f),
 	m_WaypointsLoaded(false),
@@ -200,7 +201,7 @@ bool CBotManager::CreateBotPlayers()
 		}
 
 		// Initialize reward state
-		ResetRewardState(i);
+		ResetRewardState(i, GetSpawnPos());
 
 		// Store bot client ID in shared memory (contiguous layout)
 		int32_t *pBotClientId = m_pShm->GetBotClientId(i);
@@ -361,18 +362,19 @@ void CBotManager::InjectBotInputs()
 			}
 			if(pPlayer)
 			{
-				int SpawnCp = pAction->m_RestoreSlot;
-				vec2 SpawnPos;
-				if(SpawnCp >= 0 && SpawnCp < (int)m_vCheckpoints.size())
-					SpawnPos = m_vCheckpoints[SpawnCp].m_Pos;
-				else
-					SpawnPos = GetSpawnPos();
+				// Spawn first — CSaveTee::Load needs a live character to write into.
+				vec2 SpawnPos = GetSpawnPos();
 				pPlayer->ForceSpawn(SpawnPos);
-				ResetRewardState(i, SpawnCp);
+
+				CCharacter *pNewChar = pPlayer->GetCharacter();
+				if(pAction->m_RestoreSlot >= 0 && RestoreSnapshot(pAction->m_RestoreSlot, pNewChar))
+					SpawnPos = pNewChar->GetPos();  // restore moved us; re-seed from there
+
+				ResetRewardState(i, SpawnPos);
 			}
 			else
 			{
-				ResetRewardState(i);
+				ResetRewardState(i, GetSpawnPos());
 			}
 			pAction->m_Reset = 0;
 			pAction->m_RestoreSlot = -1;
@@ -509,6 +511,7 @@ void CBotManager::ExtractObservations()
 
 				pObs->m_Progress = State.m_LastPhi;
 				FillLookahead(i, Pos, pObs);
+				CaptureSnapshot(i, pChar, State.m_LastPhi);
 			}
 			else
 			{
@@ -683,6 +686,42 @@ void CBotManager::FillLookahead(int BotIndex, vec2 Pos, SStructuredObservation *
 	}
 }
 
+int CBotManager::ProgressToBin(float Phi)
+{
+	int Bin = (int)(Phi * NUM_PROGRESS_BINS);
+	return std::clamp(Bin, 0, NUM_PROGRESS_BINS - 1);
+}
+
+// Latest-wins per bin. A snapshot from the current policy is a more useful
+// restore point than a stale one from an earlier, worse policy, and it keeps the
+// archive self-refreshing without needing a "better" metric or per-bot timers.
+void CBotManager::CaptureSnapshot(int BotIndex, CCharacter *pChar, float Phi)
+{
+	if(!pChar || !pChar->IsAlive() || m_vSnapshots.empty())
+		return;
+
+	SBotRewardState &State = m_aBotState[BotIndex];
+	int Bin = ProgressToBin(Phi);
+	if(Bin == State.m_LastBin)
+		return;  // only on bin transitions, not every decision tick
+	State.m_LastBin = Bin;
+
+	// AddPenalty = false: this is not a /save, we do not want the time penalty.
+	m_vSnapshots[Bin].Save(pChar, false);
+	if(!m_vSnapshotValid[Bin])
+		m_SnapshotsCaptured++;
+	m_vSnapshotValid[Bin] = 1;
+}
+
+bool CBotManager::RestoreSnapshot(int Slot, CCharacter *pChar)
+{
+	if(!pChar || Slot < 0 || Slot >= (int)m_vSnapshots.size() || !m_vSnapshotValid[Slot])
+		return false;
+	// Team = nullopt: skip team bookkeeping entirely. Load() never reassigns the
+	// client id, so a snapshot taken by any bot restores into any other.
+	return m_vSnapshots[Slot].Load(pChar, std::nullopt);
+}
+
 float CBotManager::GetNormalizedProgress(int BotIndex, vec2 Pos)
 {
 	if(!m_WaypointsLoaded || m_TotalPathLength <= 0.0f)
@@ -749,27 +788,20 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 	return Reward;
 }
 
-void CBotManager::ResetRewardState(int BotIndex, int SpawnCheckpoint)
+void CBotManager::ResetRewardState(int BotIndex, vec2 SpawnPos)
 {
 	SBotRewardState &State = m_aBotState[BotIndex];
 	State.m_LastHookState = 0;
 	State.m_WasDead = false;
-
-	// Reset exploration tracking
 	State.m_VisitedRegions.reset();
 	State.m_NewRegionsThisEpisode = 0;
-
-	vec2 SpawnPos = m_SpawnPos;
-	if(SpawnCheckpoint >= 0 && SpawnCheckpoint < (int)m_vCheckpoints.size())
-		SpawnPos = m_vCheckpoints[SpawnCheckpoint].m_Pos;
-
 	State.m_LastPosX = SpawnPos.x;
 	State.m_LastPosY = SpawnPos.y;
-	State.m_HighestTimeCp = (SpawnCheckpoint >= 0) ? SpawnCheckpoint : -1;
+	State.m_HighestTimeCp = -1;
 
-	// Seed the tracked index with an unrestricted scan — this is the one place a
-	// backward jump is legitimate, because the episode boundary breaks temporal
-	// continuity by design. Everywhere else the match is windowed.
+	// Seed the tracked index with an unrestricted scan — the one place a
+	// backward jump is legitimate, because an episode boundary (or a restore
+	// into an arbitrary mid-map state) breaks temporal continuity by design.
 	if(m_WaypointsLoaded)
 	{
 		State.m_WaypointIndex = FindClosestWaypoint(SpawnPos, 0, (int)m_vWaypoints.size());
@@ -780,6 +812,9 @@ void CBotManager::ResetRewardState(int BotIndex, int SpawnCheckpoint)
 		State.m_WaypointIndex = 0;
 		State.m_LastPhi = 0.0f;
 	}
+	// Seed the bin too, or the first tick after a restore snapshots a state we
+	// just restored from and overwrites a good entry with a duplicate.
+	State.m_LastBin = ProgressToBin(State.m_LastPhi);
 }
 
 void CBotManager::RespawnAllBots()
@@ -795,7 +830,7 @@ void CBotManager::RespawnAllBots()
 				pPlayer->KillCharacter(WEAPON_GAME, false);
 			}
 			pPlayer->Respawn();
-			ResetRewardState(i);
+			ResetRewardState(i, GetSpawnPos());
 		}
 	}
 }
@@ -1056,6 +1091,11 @@ bool CBotManager::LoadWaypoints(const std::string &Path)
 		NumPoints, m_TotalPathLength);
 
 	SegmentPathAtDiscontinuities();
+
+	// Archive is progress-binned, so it only makes sense once a path exists.
+	m_vSnapshots.assign(NUM_PROGRESS_BINS, CSaveTee());
+	m_vSnapshotValid.assign(NUM_PROGRESS_BINS, 0);
+	m_SnapshotsCaptured = 0;
 
 	UpdateMatchWindow();
 	return true;

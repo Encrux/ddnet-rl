@@ -9,6 +9,7 @@
 #define GAME_SERVER_RL_BOTMANAGER_H
 
 #include <game/rl/rl_protocol.h>
+#include <game/server/save.h>
 #include <base/vmath.h>
 #include <generated/protocol.h>
 #include <bitset>
@@ -75,7 +76,7 @@ private:
 
 	// Reward calculation
 	float CalculateReward(int BotIndex, const SStructuredObservation *pObs, bool IsDecisionTick);
-	void ResetRewardState(int BotIndex, int SpawnCheckpoint = -1);
+	void ResetRewardState(int BotIndex, vec2 SpawnPos);
 
 	// Normalised path progress in [0, 1] for a bot, advancing its tracked
 	// waypoint index. The only progress coordinate that is well-defined on every
@@ -122,6 +123,7 @@ private:
 		int m_WaypointIndex;  // Tracked waypoint index; only moves within a
 		                      // physically plausible window (see FindClosestWaypoint)
 		float m_LastPhi;      // Previous normalised progress, for potential-based shaping
+		int m_LastBin;        // Progress bin last snapshotted from; capture only on change
 
 		// Exploration tracking - coarse grid (8x8 tiles per region)
 		// 64x64 regions = 4096 bits = 512 bytes per bot
@@ -190,6 +192,33 @@ private:
 		int m_SegmentId;        // Path segment; increments across a teleport/discontinuity
 	};
 	std::vector<SWaypoint> m_vWaypoints;
+
+	// ------------------------------------------------------------------
+	// Snapshot archive (roadmap.md §3.1)
+	//
+	// CSaveTee is DDNet's own /save machinery and captures the COMPLETE tee:
+	// position, velocity, hook pos/dir/tick/state, freeze timer, jumps
+	// remaining, weapons, ninja, tele checkpoint, race state. That last part is
+	// what makes it the right primitive and checkpoint respawn the wrong one —
+	// most non-trivial DDNet obstacles require arriving with specific momentum,
+	// so respawning at a position while standing still poses a different, often
+	// unsolvable, problem to the one a from-start rollout faces.
+	//
+	// Load() with Team = nullopt skips all team handling and never reassigns the
+	// client id, so a snapshot taken by one bot restores cleanly into another.
+	// That transferability is the whole point: the minority that clear an
+	// obstacle donate their state to the majority that cannot.
+	//
+	// Binned by normalised path progress so a slot index means the same thing on
+	// every map and at every stage of training.
+	static constexpr int NUM_PROGRESS_BINS = 200;  // 0.5% of the path each
+	std::vector<CSaveTee> m_vSnapshots;            // NUM_PROGRESS_BINS entries
+	std::vector<uint8_t> m_vSnapshotValid;
+	int m_SnapshotsCaptured;
+
+	void CaptureSnapshot(int BotIndex, CCharacter *pChar, float Phi);
+	bool RestoreSnapshot(int Slot, CCharacter *pChar);
+	static int ProgressToBin(float Phi);
 
 	// Temporal-coherence window for waypoint matching. A merely spatial search
 	// matches the wrong strand wherever the path doubles back on itself — on
