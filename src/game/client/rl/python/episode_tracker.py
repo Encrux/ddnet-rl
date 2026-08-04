@@ -54,6 +54,7 @@ class EpisodeTracker:
         cell_size: float = 64.0,
         margin: float = 1024.0,
         history: int = 2000,
+        num_bins: int = 200,
     ):
         min_x, min_y, max_x, max_y = bounds
         self.origin = np.array([min_x - margin, min_y - margin], dtype=np.float32)
@@ -64,6 +65,24 @@ class EpisodeTracker:
         # Cumulative across the whole run — the frontier is a slow-moving thing.
         self.deaths = np.zeros((self.grid_h, self.grid_w), dtype=np.int64)
 
+        # Stall accounting.
+        #
+        # The death heatmap shows where episodes END. Once the agent stops dying
+        # that degenerates into an isochrone — "where you are after N seconds" —
+        # which says nothing about difficulty. Stall time says where it STRUGGLES,
+        # which is the thing a curriculum actually needs to key off.
+        #
+        # It also settles a question percentiles cannot: the agent averaged 175
+        # units/s on the extended slice against 451 on the flat opening. Either
+        # climbing terrain is genuinely 2.6x slower, or it spends ~61% of each
+        # episode not progressing. Those need different fixes.
+        self.stalls = np.zeros((self.grid_h, self.grid_w), dtype=np.int64)
+        self.num_bins = num_bins
+        self.bin_stalls = np.zeros(num_bins, dtype=np.int64)
+        self.bin_visits = np.zeros(num_bins, dtype=np.int64)
+        self.total_steps = 0
+        self.stalled_steps = 0
+
         self._progress = deque(maxlen=history)
         self._from_start = deque(maxlen=history)
         self._finished = deque(maxlen=history)
@@ -71,6 +90,72 @@ class EpisodeTracker:
         self.total_episodes = 0
         self.total_finishes = 0
         self.best_progress = 0.0
+
+    # ------------------------------------------------------------------- stall
+
+    def record_step(self, positions: np.ndarray, progress: np.ndarray,
+                    stalled: np.ndarray) -> None:
+        """Accumulate per-step stall statistics for every env.
+
+        `stalled` is True where the env failed to beat its own best progress this
+        step — i.e. it burned a step without advancing the high-water mark.
+        """
+        n = len(positions)
+        if n == 0:
+            return
+        self.total_steps += n
+        ns = int(stalled.sum())
+        self.stalled_steps += ns
+
+        bins = np.clip((progress * self.num_bins).astype(np.int32), 0, self.num_bins - 1)
+        np.add.at(self.bin_visits, bins, 1)
+        if ns:
+            cells = ((positions[stalled] - self.origin) / self.cell_size).astype(np.int32)
+            np.clip(cells[:, 0], 0, self.grid_w - 1, out=cells[:, 0])
+            np.clip(cells[:, 1], 0, self.grid_h - 1, out=cells[:, 1])
+            np.add.at(self.stalls, (cells[:, 1], cells[:, 0]), 1)
+            np.add.at(self.bin_stalls, bins[stalled], 1)
+
+    def frontier_bin(self, min_visits: int = 200) -> Optional[int]:
+        """Where the most time is burned near the edge of explored territory.
+
+        Naively taking argmax of stall rate does not work: early in training bin 0
+        has both the highest traffic and the highest stall rate, because that is
+        where a fresh policy flails. Any traffic-weighted score therefore pins the
+        frontier to the spawn forever.
+
+        So locate the EXPLORATION EDGE first — the furthest bin agents actually
+        reach — and only then find the biggest time sink near it. That ignores the
+        spawn unless the spawn genuinely is the edge, which early on it is.
+        """
+        if self.bin_visits.max() < min_visits:
+            return None
+        floor = max(min_visits, 0.01 * self.bin_visits.max())
+        reached = np.nonzero(self.bin_visits >= floor)[0]
+        if len(reached) == 0:
+            return None
+        edge = int(reached[-1])
+
+        # Among bins in the run-up to the edge, pick the one absorbing the most
+        # stalled steps. Total stalls, not rate: a bin nobody reaches can have a
+        # 100% stall rate and still be irrelevant.
+        lo = max(0, edge - 2 * 12)
+        window = self.bin_stalls[lo:edge + 1]
+        if window.sum() == 0:
+            return edge
+        return int(lo + np.argmax(window))
+
+    def exploration_edge(self, min_visits: int = 200) -> Optional[int]:
+        """Furthest bin agents actually reach."""
+        if self.bin_visits.max() < min_visits:
+            return None
+        floor = max(min_visits, 0.01 * self.bin_visits.max())
+        reached = np.nonzero(self.bin_visits >= floor)[0]
+        return int(reached[-1]) if len(reached) else None
+
+    def reached_bins(self, min_visits: int = 50) -> np.ndarray:
+        """Bins agents actually reach — a proxy for which archive slots exist."""
+        return np.nonzero(self.bin_visits >= min_visits)[0]
 
     # ------------------------------------------------------------------ record
 
@@ -126,6 +211,15 @@ class EpisodeTracker:
             "episodes/length_mean": float(lengths.mean()),
             "episodes/n": int(len(prog)),
         }
+        if self.total_steps:
+            out["stall/fraction"] = self.stalled_steps / self.total_steps
+        fb = self.frontier_bin()
+        if fb is not None:
+            out["stall/frontier_bin"] = float(fb)
+            out["stall/frontier_progress"] = fb / self.num_bins
+        ee = self.exploration_edge()
+        if ee is not None:
+            out["stall/exploration_edge"] = ee / self.num_bins
 
         # The headline metric. Episodes that started mid-map say nothing about
         # whether the agent can actually run the map.
@@ -143,17 +237,21 @@ class EpisodeTracker:
     # ------------------------------------------------------------------- image
 
     def heatmap_image(self, path_xy: Optional[np.ndarray] = None,
-                      upscale: int = 1) -> Optional[np.ndarray]:
-        """Render the death heatmap as HWC uint8, path overlaid in dim blue.
+                      upscale: int = 1, source: str = "deaths") -> Optional[np.ndarray]:
+        """Render a heatmap as HWC uint8, path overlaid in dim blue.
 
-        Returns None if no deaths have been recorded yet.
+        source="deaths" -> where episodes ended without finishing.
+        source="stalls" -> where time was burned without advancing. Prefer this
+        once the agent stops dying, when the death map degenerates into an
+        isochrone.
         """
-        if self.deaths.sum() == 0:
+        grid = self.stalls if source == "stalls" else self.deaths
+        if grid.sum() == 0:
             return None
 
-        # Log scale: death counts are extremely peaked at the frontier, and a
+        # Log scale: counts are extremely peaked at the frontier, and a
         # linear scale shows one bright pixel and nothing else.
-        norm = np.log1p(self.deaths.astype(np.float32))
+        norm = np.log1p(grid.astype(np.float32))
         norm /= max(norm.max(), 1e-6)
         img = _colorize(norm)
 
@@ -163,7 +261,7 @@ class EpisodeTracker:
                   (cells[:, 1] >= 0) & (cells[:, 1] < self.grid_h))
             cx, cy = cells[ok, 0], cells[ok, 1]
             # Only draw where nothing died, so the path never hides a hot cell.
-            cold = self.deaths[cy, cx] == 0
+            cold = grid[cy, cx] == 0
             img[cy[cold], cx[cold]] = (40, 70, 120)
 
         if upscale > 1:

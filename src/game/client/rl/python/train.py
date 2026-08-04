@@ -245,6 +245,11 @@ def parse_args():
     parser.add_argument("--finish-progress", type=float, default=1.0,
                         help="Virtual finish line as normalised path progress. 1.0 = real end of "
                              "map; lower slices the map short for fast iteration (default: 1.0)")
+    parser.add_argument("--frontier-curriculum", action="store_true",
+                        help="Restore agents near the stall-derived frontier (Phase 2.3). "
+                             "Distinct from --curriculum, which selects maps/segments.")
+    parser.add_argument("--frontier-window", type=int, default=12,
+                        help="Bins before the frontier to sample restore slots from")
     parser.add_argument("--waypoints-path", type=str, default=None,
                         help="Override waypoint file autodiscovery (waypoints/, then ghosts/)")
 
@@ -333,6 +338,8 @@ def main():
             top_fraction=args.top_fraction,
             finish_progress=args.finish_progress,
             waypoints_path=args.waypoints_path,
+            curriculum=args.frontier_curriculum,
+            frontier_window=args.frontier_window,
         )
         # Use default server_path (resolved relative to teeworlds_server_env.py)
         env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)
@@ -491,6 +498,12 @@ def main():
 
                 obs = next_obs
 
+                # Per-step stall accounting -> stall map -> frontier estimate.
+                if tracker is not None and getattr(base_env, '_stalled', None) is not None:
+                    tracker.record_step(base_env._step_positions,
+                                        base_env._last_progress,
+                                        base_env._stalled)
+
                 # Track episodes
                 ep_batch = []
                 for info in infos:
@@ -508,6 +521,14 @@ def main():
                         finished=np.array([e['finished'] for e in ep_batch]),
                         lengths=np.array([e['l'] for e in ep_batch]),
                     )
+
+            # Refresh the curriculum's frontier estimate from accumulated stall
+            # statistics. Once per update is plenty — the frontier moves slowly,
+            # and re-deriving it per step would just add noise.
+            if tracker is not None and base_env.spawn_manager is not None and \
+               hasattr(base_env.spawn_manager, 'update_frontier'):
+                base_env.spawn_manager.update_frontier(tracker.frontier_bin(),
+                                                       tracker.reached_bins())
 
             # PPO update (optionally pause to prevent bots from acting with stale policy)
             rollout_time = time.time() - rollout_start
@@ -533,7 +554,9 @@ def main():
                     ts = tracker.stats()
                     if ts:
                         head = (f"Fin {ts.get('episodes/finish_rate_from_start', 0.0):5.1%} | "
-                                f"Prog {ts['progress/p50']:.3f}/{ts['progress/max']:.3f} | ")
+                                f"Prog {ts['progress/p50']:.3f}/{ts['progress/max']:.3f} | "
+                                f"Stall {ts.get('stall/fraction', 0.0):4.0%} | "
+                                f"Fr {ts.get('stall/frontier_progress', -1.0):.3f} | ")
                 print(f"Update {update:5d} | Step {global_step:9,d} | "
                       f"FPS {fps:6.0f} | "
                       f"{head}"
@@ -571,17 +594,19 @@ def main():
                     if len(prog_vals):
                         writer.add_histogram("progress/hist", prog_vals, global_step)
                     if update % (args.log_freq * 10) == 0:
-                        img = tracker.heatmap_image(base_env.path_progress.xy)
-                        if img is not None:
-                            writer.add_image("progress/death_heatmap", img,
-                                             global_step, dataformats='HWC')
+                        for src, tag in (("deaths", "progress/death_heatmap"),
+                                         ("stalls", "progress/stall_heatmap")):
+                            img = tracker.heatmap_image(base_env.path_progress.xy, source=src)
+                            if img is not None:
+                                writer.add_image(tag, img, global_step, dataformats='HWC')
 
-                # Log checkpoint respawn stats
+                # Log curriculum / respawn stats
                 if hasattr(base_env, 'spawn_manager') and base_env.spawn_manager is not None:
-                    spawn_stats = base_env.spawn_manager.get_stats()
-                    writer.add_scalar("charts/spawn_mean_cp", spawn_stats['spawn_mean_cp'], global_step)
-                    writer.add_scalar("charts/spawn_max_cp", spawn_stats['spawn_max_cp'], global_step)
-                    writer.add_scalar("charts/spawn_frontier", spawn_stats['spawn_frontier'], global_step)
+                    # Both managers expose get_stats(); log whatever keys they give
+                    # rather than assuming the checkpoint-era key names.
+                    for k, v in base_env.spawn_manager.get_stats().items():
+                        tag = k if '/' in k else f"charts/{k}"
+                        writer.add_scalar(tag, v, global_step)
 
             # Save checkpoint
             if update % args.save_freq == 0:

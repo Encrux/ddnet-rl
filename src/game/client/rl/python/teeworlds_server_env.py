@@ -152,6 +152,75 @@ def _get_default_server_path() -> str:
     return os.path.join(_REPO_ROOT, "build/DDNet-Server")
 
 
+class ProgressSpawnManager:
+    """Samples archive slots to restore agents near the frontier.
+
+    Replaces CheckpointSpawnManager. Time checkpoints were the wrong index: too
+    sparse to land near a frontier (the first is typically ~4% into a map, while
+    a frontier can sit at 2.9%), mapper-authored, and they gave a position
+    without the arrival momentum most DDNet obstacles require.
+
+    Why frontier-WEIGHTED sampling rather than a Salimans-Chen backward cursor:
+    a cursor advances on binary success, and this agent produces none — zero
+    deaths and zero finishes across a 19M-step run, just steady traversal until
+    the clock expires. There is nothing for a cursor to step on. Stall time is
+    the only difficulty signal available, so we sample around where it peaks.
+
+    The window sits just BEFORE the frontier, not on it, so the agent practises
+    the approach as well as the obstacle. Restoring exactly onto an obstacle
+    trains a policy that only ever sees it from a standstill.
+    """
+
+    def __init__(self, begin_bias: float = 0.2, window: int = 12, num_bins: int = 200):
+        self.begin_bias = begin_bias
+        self.window = window
+        self.num_bins = num_bins
+        self._frontier: Optional[int] = None
+        self._reached = np.zeros(0, dtype=np.int64)
+        self.last_sampled = np.zeros(0, dtype=np.int32)
+
+    def update_frontier(self, frontier_bin: Optional[int], reached_bins: np.ndarray) -> None:
+        """Feed in the tracker's stall-based frontier estimate."""
+        self._frontier = frontier_bin
+        self._reached = reached_bins
+
+    def sample(self, n: int) -> np.ndarray:
+        """Sample n restore slots. -1 means spawn at the map start."""
+        out = np.full(n, -1, dtype=np.int32)
+        if self._frontier is None or len(self._reached) == 0:
+            return out  # no frontier estimate yet: everyone starts at the beginning
+
+        lo = max(0, self._frontier - self.window)
+        hi = self._frontier
+        # Only offer slots agents have actually reached; anything else is very
+        # likely an empty archive bin and would silently fall back to spawn.
+        candidates = self._reached[(self._reached >= lo) & (self._reached <= hi)]
+        if len(candidates) == 0:
+            return out
+
+        # begin_bias never goes away. It is both the honest from-start metric and
+        # the guard against Go-Explore's phase-2 failure, where a policy learns
+        # every segment and cannot chain them.
+        use_archive = np.random.random(n) >= self.begin_bias
+        k = int(use_archive.sum())
+        if k:
+            out[use_archive] = np.random.choice(candidates, size=k)
+        self.last_sampled = out
+        return out
+
+    def get_stats(self) -> dict:
+        s = {
+            'curriculum/frontier_bin': float(self._frontier) if self._frontier is not None else -1.0,
+            'curriculum/reached_bins': float(len(self._reached)),
+        }
+        if len(self.last_sampled):
+            restored = self.last_sampled[self.last_sampled >= 0]
+            s['curriculum/restore_fraction'] = float(len(restored) / len(self.last_sampled))
+            if len(restored):
+                s['curriculum/restore_bin_mean'] = float(restored.mean())
+        return s
+
+
 class CheckpointSpawnManager:
     """Tracks agent progress and samples spawn checkpoints for adaptive restart.
 
@@ -243,6 +312,8 @@ class ServerEnvConfig:
     # fast iteration without editing the map itself (PLAN.md Phase 0.1).
     finish_progress: float = 1.0
     waypoints_path: Optional[str] = None  # Override waypoint file autodiscovery
+    curriculum: bool = False       # Restore agents near the frontier (Phase 2.3)
+    frontier_window: int = 12      # Bins before the frontier to sample from
 
     def __post_init__(self):
         if self.server_path is None:
@@ -1239,10 +1310,19 @@ class TeeWorldsServerEnv:
         # the headline from-start finish rate.
         self._episode_from_start = np.ones(self.num_bots, dtype=bool)
         self._last_progress = np.zeros(self.num_bots, dtype=np.float32)
+        # High-water progress this episode, for stall detection.
+        self._best_progress = np.zeros(self.num_bots, dtype=np.float32)
+        self._stalled = np.zeros(self.num_bots, dtype=bool)
+        self._step_positions = np.zeros((self.num_bots, 2), dtype=np.float32)
 
         # Checkpoint respawn manager
         self.spawn_manager = None
-        if self.config.checkpoint_respawn:
+        if self.config.curriculum:
+            self.spawn_manager = ProgressSpawnManager(
+                begin_bias=self.config.begin_bias,
+                window=self.config.frontier_window,
+            )
+        elif self.config.checkpoint_respawn:
             self.spawn_manager = CheckpointSpawnManager(
                 begin_bias=self.config.begin_bias,
                 top_fraction=self.config.top_fraction,
@@ -1808,6 +1888,13 @@ class TeeWorldsServerEnv:
         if self.path_progress is not None:
             positions = self._read_positions()
             self._last_progress = self.path_progress.update(positions)
+            # Stalled = burned a step without beating this episode's high-water
+            # progress. Aggregated by the tracker into a stall map, which is what
+            # locates the frontier once the agent stops dying and the death map
+            # degenerates into an isochrone.
+            self._stalled = self._last_progress <= self._best_progress + 1e-6
+            np.maximum(self._best_progress, self._last_progress, out=self._best_progress)
+            self._step_positions = positions
             finished = self._last_progress >= self.config.finish_progress
             # A virtual finish ends the episode just like a server-side done.
             dones = dones | finished
@@ -1834,53 +1921,46 @@ class TeeWorldsServerEnv:
         reset_mask = dones | truncated
         if np.any(reset_mask):
             spawn_cps = None
-            if self.spawn_manager is not None:
-                # Extract checkpoint indices from raw shm before reset overwrites them
-                # cp_indices = m_NumCheckpointsReached, which includes spawn offset
+            n_reset = int(reset_mask.sum())
+            if isinstance(self.spawn_manager, ProgressSpawnManager):
+                spawn_cps = np.full(self.num_envs, -1, dtype=np.int32)
+                spawn_cps[reset_mask] = self.spawn_manager.sample(n_reset)
+            elif self.spawn_manager is not None:
                 cp_indices = self._read_checkpoint_indices()
                 for i in np.where(reset_mask)[0]:
-                    # cp_indices[i] = m_HighestTimeCp (0-based index, -1 if none).
-                    # For spawn at CP N: m_HighestTimeCp starts at N.
                     spawn_cp = self._agent_spawn_cp[i]
                     highest_cp = int(cp_indices[i])
-                    if spawn_cp >= 0:
-                        earned = max(0, highest_cp - spawn_cp)
-                    else:
-                        # Spawned at start: highest_cp is 0-based index, +1 for count
-                        earned = highest_cp + 1 if highest_cp >= 0 else 0
-                    # Only record if agent actually progressed beyond spawn
+                    earned = (max(0, highest_cp - spawn_cp) if spawn_cp >= 0
+                              else (highest_cp + 1 if highest_cp >= 0 else 0))
                     if earned > 0:
-                        from_start = spawn_cp < 0
-                        self.spawn_manager.record_episode(highest_cp, from_start=from_start)
-                # Sample spawn checkpoints for resetting agents
-                n_reset = int(reset_mask.sum())
+                        self.spawn_manager.record_episode(highest_cp, from_start=spawn_cp < 0)
                 sampled = self.spawn_manager.sample_spawn_checkpoints(n_reset)
                 spawn_cps = np.full(self.num_envs, -1, dtype=np.int32)
                 spawn_cps[reset_mask] = sampled
-                # Diagnostic: log spawn distribution every 1000 steps
-                if self._step_count % 1000 == 0:
-                    nonstart = sampled[sampled >= 0]
-                    stats = self.spawn_manager.get_stats()
-                    print(f"  [SPAWN] frontier={stats['spawn_frontier']} max_cp={stats['spawn_max_cp']:.0f} "
-                          f"n_reset={n_reset} at_start={int((sampled < 0).sum())} "
-                          f"nonstart_range=[{nonstart.min() if len(nonstart) else -1}, {nonstart.max() if len(nonstart) else -1}]")
-                # Track what each agent spawns at for next episode
-                reset_indices = np.where(reset_mask)[0]
-                for j, i in enumerate(reset_indices):
+                for j, i in enumerate(np.where(reset_mask)[0]):
                     self._agent_spawn_cp[i] = sampled[j]
 
-            # New episodes: forget the tracked waypoint index, and record whether
-            # they start at the map beginning (the from-start finish rate depends
-            # on this being right).
+            self._reset_envs_fast(reset_mask, obs_out, spawn_checkpoints=spawn_cps)
+
+            # Re-seed progress from where the bots ACTUALLY landed, not from what
+            # we asked for. Each server owns an independent archive, so a slot
+            # populated on one server may be empty on another and silently fall
+            # back to the map spawn. Reading the real position back makes
+            # from_start correct by construction instead of by assumption — and
+            # from_start is the headline metric, so getting it wrong would
+            # quietly corrupt every comparison.
             if self.path_progress is not None:
                 self.path_progress.reset(reset_mask)
-                self._last_progress[reset_mask] = 0.0
-            if spawn_cps is not None:
-                self._episode_from_start[reset_mask] = spawn_cps[reset_mask] < 0
+                landed = self._read_positions()
+                start_progress = self.path_progress.update(landed)
+                self._last_progress[reset_mask] = start_progress[reset_mask]
+                self._best_progress[reset_mask] = start_progress[reset_mask]
+                self._episode_from_start[reset_mask] = start_progress[reset_mask] < 0.002
             else:
-                self._episode_from_start[reset_mask] = True
+                self._best_progress[reset_mask] = 0.0
+                self._episode_from_start[reset_mask] = (
+                    True if spawn_cps is None else spawn_cps[reset_mask] < 0)
 
-            self._reset_envs_fast(reset_mask, obs_out, spawn_checkpoints=spawn_cps)
 
         return (
             obs_out,
