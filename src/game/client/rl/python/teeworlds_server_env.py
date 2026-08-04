@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from teeworlds_env import StructuredObservation
+from path_progress import PathProgress
 
 # Try to import numba for JIT acceleration
 try:
@@ -59,10 +60,10 @@ def _warmup_numba_jit():
     n = 2
 
     # Legacy interleaved layout warmup
-    raw = np.zeros(n * 1448, dtype=np.uint8)
-    features = np.zeros((n, 68), dtype=np.float32)
+    raw = np.zeros(n * BOT_DATA_SIZE, dtype=np.uint8)
+    features = np.zeros((n, FLAT_OBS_DIM), dtype=np.float32)
     player_state = np.zeros((n, 15), dtype=np.float32)
-    checkpoint = np.zeros((n, 4), dtype=np.float32)
+    checkpoint = np.zeros((n, NAV_DIM), dtype=np.float32)
     rewards = np.zeros(n, dtype=np.float32)
     dones = np.zeros(n, dtype=np.bool_)
 
@@ -71,7 +72,7 @@ def _warmup_numba_jit():
     _parse_cnn_obs_numba(raw, n, player_state, checkpoint, rewards, dones)
 
     # Contiguous layout warmup
-    obs_arr = np.zeros((n, 1400), dtype=np.uint8)
+    obs_arr = np.zeros((n, OBS_SIZE), dtype=np.uint8)
     _parse_flat_obs_contiguous_numba(obs_arr, n, features, rewards, dones)
 
 # Constants matching C++ rl_protocol.h
@@ -86,19 +87,30 @@ def get_shm_path(server_index: int = 0) -> str:
 
 # Struct sizes (must match C++ rl_protocol.h)
 HEADER_SIZE = 32        # SServerRLHeader
-ACTION_SIZE = 32        # SAction
-OBS_SIZE = 1400         # SStructuredObservation (CNN-optimized: tiles + player + checkpoint)
-BOT_DATA_SIZE = 1448    # SBotData (legacy interleaved layout: 32 + 1400 + 16)
+ACTION_SIZE = 36        # SAction (9 x int32: direction, jump, hook, fire, aim_x, aim_y, weapon, reset, restore_slot)
+OBS_SIZE = 1452         # SStructuredObservation (tiles + player + nav)
+BOT_DATA_SIZE = 1504    # SBotData (legacy interleaved layout: 36 + 1452 + 16)
+
+# Navigation block: normalised progress + geometric path lookahead.
+# Replaces the old 4-feature checkpoint block, which encoded mapper-authored
+# time checkpoints (see rl_protocol.h for why those are unusable across maps).
+NUM_LOOKAHEAD = 8
+NAV_DIM = 1 + 2 * NUM_LOOKAHEAD  # progress + (x, y) per lookahead point
+FLAT_OBS_DIM = 15 + NAV_DIM + 49  # MLP mode: player + nav + 7x7 tile crop
+# Per-index normalisation: lookahead k sits ~64 * 2^k units ahead, so dividing by
+# its own expected magnitude keeps every feature O(1) instead of spanning 62..8000.
+LOOKAHEAD_SCALE = np.array([64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0],
+                           dtype=np.float32)
 
 # Contiguous layout offsets (matches SContiguousServerRLShm in rl_protocol.h)
 # Layout: [Header][Action0..N][Obs0..N][Reward0..N][Done0..N][Truncated0..N][BotClientId0..N]
 CONTIGUOUS_ACTIONS_OFFSET = HEADER_SIZE  # 32
-CONTIGUOUS_OBS_OFFSET = CONTIGUOUS_ACTIONS_OFFSET + MAX_RL_BOTS * ACTION_SIZE  # 32 + 128*32 = 4128
-CONTIGUOUS_REWARDS_OFFSET = CONTIGUOUS_OBS_OFFSET + MAX_RL_BOTS * OBS_SIZE  # 4128 + 128*1400 = 183328
-CONTIGUOUS_DONES_OFFSET = CONTIGUOUS_REWARDS_OFFSET + MAX_RL_BOTS * 4  # 183328 + 512 = 183840
-CONTIGUOUS_TRUNCATED_OFFSET = CONTIGUOUS_DONES_OFFSET + MAX_RL_BOTS * 4  # 183840 + 512 = 184352
-CONTIGUOUS_BOTIDS_OFFSET = CONTIGUOUS_TRUNCATED_OFFSET + MAX_RL_BOTS * 4  # 184352 + 512 = 184864
-CONTIGUOUS_SHM_SIZE = CONTIGUOUS_BOTIDS_OFFSET + MAX_RL_BOTS * 4  # 184864 + 512 = 185376
+CONTIGUOUS_OBS_OFFSET = CONTIGUOUS_ACTIONS_OFFSET + MAX_RL_BOTS * ACTION_SIZE  # 32 + 128*36 = 4640
+CONTIGUOUS_REWARDS_OFFSET = CONTIGUOUS_OBS_OFFSET + MAX_RL_BOTS * OBS_SIZE  # 4640 + 128*1400 = 183840
+CONTIGUOUS_DONES_OFFSET = CONTIGUOUS_REWARDS_OFFSET + MAX_RL_BOTS * 4  # 183840 + 512 = 184352
+CONTIGUOUS_TRUNCATED_OFFSET = CONTIGUOUS_DONES_OFFSET + MAX_RL_BOTS * 4  # 184352 + 512 = 184864
+CONTIGUOUS_BOTIDS_OFFSET = CONTIGUOUS_TRUNCATED_OFFSET + MAX_RL_BOTS * 4  # 184864 + 512 = 185376
+CONTIGUOUS_SHM_SIZE = CONTIGUOUS_BOTIDS_OFFSET + MAX_RL_BOTS * 4  # 185376 + 512 = 185888
 
 # Global reference for signal handler cleanup
 _active_server_env: Optional['TeeWorldsServerEnv'] = None
@@ -126,10 +138,80 @@ def _signal_handler(signum, frame):
     raise KeyboardInterrupt()
 
 
+_REPO_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../../.."))
+
+
 def _get_default_server_path() -> str:
     """Get the default server path relative to this script."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.normpath(os.path.join(script_dir, "../../../../../build/DDNet-Server"))
+    return os.path.join(_REPO_ROOT, "build/DDNet-Server")
+
+
+class CheckpointSpawnManager:
+    """Tracks agent progress and samples spawn checkpoints for adaptive restart.
+
+    On reset, agents spawn at checkpoints sampled from the distribution of
+    best recent episodes, with a configurable bias toward the map start.
+    """
+
+    def __init__(self, begin_bias: float = 0.2, buffer_size: int = 1000, top_fraction: float = 0.3):
+        self.begin_bias = begin_bias
+        self.top_fraction = top_fraction
+        self.buffer: list = []
+        self.buffer_size = buffer_size
+        self._max_from_start = -1  # Frontier: highest time CP index reached from start (-1 = none)
+
+    def record_episode(self, highest_checkpoint: int, from_start: bool):
+        """Record the highest checkpoint reached in a completed episode.
+
+        Args:
+            highest_checkpoint: Highest checkpoint index reached (earned, not spawn offset).
+            from_start: True if the agent spawned at the map beginning.
+        """
+        if highest_checkpoint < 0:
+            highest_checkpoint = 0
+        if len(self.buffer) >= self.buffer_size:
+            self.buffer.pop(0)
+        self.buffer.append(highest_checkpoint)
+        if from_start:
+            self._max_from_start = max(self._max_from_start, highest_checkpoint)
+
+    def sample_spawn_checkpoints(self, n: int) -> np.ndarray:
+        """Sample n spawn checkpoint indices. -1 = map start."""
+        result = np.full(n, -1, dtype=np.int32)
+        if len(self.buffer) < 50 or self._max_from_start < 1:
+            return result  # Not enough data, always spawn at start
+
+        sorted_cps = sorted(self.buffer, reverse=True)
+        top_k = max(1, int(len(sorted_cps) * self.top_fraction))
+        top_cps = np.array(sorted_cps[:top_k])
+        mean_cp = float(np.mean(top_cps))
+        std_cp = max(1.0, float(np.std(top_cps)))
+
+        # Cap spawns to the frontier proven from start
+        max_spawn = self._max_from_start - 1  # Always leave at least 1 CP to reach
+
+        for i in range(n):
+            if np.random.random() < self.begin_bias:
+                result[i] = -1  # spawn at start
+            else:
+                sampled = int(np.random.normal(mean_cp, std_cp))
+                result[i] = max(0, min(sampled, max_spawn))
+        return result
+
+    def get_stats(self) -> dict:
+        """Return stats for logging."""
+        if not self.buffer:
+            return {'spawn_mean_cp': 0.0, 'spawn_max_cp': 0, 'spawn_frontier': 0, 'spawn_buffer_size': 0}
+        sorted_cps = sorted(self.buffer, reverse=True)
+        top_k = max(1, int(len(sorted_cps) * self.top_fraction))
+        top_cps = sorted_cps[:top_k]
+        return {
+            'spawn_mean_cp': float(np.mean(top_cps)),  # Mean of top episodes (what we sample from)
+            'spawn_max_cp': max(self.buffer),  # Highest CP any agent reached
+            'spawn_frontier': self._max_from_start,  # Highest CP reached from start (caps spawns)
+            'spawn_buffer_size': len(self.buffer),
+        }
 
 
 @dataclass
@@ -148,6 +230,14 @@ class ServerEnvConfig:
     sv_name: str = "RL Training" # Server name
     allow_spectators: bool = True  # Allow connecting to watch
     debug_timing: bool = False   # Print step timing debug info
+    checkpoint_respawn: bool = False  # Enable checkpoint respawning
+    begin_bias: float = 0.2          # Probability of spawning at map start
+    top_fraction: float = 0.3        # Fraction of best episodes for spawn sampling
+    # Virtual finish line: end the episode once normalised path progress reaches
+    # this. 1.0 = the real end of the map. Lower values slice the map short for
+    # fast iteration without editing the map itself (PLAN.md Phase 0.1).
+    finish_progress: float = 1.0
+    waypoints_path: Optional[str] = None  # Override waypoint file autodiscovery
 
     def __post_init__(self):
         if self.server_path is None:
@@ -160,7 +250,7 @@ class ServerEnvConfig:
 # Numba-accelerated CNN observation parsing
 @jit(nopython=True, cache=True, parallel=True)
 def _parse_flat_obs_numba(raw_arr: np.ndarray, n: int,
-                           features: np.ndarray,  # (n, 68) - player(15) + checkpoint(4) + tiles(49)
+                           features: np.ndarray,  # (n, FLAT_OBS_DIM) - player(15) + nav(17) + tiles(49)
                            rewards: np.ndarray,
                            dones: np.ndarray) -> None:
     """Parse flat observations for MLP policy - optimized for speed.
@@ -173,7 +263,7 @@ def _parse_flat_obs_numba(raw_arr: np.ndarray, n: int,
     LOCAL_PLAYER = OBS_START + 8  # After 8-byte header
     TILES = LOCAL_PLAYER + 36     # After SPlayerObs
     EXTRA_STATE = TILES + 1333    # After tile grid
-    CHECKPOINT = EXTRA_STATE + 4  # After extra state
+    NAV = EXTRA_STATE + 4  # After extra state
     REWARD_OFF = OBS_START + 1400 # After observation
     DONE_OFF = REWARD_OFF + 4
     BOT_SIZE = 1448
@@ -225,15 +315,12 @@ def _parse_flat_obs_numba(raw_arr: np.ndarray, n: int,
         features[i, 14] = float(jumped) / 3.0
 
         # Checkpoint (4 features) - indices 15-18
-        cp_floats = raw_arr[base + CHECKPOINT:base + CHECKPOINT + 8].view(np.float32)
-        cp_ints = raw_arr[base + CHECKPOINT + 8:base + CHECKPOINT + 16].view(np.int32)
-        cp_x, cp_y = cp_floats[0], cp_floats[1]
-        cp_idx, total_cp = float(cp_ints[0]), float(cp_ints[1])
+        nav_f = raw_arr[base + NAV:base + NAV + 4 + 8 * NUM_LOOKAHEAD].view(np.float32)
 
-        features[i, 15] = max(-1.0, min(1.0, (cp_x - pos_x) / 2000.0))
-        features[i, 16] = max(-1.0, min(1.0, (cp_y - pos_y) / 2000.0))
-        features[i, 17] = cp_idx / max(1.0, total_cp)
-        features[i, 18] = total_cp / 20.0
+        features[i, 15] = nav_f[0]  # normalised path progress
+        for k in range(NUM_LOOKAHEAD):
+            features[i, 16 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + k] / LOOKAHEAD_SCALE[k]))
+            features[i, 17 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + NUM_LOOKAHEAD + k] / LOOKAHEAD_SCALE[k]))
 
         # 7x7 center tile crop (49 features) - indices 19-67
         for ty in range(7):
@@ -259,7 +346,7 @@ def _parse_cnn_obs_numba(raw_arr: np.ndarray, n: int,
     LOCAL_PLAYER = OBS_START + 8  # After 8-byte header
     TILES = LOCAL_PLAYER + 36     # After SPlayerObs
     EXTRA_STATE = TILES + 1333    # After tile grid
-    CHECKPOINT = EXTRA_STATE + 4  # After extra state
+    NAV = EXTRA_STATE + 4  # After extra state
     REWARD_OFF = OBS_START + 1400 # After observation
     DONE_OFF = REWARD_OFF + 4
     BOT_SIZE = 1448
@@ -305,16 +392,13 @@ def _parse_cnn_obs_numba(raw_arr: np.ndarray, n: int,
         player_state[i, 13] = float(armor) / 10.0
         player_state[i, 14] = float(jumped) / 3.0
 
-        # Checkpoint (4 features)
-        cp_floats = raw_arr[base + CHECKPOINT:base + CHECKPOINT + 8].view(np.float32)
-        cp_ints = raw_arr[base + CHECKPOINT + 8:base + CHECKPOINT + 16].view(np.int32)
-        cp_x, cp_y = cp_floats[0], cp_floats[1]
-        cp_idx, total_cp = float(cp_ints[0]), float(cp_ints[1])
+        # Navigation: progress + geometric path lookahead
+        nav_f = raw_arr[base + NAV:base + NAV + 4 + 8 * NUM_LOOKAHEAD].view(np.float32)
 
-        checkpoint[i, 0] = max(-1.0, min(1.0, (cp_x - pos_x) / 2000.0))
-        checkpoint[i, 1] = max(-1.0, min(1.0, (cp_y - pos_y) / 2000.0))
-        checkpoint[i, 2] = cp_idx / max(1.0, total_cp)
-        checkpoint[i, 3] = total_cp / 20.0
+        checkpoint[i, 0] = nav_f[0]  # normalised path progress
+        for k in range(NUM_LOOKAHEAD):
+            checkpoint[i, 1 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + k] / LOOKAHEAD_SCALE[k]))
+            checkpoint[i, 2 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + NUM_LOOKAHEAD + k] / LOOKAHEAD_SCALE[k]))
 
 
 # ============================================================================
@@ -335,7 +419,7 @@ def _parse_flat_obs_contiguous_numba(obs_arr: np.ndarray, n: int,
     LOCAL_PLAYER = 8
     TILES = LOCAL_PLAYER + 36  # 44
     EXTRA_STATE = TILES + 1333  # 1377
-    CHECKPOINT = EXTRA_STATE + 4  # 1381
+    NAV = EXTRA_STATE + 4  # 1381
 
     # Tile grid center (player at center of 43x31)
     TILE_CENTER_X = 21
@@ -377,15 +461,12 @@ def _parse_flat_obs_contiguous_numba(obs_arr: np.ndarray, n: int,
         features[i, 14] = float(jumped) / 3.0
 
         # Checkpoint (4 features) - indices 15-18
-        cp_floats = obs_arr[i, CHECKPOINT:CHECKPOINT + 8].view(np.float32)
-        cp_ints = obs_arr[i, CHECKPOINT + 8:CHECKPOINT + 16].view(np.int32)
-        cp_x, cp_y = cp_floats[0], cp_floats[1]
-        cp_idx, total_cp = float(cp_ints[0]), float(cp_ints[1])
+        nav_f = obs_arr[i, NAV:NAV + 4 + 8 * NUM_LOOKAHEAD].view(np.float32)
 
-        features[i, 15] = max(-1.0, min(1.0, (cp_x - pos_x) / 2000.0))
-        features[i, 16] = max(-1.0, min(1.0, (cp_y - pos_y) / 2000.0))
-        features[i, 17] = cp_idx / max(1.0, total_cp)
-        features[i, 18] = total_cp / 20.0
+        features[i, 15] = nav_f[0]  # normalised path progress
+        for k in range(NUM_LOOKAHEAD):
+            features[i, 16 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + k] / LOOKAHEAD_SCALE[k]))
+            features[i, 17 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + NUM_LOOKAHEAD + k] / LOOKAHEAD_SCALE[k]))
 
         # 7x7 center tile crop (49 features) - indices 19-67
         for ty in range(7):
@@ -446,7 +527,8 @@ class ServerShmClient:
         self.total_size = CONTIGUOUS_SHM_SIZE
 
         # Pre-allocate action buffer for single memcpy writes
-        self._action_buffer = np.zeros((MAX_RL_BOTS, 8), dtype=np.int32)
+        # SAction: direction, jump, hook, fire, aim_x, aim_y, weapon, reset, spawn_checkpoint
+        self._action_buffer = np.zeros((MAX_RL_BOTS, 9), dtype=np.int32)
 
     def connect(self, max_retries: int = 60, retry_delay: float = 0.5) -> bool:
         """Connect to the server's shared memory."""
@@ -529,9 +611,9 @@ class ServerShmClient:
         offset = self._get_bot_data_offset(bot_index)
         self.shm_mmap.seek(offset)
 
-        # SAction struct: direction, jump, hook, fire, aim_x, aim_y, weapon, reset
-        action_data = struct.pack('<iiii iiii',
-            direction, jump, hook, fire, aim_x, aim_y, weapon, reset)
+        # SAction struct: direction, jump, hook, fire, aim_x, aim_y, weapon, reset, spawn_checkpoint
+        action_data = struct.pack('<iiiiiiiii',
+            direction, jump, hook, fire, aim_x, aim_y, weapon, reset, -1)
         self.shm_mmap.write(action_data)
 
     def write_actions_batch(self, actions: Dict[str, np.ndarray]):
@@ -552,8 +634,10 @@ class ServerShmClient:
         aim_x = (np.cos(aim_angle) * aim_magnitude * 200).astype(np.int32)
         aim_y = (np.sin(aim_angle) * aim_magnitude * 200).astype(np.int32)
 
+        spawn_checkpoints = actions.get('spawn_checkpoint', np.full(n, -1, dtype=np.int32))
+
         # Build action array using pre-allocated buffer
-        # SAction layout: direction, jump, hook, fire, aim_x, aim_y, weapon, reset
+        # SAction layout: direction, jump, hook, fire, aim_x, aim_y, weapon, reset, spawn_checkpoint
         self._action_buffer[:n, 0] = direction
         self._action_buffer[:n, 1] = jump
         self._action_buffer[:n, 2] = hook
@@ -562,6 +646,7 @@ class ServerShmClient:
         self._action_buffer[:n, 5] = aim_y
         self._action_buffer[:n, 6] = 0  # weapon
         self._action_buffer[:n, 7] = resets.astype(np.int32)
+        self._action_buffer[:n, 8] = spawn_checkpoints.astype(np.int32)
 
         # CONTIGUOUS LAYOUT: Single memcpy for all actions!
         # Actions are stored contiguously at CONTIGUOUS_ACTIONS_OFFSET
@@ -611,7 +696,7 @@ class ServerShmClient:
         Uses CONTIGUOUS layout for efficient single-memcpy reads.
 
         Returns:
-            observations: np.ndarray of shape (num_bots, 68) - 15 player + 4 checkpoint + 49 tiles
+            observations: np.ndarray of shape (num_bots, FLAT_OBS_DIM) - 15 player + 17 nav + 49 tiles
             rewards: np.ndarray of shape (num_bots,)
             dones: np.ndarray of shape (num_bots,)
         """
@@ -630,8 +715,8 @@ class ServerShmClient:
         self.shm_mmap.seek(CONTIGUOUS_DONES_OFFSET)
         dones = np.frombuffer(self.shm_mmap.read(n * 4), dtype=np.int32).astype(np.bool_)
 
-        # Pre-allocate outputs - 68 features (15 + 4 + 49)
-        features = np.zeros((n, 68), dtype=np.float32)
+        # Pre-allocate outputs - FLAT_OBS_DIM features (15 + 17 + 49)
+        features = np.zeros((n, FLAT_OBS_DIM), dtype=np.float32)
 
         # Use Numba-accelerated parsing if available
         if NUMBA_AVAILABLE:
@@ -668,14 +753,14 @@ class ServerShmClient:
         # Pre-allocate outputs
         tiles = np.empty((n, 1, 31, 43), dtype=np.float32)
         player_state = np.empty((n, 15), dtype=np.float32)
-        checkpoint = np.empty((n, 4), dtype=np.float32)
+        checkpoint = np.empty((n, NAV_DIM), dtype=np.float32)
 
         # Offsets within SStructuredObservation (1400 bytes)
         # Layout: header(8) + LocalPlayer(36) + TileGrid(1333) + ExtraState(4) + Checkpoint(16) + Reserved(3)
         LOCAL_PLAYER = 8
         TILES = LOCAL_PLAYER + 36  # 44
         EXTRA_STATE = TILES + 1333  # 1377
-        CHECKPOINT = EXTRA_STATE + 4  # 1381
+        NAV = EXTRA_STATE + 4  # 1381
 
         # ===== TILES: direct contiguous access, no strided view needed! =====
         # Each observation's tiles are at bytes 44:1377 (1333 bytes = 31*43)
@@ -719,18 +804,12 @@ class ServerShmClient:
         player_state[:, 13] = armor / 10.0
         player_state[:, 14] = jumped / 3.0
 
-        # ===== CHECKPOINT =====
-        cp_floats = obs_arr[:, CHECKPOINT:CHECKPOINT+8].view(np.float32).reshape(n, 2)
-        cp_ints = obs_arr[:, CHECKPOINT+8:CHECKPOINT+16].view(np.int32).reshape(n, 2)
-        cp_x = cp_floats[:, 0]
-        cp_y = cp_floats[:, 1]
-        cp_idx = cp_ints[:, 0].astype(np.float32)
-        total_cp = cp_ints[:, 1].astype(np.float32)
+        # ===== NAV (progress + path lookahead) =====
+        nav_raw = obs_arr[:, NAV:NAV + 4 + 8 * NUM_LOOKAHEAD].copy().view(np.float32).reshape(n, NAV_DIM)
 
-        checkpoint[:, 0] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
-        checkpoint[:, 1] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
-        checkpoint[:, 2] = cp_idx / np.maximum(1.0, total_cp)
-        checkpoint[:, 3] = total_cp / 20.0
+        checkpoint[:, 0] = nav_raw[:, 0]  # normalised path progress
+        checkpoint[:, 1::2] = np.clip(nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 2::2] = np.clip(nav_raw[:, 1 + NUM_LOOKAHEAD:] / LOOKAHEAD_SCALE, -4.0, 4.0)
 
         # Sanitize NaN/inf
         np.nan_to_num(player_state, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -748,7 +827,7 @@ class ServerShmClient:
             observations: Dict with:
                 'tiles': np.ndarray(shape=(n, 31, 43), dtype=np.int64) - raw tile IDs 0-255
                 'player_state': np.ndarray(shape=(n, 15), dtype=np.float32)
-                'checkpoint': np.ndarray(shape=(n, 4), dtype=np.float32)
+                'checkpoint': np.ndarray(shape=(n, NAV_DIM), dtype=np.float32)
             rewards: np.ndarray of shape (n,)
             dones: np.ndarray of shape (n,)
         """
@@ -770,13 +849,13 @@ class ServerShmClient:
         # Pre-allocate outputs
         tiles = np.empty((n, 31, 43), dtype=np.int64)
         player_state = np.empty((n, 15), dtype=np.float32)
-        checkpoint = np.empty((n, 4), dtype=np.float32)
+        checkpoint = np.empty((n, NAV_DIM), dtype=np.float32)
 
         # Offsets within SStructuredObservation (1400 bytes)
         LOCAL_PLAYER = 8
         TILES = LOCAL_PLAYER + 36  # 44
         EXTRA_STATE = TILES + 1333  # 1377
-        CHECKPOINT = EXTRA_STATE + 4  # 1381
+        NAV = EXTRA_STATE + 4  # 1381
 
         # ===== TILES: cast to int64 for embedding =====
         tile_data = obs_arr[:, TILES:TILES+1333].reshape(n, 31, 43)
@@ -816,18 +895,12 @@ class ServerShmClient:
         player_state[:, 13] = armor / 10.0
         player_state[:, 14] = jumped / 3.0
 
-        # ===== CHECKPOINT =====
-        cp_floats = obs_arr[:, CHECKPOINT:CHECKPOINT+8].view(np.float32).reshape(n, 2)
-        cp_ints = obs_arr[:, CHECKPOINT+8:CHECKPOINT+16].view(np.int32).reshape(n, 2)
-        cp_x = cp_floats[:, 0]
-        cp_y = cp_floats[:, 1]
-        cp_idx = cp_ints[:, 0].astype(np.float32)
-        total_cp = cp_ints[:, 1].astype(np.float32)
+        # ===== NAV (progress + path lookahead) =====
+        nav_raw = obs_arr[:, NAV:NAV + 4 + 8 * NUM_LOOKAHEAD].copy().view(np.float32).reshape(n, NAV_DIM)
 
-        checkpoint[:, 0] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
-        checkpoint[:, 1] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
-        checkpoint[:, 2] = cp_idx / np.maximum(1.0, total_cp)
-        checkpoint[:, 3] = total_cp / 20.0
+        checkpoint[:, 0] = nav_raw[:, 0]  # normalised path progress
+        checkpoint[:, 1::2] = np.clip(nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 2::2] = np.clip(nav_raw[:, 1 + NUM_LOOKAHEAD:] / LOOKAHEAD_SCALE, -4.0, 4.0)
 
         # Sanitize NaN/inf
         np.nan_to_num(player_state, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -860,7 +933,7 @@ class ServerShmClient:
         LOCAL_PLAYER = OBS_START + 8  # After 8-byte header
         TILES = LOCAL_PLAYER + 36     # After SPlayerObs
         EXTRA_STATE = TILES + 1333    # After tile grid
-        CHECKPOINT = EXTRA_STATE + 4  # After extra state
+        NAV = EXTRA_STATE + 4  # After extra state
         REWARD_OFF = OBS_START + 1400 # After observation
         DONE_OFF = REWARD_OFF + 4
 
@@ -905,16 +978,14 @@ class ServerShmClient:
         player_state[:, 13] = armor / 10.0
         player_state[:, 14] = jumped / 3.0
 
-        # Checkpoint (4 features)
-        cp_x = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT)[0] for o in bot_offsets])
-        cp_y = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT + 4)[0] for o in bot_offsets])
-        cp_idx = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 8)[0] for o in bot_offsets], dtype=np.float32)
-        total_cp = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 12)[0] for o in bot_offsets], dtype=np.float32)
+        # Navigation: progress + geometric path lookahead
+        nav_raw = np.array(
+            [struct.unpack_from('<' + 'f' * NAV_DIM, raw, int(o) + NAV) for o in bot_offsets],
+            dtype=np.float32).reshape(len(bot_offsets), NAV_DIM)
 
-        checkpoint[:, 0] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
-        checkpoint[:, 1] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
-        checkpoint[:, 2] = cp_idx / np.maximum(1.0, total_cp)
-        checkpoint[:, 3] = total_cp / 20.0
+        checkpoint[:, 0] = nav_raw[:, 0]  # normalised path progress
+        checkpoint[:, 1::2] = np.clip(nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 2::2] = np.clip(nav_raw[:, 1 + NUM_LOOKAHEAD:] / LOOKAHEAD_SCALE, -4.0, 4.0)
 
         # Full tile grid (31, 43) - normalized by 15
         for i in range(n):
@@ -931,7 +1002,7 @@ class ServerShmClient:
         LOCAL_PLAYER = OBS_START + 8
         TILES = LOCAL_PLAYER + 36
         EXTRA_STATE = TILES + 1333
-        CHECKPOINT = EXTRA_STATE + 4
+        NAV = EXTRA_STATE + 4
         REWARD_OFF = OBS_START + 1400
         DONE_OFF = REWARD_OFF + 4
 
@@ -981,15 +1052,13 @@ class ServerShmClient:
         features[:, 14] = jumped / 3.0
 
         # Checkpoint (4 features) - indices 15-18
-        cp_x = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT)[0] for o in bot_offsets])
-        cp_y = np.array([struct.unpack_from('<f', raw, int(o) + CHECKPOINT + 4)[0] for o in bot_offsets])
-        cp_idx = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 8)[0] for o in bot_offsets], dtype=np.float32)
-        total_cp = np.array([struct.unpack_from('<i', raw, int(o) + CHECKPOINT + 12)[0] for o in bot_offsets], dtype=np.float32)
+        nav_raw = np.array(
+            [struct.unpack_from('<' + 'f' * NAV_DIM, raw, int(o) + NAV) for o in bot_offsets],
+            dtype=np.float32).reshape(len(bot_offsets), NAV_DIM)
 
-        features[:, 15] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
-        features[:, 16] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
-        features[:, 17] = cp_idx / np.maximum(1.0, total_cp)
-        features[:, 18] = total_cp / 20.0
+        features[:, 15] = nav_raw[:, 0]  # normalised path progress
+        features[:, 16:15 + NAV_DIM:2] = np.clip(nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        features[:, 17:15 + NAV_DIM:2] = np.clip(nav_raw[:, 1 + NUM_LOOKAHEAD:] / LOOKAHEAD_SCALE, -4.0, 4.0)
 
         # 7x7 center tile crop (49 features) - indices 19-67
         for ty in range(7):
@@ -1006,7 +1075,7 @@ class ServerShmClient:
         LOCAL_PLAYER = 8
         TILES = LOCAL_PLAYER + 36  # 44
         EXTRA_STATE = TILES + 1333  # 1377
-        CHECKPOINT = EXTRA_STATE + 4  # 1381
+        NAV = EXTRA_STATE + 4  # 1381
 
         # Tile grid center
         TILE_CENTER_X = 21
@@ -1048,17 +1117,11 @@ class ServerShmClient:
         features[:, 14] = jumped / 3.0
 
         # Checkpoint (4 features) - indices 15-18
-        cp_floats = obs_arr[:, CHECKPOINT:CHECKPOINT+8].view(np.float32).reshape(n, 2)
-        cp_ints = obs_arr[:, CHECKPOINT+8:CHECKPOINT+16].view(np.int32).reshape(n, 2)
-        cp_x = cp_floats[:, 0]
-        cp_y = cp_floats[:, 1]
-        cp_idx = cp_ints[:, 0].astype(np.float32)
-        total_cp = cp_ints[:, 1].astype(np.float32)
+        nav_raw = obs_arr[:, NAV:NAV + 4 + 8 * NUM_LOOKAHEAD].copy().view(np.float32).reshape(n, NAV_DIM)
 
-        features[:, 15] = np.clip((cp_x - pos_x) / 2000.0, -1.0, 1.0)
-        features[:, 16] = np.clip((cp_y - pos_y) / 2000.0, -1.0, 1.0)
-        features[:, 17] = cp_idx / np.maximum(1.0, total_cp)
-        features[:, 18] = total_cp / 20.0
+        features[:, 15] = nav_raw[:, 0]  # normalised path progress
+        features[:, 16:15 + NAV_DIM:2] = np.clip(nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        features[:, 17:15 + NAV_DIM:2] = np.clip(nav_raw[:, 1 + NUM_LOOKAHEAD:] / LOOKAHEAD_SCALE, -4.0, 4.0)
 
         # 7x7 center tile crop (49 features) - indices 19-67
         for ty in range(7):
@@ -1140,6 +1203,41 @@ class TeeWorldsServerEnv:
         self.obs_dim: Optional[int] = None
         self.episode_steps = np.zeros(self.num_bots, dtype=np.int32)
         self.episode_rewards = np.zeros(self.num_bots, dtype=np.float32)
+        self._agent_spawn_cp = np.full(self.num_bots, -1, dtype=np.int32)  # Track spawn checkpoint per agent
+
+        # Path progress: the one map-independent progress coordinate (roadmap.md §1.7).
+        # Drives the virtual finish line and every episode metric.
+        self.path_progress = None
+        wp = PathProgress.resolve(self.config.map_name, _REPO_ROOT, self.config.waypoints_path)
+        if wp is not None:
+            self.path_progress = PathProgress(
+                wp, num_envs=self.num_bots, frame_skip=self.config.frame_skip)
+            print(f"Path progress: {self.path_progress}")
+            amb = self.path_progress.self_crossing_report()
+            if amb["num_ambiguous"]:
+                print(f"  note: path self-approaches at {amb['num_ambiguous']} point(s), "
+                      f"e.g. {amb['examples'][:2]} — temporal matching is load-bearing here")
+            if self.config.finish_progress < 1.0:
+                fx, fy = self.path_progress.progress_to_world(self.config.finish_progress)
+                print(f"  virtual finish at progress {self.config.finish_progress:.3f} "
+                      f"-> world ({fx:.0f}, {fy:.0f})")
+        elif self.config.finish_progress < 1.0:
+            raise RuntimeError(
+                f"finish_progress={self.config.finish_progress} requires a waypoint file "
+                f"for map '{self.config.map_name}' (looked in waypoints/ and ghosts/)")
+
+        # Was this episode started at the map beginning? Only these count toward
+        # the headline from-start finish rate.
+        self._episode_from_start = np.ones(self.num_bots, dtype=bool)
+        self._last_progress = np.zeros(self.num_bots, dtype=np.float32)
+
+        # Checkpoint respawn manager
+        self.spawn_manager = None
+        if self.config.checkpoint_respawn:
+            self.spawn_manager = CheckpointSpawnManager(
+                begin_bias=self.config.begin_bias,
+                top_fraction=self.config.top_fraction,
+            )
 
         # Track state
         self._running = False
@@ -1243,9 +1341,9 @@ class TeeWorldsServerEnv:
                     raise RuntimeError(f"Timeout waiting for initial observations from server {idx}")
 
         # Set observation dimension
-        # Flat MLP mode: 68 features (15 player + 4 checkpoint + 49 tiles)
+        # Flat MLP mode: FLAT_OBS_DIM features (15 player + 17 nav + 49 tiles)
         # CNN mode: dict with tiles(1,31,43), player_state(15), checkpoint(4)
-        self.obs_dim = 68 if not self.use_dict_obs else None
+        self.obs_dim = FLAT_OBS_DIM if not self.use_dict_obs else None
         self._running = True
         numba_status = "enabled (JIT)" if NUMBA_AVAILABLE else "disabled (install numba for 5-10x faster parsing)"
         if self.use_dict_obs:
@@ -1320,8 +1418,11 @@ class TeeWorldsServerEnv:
 
         # RL-specific settings (these must come after basic server setup)
         server_cmd.extend([
-            f"sv_rl_frame_skip {self.config.frame_skip}",
+            # ORDER MATTERS: sv_rl_frame_skip is a no-op unless the bot manager
+            # already exists (ConRLFrameSkip bails with "RL bots not active"), so
+            # sv_rl_bots MUST come first. Reversed, frame skip silently stays 1.
             f"sv_rl_bots {self.num_bots_per_server} {server_idx}",
+            f"sv_rl_frame_skip {self.config.frame_skip}",
         ])
 
         # Server 0 logs to /tmp/rl_server.log for debugging (tail -f /tmp/rl_server.log)
@@ -1376,8 +1477,11 @@ class TeeWorldsServerEnv:
             ])
 
         server_cmd.extend([
-            f"sv_rl_frame_skip {self.config.frame_skip}",
+            # ORDER MATTERS: sv_rl_frame_skip is a no-op unless the bot manager
+            # already exists (ConRLFrameSkip bails with "RL bots not active"), so
+            # sv_rl_bots MUST come first. Reversed, frame skip silently stays 1.
             f"sv_rl_bots {self.num_bots_per_server} {server_idx}",
+            f"sv_rl_frame_skip {self.config.frame_skip}",
         ])
 
         # Server 0 logs to /tmp/rl_server.log for debugging (tail -f /tmp/rl_server.log)
@@ -1423,6 +1527,12 @@ class TeeWorldsServerEnv:
 
         self.episode_steps[:] = 0
         self.episode_rewards[:] = 0.0
+        self._agent_spawn_cp[:] = -1  # All agents start at map beginning on full reset
+        self._episode_from_start[:] = True
+        self._last_progress[:] = 0.0
+        if self.path_progress is not None:
+            self.path_progress.reset()
+            self._warn_spawn_path_gap()
 
         # Read observations from all servers
         if self.use_embeddings:
@@ -1461,7 +1571,7 @@ class TeeWorldsServerEnv:
             for shm_client in self.shm_clients:
                 observations, _, _ = shm_client.read_observations_batch_fast()
                 all_observations.append(observations)
-            return np.vstack(all_observations), {}  # (total_bots, 68)
+            return np.vstack(all_observations), {}  # (total_bots, FLAT_OBS_DIM)
 
     def _observations_to_dict(self, observations: List[Optional[StructuredObservation]]) -> Dict[str, np.ndarray]:
         """Convert list of observations to batched dict format for CNN."""
@@ -1479,7 +1589,7 @@ class TeeWorldsServerEnv:
                 # Zero observations for missing
                 tiles_list.append(np.zeros((1, TILE_GRID_HEIGHT, TILE_GRID_WIDTH), dtype=np.float32))
                 player_state_list.append(np.zeros(15, dtype=np.float32))
-                checkpoint_list.append(np.zeros(4, dtype=np.float32))
+                checkpoint_list.append(np.zeros(NAV_DIM, dtype=np.float32))
 
         return {
             'tiles': np.array(tiles_list, dtype=np.float32),
@@ -1631,7 +1741,7 @@ class TeeWorldsServerEnv:
                     # Handle timeout case - append zeros
                     all_tiles.append(np.zeros((self.num_bots_per_server, TILE_GRID_HEIGHT, TILE_GRID_WIDTH), dtype=np.int64))
                     all_player_state.append(np.zeros((self.num_bots_per_server, 15), dtype=np.float32))
-                    all_checkpoint.append(np.zeros((self.num_bots_per_server, 4), dtype=np.float32))
+                    all_checkpoint.append(np.zeros((self.num_bots_per_server, NAV_DIM), dtype=np.float32))
                     all_rewards.append(np.zeros(self.num_bots_per_server, dtype=np.float32))
                     all_dones.append(np.zeros(self.num_bots_per_server, dtype=bool))
             obs_out = {
@@ -1655,7 +1765,7 @@ class TeeWorldsServerEnv:
                     # Handle timeout case - append zeros
                     all_tiles.append(np.zeros((self.num_bots_per_server, 1, TILE_GRID_HEIGHT, TILE_GRID_WIDTH), dtype=np.float32))
                     all_player_state.append(np.zeros((self.num_bots_per_server, 15), dtype=np.float32))
-                    all_checkpoint.append(np.zeros((self.num_bots_per_server, 4), dtype=np.float32))
+                    all_checkpoint.append(np.zeros((self.num_bots_per_server, NAV_DIM), dtype=np.float32))
                     all_rewards.append(np.zeros(self.num_bots_per_server, dtype=np.float32))
                     all_dones.append(np.zeros(self.num_bots_per_server, dtype=bool))
             obs_out = {
@@ -1673,7 +1783,7 @@ class TeeWorldsServerEnv:
                     all_dones.append(done)
                 else:
                     # Handle timeout case - append zeros
-                    all_observations.append(np.zeros((self.num_bots_per_server, 68), dtype=np.float32))
+                    all_observations.append(np.zeros((self.num_bots_per_server, FLAT_OBS_DIM), dtype=np.float32))
                     all_rewards.append(np.zeros(self.num_bots_per_server, dtype=np.float32))
                     all_dones.append(np.zeros(self.num_bots_per_server, dtype=bool))
             obs_out = np.vstack(all_observations)  # (total_bots, 68)
@@ -1683,33 +1793,85 @@ class TeeWorldsServerEnv:
         truncated = np.zeros(self.num_envs, dtype=bool)
         infos = []
 
+        # Path progress drives both the virtual finish line and every metric.
+        positions = None
+        finished = np.zeros(self.num_envs, dtype=bool)
+        if self.path_progress is not None:
+            positions = self._read_positions()
+            self._last_progress = self.path_progress.update(positions)
+            finished = self._last_progress >= self.config.finish_progress
+            # A virtual finish ends the episode just like a server-side done.
+            dones = dones | finished
+
+        self.episode_steps += 1
+        self.episode_rewards += rewards
+        truncated[:] = self.episode_steps >= self.config.max_episode_steps
+
         for i in range(self.num_envs):
-            self.episode_steps[i] += 1
-            self.episode_rewards[i] += rewards[i]
-
             info = {}
-
-            # Check for truncation
-            if self.episode_steps[i] >= self.config.max_episode_steps:
-                truncated[i] = True
+            if dones[i] or truncated[i]:
                 info['episode'] = {
                     'r': self.episode_rewards[i],
                     'l': self.episode_steps[i],
+                    'progress': float(self._last_progress[i]),
+                    'finished': bool(finished[i]),
+                    'from_start': bool(self._episode_from_start[i]),
                 }
-
-            # Record episode stats on done
-            if dones[i]:
-                info['episode'] = {
-                    'r': self.episode_rewards[i],
-                    'l': self.episode_steps[i],
-                }
-
+                if positions is not None:
+                    info['episode']['pos'] = positions[i].copy()
             infos.append(info)
 
         # Auto-reset environments that are done or truncated
         reset_mask = dones | truncated
         if np.any(reset_mask):
-            self._reset_envs_fast(reset_mask, obs_out)
+            spawn_cps = None
+            if self.spawn_manager is not None:
+                # Extract checkpoint indices from raw shm before reset overwrites them
+                # cp_indices = m_NumCheckpointsReached, which includes spawn offset
+                cp_indices = self._read_checkpoint_indices()
+                for i in np.where(reset_mask)[0]:
+                    # cp_indices[i] = m_HighestTimeCp (0-based index, -1 if none).
+                    # For spawn at CP N: m_HighestTimeCp starts at N.
+                    spawn_cp = self._agent_spawn_cp[i]
+                    highest_cp = int(cp_indices[i])
+                    if spawn_cp >= 0:
+                        earned = max(0, highest_cp - spawn_cp)
+                    else:
+                        # Spawned at start: highest_cp is 0-based index, +1 for count
+                        earned = highest_cp + 1 if highest_cp >= 0 else 0
+                    # Only record if agent actually progressed beyond spawn
+                    if earned > 0:
+                        from_start = spawn_cp < 0
+                        self.spawn_manager.record_episode(highest_cp, from_start=from_start)
+                # Sample spawn checkpoints for resetting agents
+                n_reset = int(reset_mask.sum())
+                sampled = self.spawn_manager.sample_spawn_checkpoints(n_reset)
+                spawn_cps = np.full(self.num_envs, -1, dtype=np.int32)
+                spawn_cps[reset_mask] = sampled
+                # Diagnostic: log spawn distribution every 1000 steps
+                if self._step_count % 1000 == 0:
+                    nonstart = sampled[sampled >= 0]
+                    stats = self.spawn_manager.get_stats()
+                    print(f"  [SPAWN] frontier={stats['spawn_frontier']} max_cp={stats['spawn_max_cp']:.0f} "
+                          f"n_reset={n_reset} at_start={int((sampled < 0).sum())} "
+                          f"nonstart_range=[{nonstart.min() if len(nonstart) else -1}, {nonstart.max() if len(nonstart) else -1}]")
+                # Track what each agent spawns at for next episode
+                reset_indices = np.where(reset_mask)[0]
+                for j, i in enumerate(reset_indices):
+                    self._agent_spawn_cp[i] = sampled[j]
+
+            # New episodes: forget the tracked waypoint index, and record whether
+            # they start at the map beginning (the from-start finish rate depends
+            # on this being right).
+            if self.path_progress is not None:
+                self.path_progress.reset(reset_mask)
+                self._last_progress[reset_mask] = 0.0
+            if spawn_cps is not None:
+                self._episode_from_start[reset_mask] = spawn_cps[reset_mask] < 0
+            else:
+                self._episode_from_start[reset_mask] = True
+
+            self._reset_envs_fast(reset_mask, obs_out, spawn_checkpoints=spawn_cps)
 
         return (
             obs_out,
@@ -1719,12 +1881,13 @@ class TeeWorldsServerEnv:
             infos
         )
 
-    def _reset_envs_fast(self, mask: np.ndarray, observations):
+    def _reset_envs_fast(self, mask: np.ndarray, observations, spawn_checkpoints=None):
         """Reset specific environments and update observations in place.
 
         Args:
             mask: Boolean mask of environments to reset
             observations: Either numpy array (MLP mode) or dict of arrays (CNN mode)
+            spawn_checkpoints: Optional int32 array of checkpoint indices per env (-1 = start)
         """
         # Split mask across servers and send reset for masked environments
         for server_idx, shm_client in enumerate(self.shm_clients):
@@ -1740,6 +1903,8 @@ class TeeWorldsServerEnv:
                 'continuous': np.zeros((self.num_bots_per_server, 2), dtype=np.float32),
                 'reset': server_mask.astype(np.int32),
             }
+            if spawn_checkpoints is not None:
+                reset_actions['spawn_checkpoint'] = spawn_checkpoints[start_idx:end_idx]
             shm_client.write_actions_batch(reset_actions)
             shm_client.signal_actions_ready()
 
@@ -1822,6 +1987,65 @@ class TeeWorldsServerEnv:
         for i in np.where(mask)[0]:
             self.episode_steps[i] = 0
             self.episode_rewards[i] = 0.0
+
+    def _warn_spawn_path_gap(self, threshold: float = 128.0) -> None:
+        """Warn once if the tee spawns far from the start of the reference path.
+
+        Ghost recording begins at the START tile, not at the spawn tile, so a
+        ghost-derived path can begin some distance ahead of where episodes
+        actually start. Progress is flat over that gap, which means the shaping
+        term gives no gradient for the opening seconds of every episode.
+        """
+        if getattr(self, '_spawn_gap_checked', False):
+            return
+        self._spawn_gap_checked = True
+        try:
+            spawn = self._read_positions()[0]
+        except Exception:
+            return
+        wp0 = self.path_progress.xy[0]
+        gap = float(np.linalg.norm(spawn - wp0))
+        if gap > threshold:
+            print(f"  WARNING: spawn ({spawn[0]:.0f}, {spawn[1]:.0f}) is {gap:.0f} units from "
+                  f"path start ({wp0[0]:.0f}, {wp0[1]:.0f}) — progress is flat over that gap, "
+                  f"so shaping gives no gradient there. Consider prepending the spawn to the "
+                  f"waypoint file.")
+
+    def _read_positions(self) -> np.ndarray:
+        """Read every bot's world position from raw shm. Returns (num_envs, 2) float32.
+
+        Position is deliberately absent from the policy observation (it doesn't
+        generalise), but it's exactly what the metrics need.
+        """
+        # m_PosX/m_PosY are the first two fields of m_LocalPlayer, which follows
+        # the 8-byte game-state header in SStructuredObservation.
+        POS_OFFSET = 8
+        result = np.zeros((self.num_envs, 2), dtype=np.float32)
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            start_idx = server_idx * self.num_bots_per_server
+            n = self.num_bots_per_server
+            shm_client.shm_mmap.seek(CONTIGUOUS_OBS_OFFSET)
+            obs_raw = shm_client.shm_mmap.read(n * OBS_SIZE)
+            obs_arr = np.frombuffer(obs_raw, dtype=np.uint8).reshape(n, OBS_SIZE)
+            xy = obs_arr[:, POS_OFFSET:POS_OFFSET + 8].copy().view(np.float32).reshape(n, 2)
+            result[start_idx:start_idx + n] = xy
+        return result
+
+    def _read_checkpoint_indices(self) -> np.ndarray:
+        """Read checkpoint indices from raw shm observations for all bots."""
+        # m_CheckpointIndex is at byte offset 1389 within SStructuredObservation
+        # Layout: header(8) + player(36) + tiles(1333) + extra(4) + NextCpX(4) + NextCpY(4) = 1389
+        CP_INDEX_OFFSET = 8 + 36 + 1333 + 4 + 4 + 4  # 1389
+        result = np.zeros(self.num_envs, dtype=np.int32)
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            start_idx = server_idx * self.num_bots_per_server
+            n = self.num_bots_per_server
+            shm_client.shm_mmap.seek(CONTIGUOUS_OBS_OFFSET)
+            obs_raw = shm_client.shm_mmap.read(n * OBS_SIZE)
+            obs_arr = np.frombuffer(obs_raw, dtype=np.uint8).reshape(n, OBS_SIZE)
+            cp_vals = obs_arr[:, CP_INDEX_OFFSET:CP_INDEX_OFFSET + 4].copy().view(np.int32).flatten()
+            result[start_idx:start_idx + n] = cp_vals
+        return result
 
     def pause(self):
         """

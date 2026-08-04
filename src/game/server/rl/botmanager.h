@@ -13,6 +13,7 @@
 #include <generated/protocol.h>
 #include <bitset>
 #include <memory>
+#include <string>
 #include <vector>
 #include <map>
 
@@ -73,8 +74,16 @@ private:
 	void ExtractTileGrid(CCharacter *pChar, uint8_t *pGrid);
 
 	// Reward calculation
-	float CalculateReward(int BotIndex, const SStructuredObservation *pObs);
-	void ResetRewardState(int BotIndex);
+	float CalculateReward(int BotIndex, const SStructuredObservation *pObs, bool IsDecisionTick);
+	void ResetRewardState(int BotIndex, int SpawnCheckpoint = -1);
+
+	// Normalised path progress in [0, 1] for a bot, advancing its tracked
+	// waypoint index. The only progress coordinate that is well-defined on every
+	// race map — see roadmap.md §1.7.
+	float GetNormalizedProgress(int BotIndex, vec2 Pos);
+
+	// Egocentric path lookahead written into the observation.
+	void FillLookahead(int BotIndex, vec2 Pos, SStructuredObservation *pObs);
 
 	// Spawn position for respawn
 	vec2 GetSpawnPos();
@@ -95,25 +104,24 @@ private:
 		int m_Index;
 	};
 
-	// Per-bot reward tracking state
+	// Per-bot reward tracking state.
+	//
+	// The freeze/stuck/checkpoint-distance bookkeeping that used to live here is
+	// gone along with the reward terms that consumed it (roadmap.md Part 1b).
+	// What remains is the tracked waypoint index and the previous potential.
 	struct SBotRewardState
 	{
 		float m_LastPosX;
 		float m_LastPosY;
-		float m_LastDistToCheckpoint;
-		float m_BestDistToCheckpoint;  // High water mark - closest we've ever been
-		int m_NumCheckpointsReached;   // Count of unique checkpoints reached (for progress)
-		int m_LastCheckpointNumber;    // Last checkpoint number touched (1-255, for navigation)
-		int m_LastCheckpointRewarded;  // Count when last rewarded (reset on respawn)
 		int m_LastHookState;
-		int m_StuckCounter;
-		bool m_WasFrozen;
 		bool m_WasDead;
-		int m_HighestTimeCp;  // Highest time checkpoint index reached (-1 = none)
+		int m_HighestTimeCp;  // Highest time checkpoint reached. Observation only —
+		                      // NOT used by the reward. Removed in the Phase 1 protocol batch.
 
-		// Track which checkpoint NUMBERS have been visited (supports any ordering)
-		// DDNet checkpoint numbers are 1-255 (0 = none)
-		std::bitset<256> m_VisitedCheckpoints;
+		// Path progress tracking
+		int m_WaypointIndex;  // Tracked waypoint index; only moves within a
+		                      // physically plausible window (see FindClosestWaypoint)
+		float m_LastPhi;      // Previous normalised progress, for potential-based shaping
 
 		// Exploration tracking - coarse grid (8x8 tiles per region)
 		// 64x64 regions = 4096 bits = 512 bytes per bot
@@ -125,10 +133,80 @@ private:
 
 	// Map checkpoint data
 	std::vector<SCheckpoint> m_vCheckpoints;
-	int m_NumTeleCheckpoints;  // Count of teleport checkpoints on map
 	vec2 m_SpawnPos;
 	vec2 m_FinishPos;
 	bool m_MapAnalyzed;
+
+	// ------------------------------------------------------------------
+	// Reward constants (roadmap.md Part 1b)
+	//
+	//   R = -TIME_PENALTY  +  SHAPING_K * (GAMMA * Phi' - Phi)  +  FINISH_BONUS
+	//
+	// Phi is normalised path progress in [0, 1], so the reward scale no longer
+	// depends on map length (the old Delta/100 gave a long map 10x the total
+	// reward of a short one — another cross-map inconsistency).
+	//
+	// Scale derivation. Forward motion must stay net-positive, or the agent
+	// prefers to die immediately and stop paying the time penalty:
+	//
+	//   progress rate at v units/s = SHAPING_K * v / PathLength  per second
+	//   time cost                  = TIME_PENALTY * 50           per second
+	//
+	// A mid-training agent runs ~150 units/s and the ghost runs ~600. On
+	// Tutorial (112k units) with SHAPING_K = 100 and TIME_PENALTY = 0.001:
+	//   slow agent: +0.134/s progress vs -0.05/s time  -> net positive
+	//   ghost pace: +0.536/s progress vs -0.05/s time  -> ~4x better
+	// so speed is rewarded without ever making death attractive. The old value
+	// (-0.0005/tick against ~1.5/s of progress reward) was a 60:1 ratio, which
+	// is why the agent ambled at 25% of ghost pace.
+	static constexpr float TIME_PENALTY = 0.001f;  // per tick
+	static constexpr float SHAPING_K = 100.0f;     // reward for the full path
+	static constexpr float FINISH_BONUS = 100.0f;
+
+	// Discount used INSIDE the shaping term. Deliberately 1.0, not the PPO gamma.
+	//
+	// With gamma < 1 the shaping sum expands to
+	//     K*gamma*Phi_T  -  K*(1-gamma)*sum_t(Phi_t)
+	// and that second term is a per-step leak of -K*(1-gamma)*Phi. Over an
+	// 800-decision episode at gamma=0.99 the leak is -20.0 against a useful
+	// signal of +4.95 — a drift/signal ratio of (1-gamma)*T = 8x that GROWS the
+	// further the agent gets, so episodic return moves the wrong way while the
+	// policy genuinely improves.
+	//
+	// The strict Ng/Harada/Russell invariance result wants gamma here to match
+	// the agent's discount. Using 1.0 gives up that guarantee, but in exchange
+	// the shaping telescopes cleanly to K*(Phi_T - Phi_0): the return is
+	// monotone in progress, and the critic no longer has to represent and cancel
+	// a state-dependent term 16x the size of the time penalty. This is the
+	// standard practical choice.
+	static constexpr float SHAPING_GAMMA = 1.0f;
+
+	// Waypoint-based reward system
+	struct SWaypoint
+	{
+		float m_X;
+		float m_Y;
+		float m_CumulativeDist; // Distance from start to this waypoint along path
+		int m_SegmentId;        // Path segment; increments across a teleport/discontinuity
+	};
+	std::vector<SWaypoint> m_vWaypoints;
+
+	// Temporal-coherence window for waypoint matching. A merely spatial search
+	// matches the wrong strand wherever the path doubles back on itself — on
+	// Tutorial the path passes within ~100 units of a point ~1000 units later,
+	// only ~17 waypoints apart, well inside the old +/-100 window. Sized from
+	// physics instead: a tee tops out near 100 units/tick.
+	static constexpr float MAX_TEE_SPEED = 100.0f;
+	static constexpr int MAX_RETREAT = 2;
+	static constexpr float LOST_DIST = 512.0f;  // beyond this, scan forward to re-acquire
+	int m_MaxAdvance;  // derived from waypoint spacing at load time
+	void SegmentPathAtDiscontinuities();
+	void UpdateMatchWindow();
+	float m_TotalPathLength;
+	bool m_WaypointsLoaded;
+	bool LoadWaypoints(const std::string &Path);
+	int FindClosestWaypoint(vec2 Pos, int SearchStart, int SearchRadius = 50) const;
+	float GetPathProgress(vec2 Pos, int WaypointIdx) const;
 
 	// Analyze map for checkpoints (called once on first tick)
 	void AnalyzeMap();

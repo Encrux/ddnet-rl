@@ -124,10 +124,15 @@ torch.set_float32_matmul_precision('high')
 from teeworlds_vec_env import TeeWorldsVecEnv, EnvConfig
 from teeworlds_server_env import TeeWorldsServerEnv, ServerEnvConfig, FrameStackWrapper
 from ppo_hybrid import PPOAgent, PPOConfig
+from episode_tracker import EpisodeTracker
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train PPO on Teeworlds")
+
+    # Config file (loaded first, CLI args override)
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to YAML config file (CLI args override config values)")
 
     # Environment
     parser.add_argument("--num-envs", type=int, default=16,
@@ -230,6 +235,19 @@ def parse_args():
     parser.add_argument("--n-player-state-stack", type=int, default=8,
                         help="Number of player state frames to stack (default: 8, cheap - enables timing)")
 
+    # Checkpoint respawning
+    parser.add_argument("--checkpoint-respawn", action="store_true",
+                        help="Enable adaptive checkpoint respawning (spawn at frontier)")
+    parser.add_argument("--begin-bias", type=float, default=0.2,
+                        help="Probability of spawning at map start (default: 0.2)")
+    parser.add_argument("--top-fraction", type=float, default=0.3,
+                        help="Fraction of best episodes for spawn sampling (default: 0.3)")
+    parser.add_argument("--finish-progress", type=float, default=1.0,
+                        help="Virtual finish line as normalised path progress. 1.0 = real end of "
+                             "map; lower slices the map short for fast iteration (default: 1.0)")
+    parser.add_argument("--waypoints-path", type=str, default=None,
+                        help="Override waypoint file autodiscovery (waypoints/, then ghosts/)")
+
     # Curriculum learning
     parser.add_argument("--curriculum", type=str, default="none",
                         choices=["none", "map", "segment", "both"],
@@ -241,6 +259,18 @@ def parse_args():
     parser.add_argument("--success-threshold", type=float, default=0.8,
                         help="Success rate threshold to advance curriculum")
 
+    # Two-pass parsing: first grab --config, then apply YAML as defaults
+    args, remaining = parser.parse_known_args()
+    if args.config:
+        import yaml
+        with open(args.config) as f:
+            config = yaml.safe_load(f) or {}
+        # Convert YAML keys (underscores) to argparse format and set as defaults
+        defaults = {}
+        for key, value in config.items():
+            argparse_key = key.replace("-", "_")
+            defaults[argparse_key] = value
+        parser.set_defaults(**defaults)
     return parser.parse_args()
 
 
@@ -298,6 +328,11 @@ def main():
             use_embeddings=args.use_embeddings,  # Enable embedding observations
             map_name=args.map,
             debug_timing=args.debug_timing,
+            checkpoint_respawn=args.checkpoint_respawn,
+            begin_bias=args.begin_bias,
+            top_fraction=args.top_fraction,
+            finish_progress=args.finish_progress,
+            waypoints_path=args.waypoints_path,
         )
         # Use default server_path (resolved relative to teeworlds_server_env.py)
         env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)
@@ -397,6 +432,8 @@ def main():
             inference_mode = "sync (pause)" if args.sync_inference else "async (no pause)"
             update_mode = "sync (pause)" if args.sync_update else "async (no pause)"
             print(f"Inference: {inference_mode}, PPO update: {update_mode}")
+        if args.checkpoint_respawn:
+            print(f"Checkpoint respawn: ON (begin_bias={args.begin_bias}, top_fraction={args.top_fraction})")
         print("-" * 60)
 
         start_time = time.time()
@@ -410,6 +447,14 @@ def main():
         # Episode tracking
         episode_rewards = []
         episode_lengths = []
+
+        # Cross-run-comparable metrics. Reward curves stop being comparable the
+        # moment the reward function changes; these don't (PLAN.md Phase 0.2/0.3).
+        base_env = env.env if hasattr(env, 'env') else env
+        tracker = None
+        if getattr(base_env, 'path_progress', None) is not None:
+            tracker = EpisodeTracker(base_env.path_progress.bounds)
+            print(f"Metrics: {tracker}")
 
         for update in range(1, num_updates + 1):
             rollout_start = time.time()
@@ -447,10 +492,22 @@ def main():
                 obs = next_obs
 
                 # Track episodes
+                ep_batch = []
                 for info in infos:
                     if 'episode' in info:
-                        episode_rewards.append(info['episode']['r'])
-                        episode_lengths.append(info['episode']['l'])
+                        ep = info['episode']
+                        episode_rewards.append(ep['r'])
+                        episode_lengths.append(ep['l'])
+                        if tracker is not None and 'pos' in ep:
+                            ep_batch.append(ep)
+                if ep_batch:
+                    tracker.record(
+                        progress=np.array([e['progress'] for e in ep_batch], dtype=np.float32),
+                        positions=np.stack([e['pos'] for e in ep_batch]),
+                        from_start=np.array([e['from_start'] for e in ep_batch]),
+                        finished=np.array([e['finished'] for e in ep_batch]),
+                        lengths=np.array([e['l'] for e in ep_batch]),
+                    )
 
             # PPO update (optionally pause to prevent bots from acting with stale policy)
             rollout_time = time.time() - rollout_start
@@ -470,8 +527,16 @@ def main():
             if episode_rewards:
                 mean_reward = np.mean(episode_rewards[-100:])
                 mean_length = np.mean(episode_lengths[-100:])
+                # Headline metrics first: finish rate and progress, not reward.
+                head = ""
+                if tracker is not None:
+                    ts = tracker.stats()
+                    if ts:
+                        head = (f"Fin {ts.get('episodes/finish_rate_from_start', 0.0):5.1%} | "
+                                f"Prog {ts['progress/p50']:.3f}/{ts['progress/max']:.3f} | ")
                 print(f"Update {update:5d} | Step {global_step:9,d} | "
                       f"FPS {fps:6.0f} | "
+                      f"{head}"
                       f"Reward {mean_reward:7.2f} | "
                       f"Length {mean_length:6.0f} | "
                       f"PG {stats['policy_loss']:6.3f} | "
@@ -497,6 +562,26 @@ def main():
                 if episode_rewards:
                     writer.add_scalar("charts/episodic_return", mean_reward, global_step)
                     writer.add_scalar("charts/episodic_length", mean_length, global_step)
+
+                # Headline metrics: finish rate, progress percentiles, death heatmap
+                if tracker is not None:
+                    for k, v in tracker.stats().items():
+                        writer.add_scalar(k, v, global_step)
+                    prog_vals = tracker.progress_values()
+                    if len(prog_vals):
+                        writer.add_histogram("progress/hist", prog_vals, global_step)
+                    if update % (args.log_freq * 10) == 0:
+                        img = tracker.heatmap_image(base_env.path_progress.xy)
+                        if img is not None:
+                            writer.add_image("progress/death_heatmap", img,
+                                             global_step, dataformats='HWC')
+
+                # Log checkpoint respawn stats
+                if hasattr(base_env, 'spawn_manager') and base_env.spawn_manager is not None:
+                    spawn_stats = base_env.spawn_manager.get_stats()
+                    writer.add_scalar("charts/spawn_mean_cp", spawn_stats['spawn_mean_cp'], global_step)
+                    writer.add_scalar("charts/spawn_max_cp", spawn_stats['spawn_max_cp'], global_step)
+                    writer.add_scalar("charts/spawn_frontier", spawn_stats['spawn_frontier'], global_step)
 
             # Save checkpoint
             if update % args.save_freq == 0:

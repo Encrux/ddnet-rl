@@ -1,0 +1,64 @@
+# Fast-iteration smoke-test config: a short slice of Tutorial.
+#
+# Purpose is turnaround, not results. Reward/action-space/observation changes
+# should show a signal here in ~15 minutes instead of overnight. The target map
+# (full Tutorial, then run_guy_25) uses default.yaml.
+#
+# Usage: python train.py --config configs/slice.yaml
+
+# Environment
+server_side: true
+num_servers: 8            # benchmarks: 8 cycles faster than 12 on 16 threads
+num_envs: 127
+map: Tutorial
+frame_skip: 3
+
+# The slice.
+#
+# SIZING RULE — get this wrong and the finish is unreachable, which looks
+# identical to a learning failure in the logs:
+#
+#   max_episode_steps  >  finish_progress * 111928 / rate * 50 / frame_skip
+#
+# where `rate` is the agent's ACTUAL units/s, not the ghost's (598 u/s).
+#
+# 0.05 * 111928 = 5596 units. The baseline agent managed 455 u/s at 50 Hz
+# decisions -> 12 s; at a pessimistic 150 u/s -> 37 s. With frame_skip 3,
+# 800 steps = 2400 ticks = 48 s, which covers both.
+#
+# NB: the baseline was measured before the sv_rl_frame_skip ordering fix, so it
+# ran at 50 Hz decisions. This run is the first at a real 16.7 Hz — the agent
+# acts 3x less often, so expect a different rate.
+#
+# Do NOT lower finish_progress below current p50 (~0.024) to make it fit — that
+# just measures an already-solved slice.
+finish_progress: 0.05
+max_episode_steps: 800
+
+# Training
+total_timesteps: 20000000000
+num_steps: 128
+num_minibatches: 64
+update_epochs: 4
+sync_update: true
+checkpoint_respawn: false  # curriculum comes in Phase 2; keep the baseline honest
+
+# PPO
+learning_rate: 3.0e-4
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+ent_coef: 0.01
+vf_coef: 0.5
+max_grad_norm: 0.5
+
+# Network
+use_cnn: true
+hidden_dim: 256
+num_layers: 2
+n_player_state_stack: 4
+n_frame_stack: 1
+
+# Logging
+save_freq: 100
+log_freq: 5

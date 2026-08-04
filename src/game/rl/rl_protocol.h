@@ -27,6 +27,14 @@ constexpr int TILE_GRID_WIDTH = 43;   // 21 left + 1 center + 21 right
 constexpr int TILE_GRID_HEIGHT = 31;  // 15 up + 1 center + 15 down
 constexpr int TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT; // 1333
 
+// Path lookahead points fed to the policy, at GEOMETRIC offsets in waypoint
+// indices. Near points steer, far points orient. At the standard ~62-unit
+// spacing this spans ~62 to ~8000 units (2 to 250 tiles), so the agent gets both
+// sub-tile guidance and a sense of where the route goes well beyond its 43x31
+// tile view — which a fixed stride could not do in the same budget.
+constexpr int NUM_LOOKAHEAD = 8;
+constexpr int LOOKAHEAD_OFFSETS[NUM_LOOKAHEAD] = {1, 2, 4, 8, 16, 32, 64, 128};
+
 // ============================================================================
 // Tile Types (for observation)
 // ============================================================================
@@ -110,19 +118,27 @@ struct SStructuredObservation
 	uint8_t m_CanHook;
 	uint8_t m_Reserved2;
 
-	// Checkpoint navigation info (16 bytes)
-	float m_NextCheckpointX;   // World X position of next checkpoint
-	float m_NextCheckpointY;   // World Y position of next checkpoint
-	int32_t m_CheckpointIndex; // Current checkpoint index (0-based, -1 if none reached)
-	int32_t m_TotalCheckpoints; // Total number of checkpoints in map
+	// Navigation (68 bytes). Replaces the old checkpoint block.
+	//
+	// Time checkpoints were mapper-authored and unusable across maps: placement
+	// need not be near the ideal path, numbering may be non-sequential or
+	// duplicated, and TILE_CP/TILE_CP_F carry no index at all. Progress along a
+	// reference path is the one navigation signal well-defined on every map.
+	//
+	// m_Progress also makes restore-anywhere training possible: an agent
+	// respawned mid-map can see identical local geometry to one near the start,
+	// so without this the critic cannot tell them apart.
+	float m_Progress;                        // Normalised path progress in [0, 1]
+	float m_aLookaheadX[NUM_LOOKAHEAD];      // Egocentric world offsets to points
+	float m_aLookaheadY[NUM_LOOKAHEAD];      // ahead along the path
 
-	// Padding for alignment (3 bytes to reach 1400 total)
+	// Padding for alignment (3 bytes to reach 1452 total)
 	uint8_t m_Reserved3[3];
 };
 #pragma pack(pop)
 
-// New size: 8 + 36 + 1333 + 4 + 16 + 3 = 1400 bytes
-static_assert(sizeof(SStructuredObservation) == 1400, "SStructuredObservation must be 1400 bytes");
+// Size: 8 + 36 + 1333 + 4 + 4 + 64 + 3 = 1452 bytes
+static_assert(sizeof(SStructuredObservation) == 1452, "SStructuredObservation must be 1452 bytes");
 
 // ============================================================================
 // Action (from Python to server/client)
@@ -139,10 +155,17 @@ struct SAction
 	int32_t m_AimY;       // Target Y
 	int32_t m_Weapon;     // Desired weapon
 	int32_t m_Reset;      // Request episode reset
+	// Where to respawn. -1 = map start. 0+ = index into the server's snapshot
+	// archive, which is binned by normalised path progress. Replaces the old
+	// m_SpawnCheckpoint: DDNet time checkpoints are mapper-authored, far too
+	// sparse to land near a frontier, and give you a position without the
+	// velocity/hook/jump state most obstacles require on arrival. Same offset
+	// and width, so the wire layout is unchanged.
+	int32_t m_RestoreSlot;
 };
 #pragma pack(pop)
 
-static_assert(sizeof(SAction) == 32, "SAction must be 32 bytes");
+static_assert(sizeof(SAction) == 36, "SAction must be 36 bytes");
 
 // ============================================================================
 // Server-Side Batch Shared Memory Layout
@@ -179,8 +202,8 @@ struct SBotData
 };
 #pragma pack(pop)
 
-// New size: 32 + 1400 + 16 = 1448 bytes
-static_assert(sizeof(SBotData) == 1448, "SBotData must be 1448 bytes");
+// Size: 36 + 1452 + 16 = 1504 bytes
+static_assert(sizeof(SBotData) == 1504, "SBotData must be 1504 bytes");
 
 // Legacy interleaved shared memory layout (kept for reference)
 // Total size: 32 + 128 * 1448 = 185,376 bytes (~181 KB)

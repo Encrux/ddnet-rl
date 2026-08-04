@@ -717,6 +717,11 @@ void CGameContext::ConRLFrameSkip(IConsole::IResult *pResult, void *pUserData)
 
 	if(!pSelf->m_pBotManager || !pSelf->m_pBotManager->IsEnabled())
 	{
+		// This used to fail silently: the launcher issued sv_rl_frame_skip before
+		// sv_rl_bots, so frame skip stayed at 1 on every run while every config
+		// and log claimed otherwise. Make it impossible to miss.
+		dbg_msg("rl/bots", "WARNING: sv_rl_frame_skip IGNORED - bot manager not created yet. "
+			"Issue sv_rl_bots FIRST, otherwise frame skip stays at 1.");
 		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", "RL bots not active");
 		return;
 	}

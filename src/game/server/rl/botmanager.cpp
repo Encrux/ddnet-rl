@@ -15,6 +15,7 @@
 
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 #include <algorithm>
 
 namespace rl {
@@ -25,10 +26,12 @@ CBotManager::CBotManager(CGameContext *pGameContext) :
 	m_Enabled(false),
 	m_PlayersCreated(false),
 	m_NumBots(0),
-	m_NumTeleCheckpoints(0),
 	m_SpawnPos(0, 0),
 	m_FinishPos(0, 0),
 	m_MapAnalyzed(false),
+	m_MaxAdvance(8),
+	m_TotalPathLength(0.0f),
+	m_WaypointsLoaded(false),
 	m_LastTick(0),
 	m_FrameSkip(1),
 	m_FrameSkipCounter(0),
@@ -358,14 +361,21 @@ void CBotManager::InjectBotInputs()
 			}
 			if(pPlayer)
 			{
-				// Use ForceSpawn instead of Respawn for bots
-				// Respawn() just sets m_Spawning=true, but TryRespawn() checks
-				// Server()->ClientIngame() which returns false for bots
-				vec2 SpawnPos = GetSpawnPos();
+				int SpawnCp = pAction->m_RestoreSlot;
+				vec2 SpawnPos;
+				if(SpawnCp >= 0 && SpawnCp < (int)m_vCheckpoints.size())
+					SpawnPos = m_vCheckpoints[SpawnCp].m_Pos;
+				else
+					SpawnPos = GetSpawnPos();
 				pPlayer->ForceSpawn(SpawnPos);
+				ResetRewardState(i, SpawnCp);
 			}
-			ResetRewardState(i);
+			else
+			{
+				ResetRewardState(i);
+			}
 			pAction->m_Reset = 0;
+			pAction->m_RestoreSlot = -1;
 		}
 
 		// Convert action to input
@@ -488,96 +498,37 @@ void CBotManager::ExtractObservations()
 
 				pObs->m_CanHook = (pChar->Core()->m_HookState == HOOK_IDLE) ? 1 : 0;
 
-				// Checkpoint tracking
+				// Navigation: normalised progress + geometric path lookahead.
+				// Time checkpoints are gone entirely — see rl_protocol.h.
 				SBotRewardState &State = m_aBotState[i];
+				State.m_HighestTimeCp = std::max(State.m_HighestTimeCp, pChar->m_LastTimeCp);
 
-				// Teleport checkpoint from DDNet (1-255, 0 = none)
-				int TeleCheckpoint = pChar->m_TeleCheckpoint;
-				if(TeleCheckpoint > 0 && !State.m_VisitedCheckpoints.test(TeleCheckpoint))
-				{
-					State.m_VisitedCheckpoints.set(TeleCheckpoint);
-					State.m_NumCheckpointsReached++;
-					State.m_LastCheckpointNumber = TeleCheckpoint;
-				}
+				// CalculateReward advances the tracked waypoint index, so fill the
+				// lookahead after it to stay consistent with this tick's match.
+				TickReward = CalculateReward(i, pObs, true);
 
-				// Time checkpoint tracking — read from game's native detection
-				int TimeCp = pChar->m_LastTimeCp;
-				if(TimeCp > State.m_HighestTimeCp)
-				{
-					State.m_HighestTimeCp = TimeCp;
-					State.m_NumCheckpointsReached++;
-				}
-
-				// Navigation: target next sequential time checkpoint
-				vec2 NextCpPos;
-				int NextTimeCp = State.m_HighestTimeCp + 1;
-				if(NextTimeCp < (int)m_vCheckpoints.size())
-					NextCpPos = m_vCheckpoints[NextTimeCp].m_Pos;
-				else
-					NextCpPos = m_FinishPos.x > 0 ? m_FinishPos : m_SpawnPos;
-				pObs->m_NextCheckpointX = NextCpPos.x;
-				pObs->m_NextCheckpointY = NextCpPos.y;
-				pObs->m_CheckpointIndex = State.m_NumCheckpointsReached;
-				pObs->m_TotalCheckpoints = std::max(m_NumTeleCheckpoints, (int)m_vCheckpoints.size());
-
-				// Calculate reward for this tick
-				TickReward = CalculateReward(i, pObs);
+				pObs->m_Progress = State.m_LastPhi;
+				FillLookahead(i, Pos, pObs);
 			}
 			else
 			{
-				// Non-decision tick: still calculate reward for accumulation
-				// Need a temporary observation for reward calculation
+				// Non-decision tick: only the per-tick time penalty accrues. The
+				// shaping term must fire once per decision, not once per tick.
 				SStructuredObservation TempObs;
 				mem_zero(&TempObs, sizeof(TempObs));
 				ExtractPlayerObs(pChar, &TempObs.m_LocalPlayer, true);
 
-				// Checkpoint tracking
-				SBotRewardState &State = m_aBotState[i];
-
-				int TeleCheckpoint = pChar->m_TeleCheckpoint;
-				if(TeleCheckpoint > 0 && !State.m_VisitedCheckpoints.test(TeleCheckpoint))
-				{
-					State.m_VisitedCheckpoints.set(TeleCheckpoint);
-					State.m_NumCheckpointsReached++;
-					State.m_LastCheckpointNumber = TeleCheckpoint;
-				}
-
-				// Time checkpoint tracking — read from game's native detection
-				int TimeCp = pChar->m_LastTimeCp;
-				if(TimeCp > State.m_HighestTimeCp)
-				{
-					State.m_HighestTimeCp = TimeCp;
-					State.m_NumCheckpointsReached++;
-				}
-
-				// Navigation: target next sequential time checkpoint
-				vec2 NextCpPos;
-				int NextTimeCp = State.m_HighestTimeCp + 1;
-				if(NextTimeCp < (int)m_vCheckpoints.size())
-					NextCpPos = m_vCheckpoints[NextTimeCp].m_Pos;
-				else
-					NextCpPos = m_FinishPos.x > 0 ? m_FinishPos : m_SpawnPos;
-				TempObs.m_NextCheckpointX = NextCpPos.x;
-				TempObs.m_NextCheckpointY = NextCpPos.y;
-				TempObs.m_CheckpointIndex = State.m_NumCheckpointsReached;
-
-				TickReward = CalculateReward(i, &TempObs);
+				TickReward = CalculateReward(i, &TempObs, false);
 			}
 		}
 		else
 		{
-			// Character dead or not spawned
-			TickReward = -1.0f; // Death penalty
+			// Character dead or not spawned. No explicit death penalty: with a
+			// positive-in-expectation forward reward, terminating forfeits the
+			// remaining shaping and the finish bonus, which is the cost. Adding a
+			// constant here would be a fourth term with an arbitrary scale.
 			IsDone = true;
 			dbg_msg("rl/done", "Bot %d: dead/not spawned", i);
-		}
-
-		// Hard reset if no progress for too long (~10 seconds)
-		// Long enough to cover mandatory freeze sections (typically 1-3 sec)
-		if(m_aBotState[i].m_StuckCounter > 500)
-		{
-			IsDone = true;
-			dbg_msg("rl/done", "Bot %d: stuck > 500", i);
 		}
 
 		// Accumulate reward
@@ -706,7 +657,61 @@ void CBotManager::ExtractTileGrid(CCharacter *pChar, uint8_t *pGrid)
 	}
 }
 
-float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *pObs)
+// Egocentric offsets to points ahead along the reference path. Where the path
+// runs out (near the finish, or past the last waypoint) the remaining slots
+// clamp to the final waypoint rather than going zero, so "nothing ahead" reads
+// as "the end is over there" instead of "the target is on top of me".
+void CBotManager::FillLookahead(int BotIndex, vec2 Pos, SStructuredObservation *pObs)
+{
+	if(!m_WaypointsLoaded || m_vWaypoints.empty())
+	{
+		for(int k = 0; k < NUM_LOOKAHEAD; k++)
+		{
+			pObs->m_aLookaheadX[k] = 0.0f;
+			pObs->m_aLookaheadY[k] = 0.0f;
+		}
+		return;
+	}
+
+	const int Base = m_aBotState[BotIndex].m_WaypointIndex;
+	const int Last = (int)m_vWaypoints.size() - 1;
+	for(int k = 0; k < NUM_LOOKAHEAD; k++)
+	{
+		int Idx = std::min(Base + LOOKAHEAD_OFFSETS[k], Last);
+		pObs->m_aLookaheadX[k] = m_vWaypoints[Idx].m_X - Pos.x;
+		pObs->m_aLookaheadY[k] = m_vWaypoints[Idx].m_Y - Pos.y;
+	}
+}
+
+float CBotManager::GetNormalizedProgress(int BotIndex, vec2 Pos)
+{
+	if(!m_WaypointsLoaded || m_TotalPathLength <= 0.0f)
+		return 0.0f;
+
+	SBotRewardState &State = m_aBotState[BotIndex];
+	State.m_WaypointIndex = FindClosestWaypoint(Pos, State.m_WaypointIndex, m_MaxAdvance);
+	return GetPathProgress(Pos, State.m_WaypointIndex) / m_TotalPathLength;
+}
+
+// Three terms, and deliberately no more (roadmap.md Part 1b).
+//
+// The freeze penalty, stuck ramp, off-path penalty, checkpoint bonus and
+// velocity-toward-checkpoint term are all gone. Each was a hand-tuned scale with
+// no reason to hold on the next map, and each could move the optimal policy. The
+// per-tick freeze penalty in particular cost -5.0/s against a maximum progress
+// rate of +5.0/s, so one second frozen exactly cancelled one second of
+// world-record-pace running — on a game where passing through freeze is routine
+// and sometimes mandatory.
+//
+// The progress term is a POTENTIAL DIFFERENCE, not the old high-water ratchet.
+// Ng, Harada & Russell (1999) proved that shaping of the form
+// gamma*Phi(s') - Phi(s) leaves the optimal policy unchanged for ANY Phi. That is
+// exactly the robustness we need: a mediocre ghost line, a suboptimal pathfinder
+// route, or a garbage segment near a teleport can cost learning speed but can
+// never teach the wrong behaviour. The ratchet had no such guarantee — being
+// non-Markovian it did move the optimum, and it made every tick after a failed
+// frontier attempt strictly negative with no way to earn anything back.
+float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *pObs, bool IsDecisionTick)
 {
 	float Reward = 0.0f;
 	SBotRewardState &State = m_aBotState[BotIndex];
@@ -716,155 +721,65 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 		return 0.0f;
 
 	vec2 Pos(Local.m_PosX, Local.m_PosY);
-	vec2 NextCp(pObs->m_NextCheckpointX, pObs->m_NextCheckpointY);
 
-	// Calculate distance to next checkpoint
-	vec2 ToCheckpoint = NextCp - Pos;
-	float DistToCheckpoint = length(ToCheckpoint);
+	// Time cost accrues every tick — this is the actual race objective.
+	Reward -= TIME_PENALTY;
 
-	// Progress reward using high water mark - only reward NEW progress, don't penalize backtracking
-	// This allows agents to backtrack to set up jumps without being punished
-	if(DistToCheckpoint < State.m_BestDistToCheckpoint)
+	// Potential-based shaping, applied ONCE PER DECISION.
+	//
+	// This must not run per tick. Reward is accumulated across the frame skip,
+	// and summing (gamma*Phi_{t+1} - Phi_t) over N ticks does not equal
+	// gamma^N*Phi_{t+N} - Phi_t, so the telescoping that makes the shaping
+	// policy-invariant breaks. The discount here has to be the agent's gamma at
+	// the agent's decision rate.
+	if(IsDecisionTick && m_WaypointsLoaded)
 	{
-		float Progress = State.m_BestDistToCheckpoint - DistToCheckpoint;
-		Reward += Progress / 100.0f;
-		State.m_BestDistToCheckpoint = DistToCheckpoint;
-	}
-	// No penalty for backtracking - just 0 reward
-
-	// Checkpoint reached (sparse but important) - reward based on count of unique checkpoints
-	int NumCheckpoints = State.m_NumCheckpointsReached;
-	if(NumCheckpoints > State.m_LastCheckpointRewarded)
-	{
-		Reward += 10.0f;
-		State.m_LastCheckpointRewarded = NumCheckpoints;
-		// Reset high-water mark — gives fresh progress reward headroom
-		State.m_BestDistToCheckpoint = DistToCheckpoint;
-		State.m_LastDistToCheckpoint = DistToCheckpoint;
+		float Phi = GetNormalizedProgress(BotIndex, Pos);
+		Reward += SHAPING_K * (SHAPING_GAMMA * Phi - State.m_LastPhi);
+		State.m_LastPhi = Phi;
 	}
 
-	// Finish reached
 	if(m_FinishPos.x > 0 && distance(Pos, m_FinishPos) < 48.0f)
-	{
-		Reward += 100.0f;
-	}
+		Reward += FINISH_BONUS;
 
-	// Time penalty (small)
-	Reward -= 0.0005f;
-
-	// Velocity bonus: reward movement TOWARD checkpoint
-	if(DistToCheckpoint > 0.1f)
-	{
-		vec2 DirToCheckpoint = ToCheckpoint / DistToCheckpoint;
-		vec2 Vel(Local.m_VelX, Local.m_VelY);
-		float VelTowardCp = dot(Vel, DirToCheckpoint);
-		Reward += std::clamp(VelTowardCp, 0.0f, 20.0f) / 500.0f;
-	}
-
-	// Hook success
-	if(Local.m_HookState == 2 && State.m_LastHookState != 2)
-	{
-		Reward += 0.05f;
-	}
-
-	// Freeze penalty
-	if(Local.m_IsFrozen && !State.m_WasFrozen)
-	{
-		Reward -= 0.3f;
-	}
-	if(Local.m_IsFrozen)
-	{
-		Reward -= 0.1f; // Per-tick penalty while frozen
-	}
-
-	// Exploration bonus - reward visiting new map regions
-	// Uses coarse grid (8x8 tiles = 256 pixels per region)
-	constexpr float REGION_SIZE = 256.0f;  // 8 tiles * 32 pixels
-	int RegionX = (int)(Pos.x / REGION_SIZE);
-	int RegionY = (int)(Pos.y / REGION_SIZE);
-
-	// Clamp to valid range
-	RegionX = std::clamp(RegionX, 0, SBotRewardState::EXPLORATION_GRID_SIZE - 1);
-	RegionY = std::clamp(RegionY, 0, SBotRewardState::EXPLORATION_GRID_SIZE - 1);
-
-	int RegionIdx = RegionY * SBotRewardState::EXPLORATION_GRID_SIZE + RegionX;
-
-	if(!State.m_VisitedRegions.test(RegionIdx))
-	{
-		State.m_VisitedRegions.set(RegionIdx);
-		State.m_NewRegionsThisEpisode++;
-
-		// Decaying exploration bonus to avoid over-exploration
-		// First regions worth more, diminishing returns
-		float ExplorationBonus = 0.1f / (1.0f + 0.05f * State.m_NewRegionsThisEpisode);
-		Reward += ExplorationBonus;
-	}
-
-	// Stuck detection based on lack of progress (not lack of movement)
-	// If we're at or near our best distance, we made progress recently
-	// Use generous tolerance (32 units = 1 tile) to account for physics oscillations
-	bool MadeProgress = (DistToCheckpoint <= State.m_BestDistToCheckpoint + 32.0f);
-
-	if(MadeProgress)
-	{
-		State.m_StuckCounter = 0;
-	}
-	else
-	{
-		State.m_StuckCounter++;
-
-		// Escalating penalty for sustained lack of progress
-		// Starts after ~1 second (50 ticks), increases over time
-		// This discourages oscillating/hesitating without penalizing brief backtracks
-		if(State.m_StuckCounter > 50)
-		{
-			float StuckPenalty = 0.01f * (State.m_StuckCounter - 50) / 50.0f;
-			Reward -= StuckPenalty;
-		}
-
-		// Debug: Log when stuck counter is high
-		if(State.m_StuckCounter == 100 || State.m_StuckCounter == 300 || State.m_StuckCounter == 500)
-		{
-			dbg_msg("rl/stuck", "Bot %d: stuck=%d, dist=%.1f, best=%.1f, diff=%.1f",
-				BotIndex, State.m_StuckCounter, DistToCheckpoint, State.m_BestDistToCheckpoint,
-				DistToCheckpoint - State.m_BestDistToCheckpoint);
-		}
-	}
-	// Note: Hard reset (Done=1) is handled in ExtractObservations where pBotData is accessible
-
-	// Update state
 	State.m_LastPosX = Local.m_PosX;
 	State.m_LastPosY = Local.m_PosY;
-	State.m_LastDistToCheckpoint = DistToCheckpoint;
 	State.m_LastHookState = Local.m_HookState;
-	State.m_WasFrozen = Local.m_IsFrozen;
-
-	// Scale rewards for PPO stability (adjust as needed)
-	Reward *= 1.0f;
 
 	return Reward;
 }
 
-void CBotManager::ResetRewardState(int BotIndex)
+void CBotManager::ResetRewardState(int BotIndex, int SpawnCheckpoint)
 {
 	SBotRewardState &State = m_aBotState[BotIndex];
-	State.m_LastPosX = m_SpawnPos.x;
-	State.m_LastPosY = m_SpawnPos.y;
-	State.m_NumCheckpointsReached = 0;
-	State.m_LastCheckpointNumber = 0;  // 0 = no checkpoint touched yet
-	State.m_LastCheckpointRewarded = 0;  // Reset so checkpoints give rewards again
-	State.m_LastDistToCheckpoint = 10000.0f; // Will be set properly on first tick
-	State.m_BestDistToCheckpoint = 10000.0f; // High water mark for progress
 	State.m_LastHookState = 0;
-	State.m_StuckCounter = 0;
-	State.m_WasFrozen = false;
 	State.m_WasDead = false;
-	State.m_HighestTimeCp = -1;
 
-	// Reset checkpoint and exploration tracking
-	State.m_VisitedCheckpoints.reset();
+	// Reset exploration tracking
 	State.m_VisitedRegions.reset();
 	State.m_NewRegionsThisEpisode = 0;
+
+	vec2 SpawnPos = m_SpawnPos;
+	if(SpawnCheckpoint >= 0 && SpawnCheckpoint < (int)m_vCheckpoints.size())
+		SpawnPos = m_vCheckpoints[SpawnCheckpoint].m_Pos;
+
+	State.m_LastPosX = SpawnPos.x;
+	State.m_LastPosY = SpawnPos.y;
+	State.m_HighestTimeCp = (SpawnCheckpoint >= 0) ? SpawnCheckpoint : -1;
+
+	// Seed the tracked index with an unrestricted scan — this is the one place a
+	// backward jump is legitimate, because the episode boundary breaks temporal
+	// continuity by design. Everywhere else the match is windowed.
+	if(m_WaypointsLoaded)
+	{
+		State.m_WaypointIndex = FindClosestWaypoint(SpawnPos, 0, (int)m_vWaypoints.size());
+		State.m_LastPhi = GetPathProgress(SpawnPos, State.m_WaypointIndex) / m_TotalPathLength;
+	}
+	else
+	{
+		State.m_WaypointIndex = 0;
+		State.m_LastPhi = 0.0f;
+	}
 }
 
 void CBotManager::RespawnAllBots()
@@ -1036,20 +951,21 @@ void CBotManager::AnalyzeMap()
 		m_vCheckpoints[i].m_Index = (int)i;
 	}
 
-	// Count teleport checkpoints (DDNet uses 0-indexed numbers for TeleCheckOuts)
-	// Find the highest checkpoint number that has teleport-out positions
-	m_NumTeleCheckpoints = 0;
-	for(int i = 0; i < 255; i++)  // DDNet supports up to 255 tele numbers
-	{
-		const auto &TeleOuts = m_pCollision->TeleCheckOuts(i);
-		if(!TeleOuts.empty())
-			m_NumTeleCheckpoints = i + 1;  // 0-indexed, so +1 for count
-	}
-
 	m_MapAnalyzed = true;
 
-	dbg_msg("rl/bots", "Map analyzed: %d time checkpoints, %d tele checkpoints, spawn (%.0f, %.0f), finish (%.0f, %.0f)",
-		(int)m_vCheckpoints.size(), m_NumTeleCheckpoints, m_SpawnPos.x, m_SpawnPos.y, m_FinishPos.x, m_FinishPos.y);
+	dbg_msg("rl/bots", "Map analyzed: %d time checkpoints, spawn (%.0f, %.0f), finish (%.0f, %.0f)",
+		(int)m_vCheckpoints.size(), m_SpawnPos.x, m_SpawnPos.y, m_FinishPos.x, m_FinishPos.y);
+
+	// Try to load waypoints for this map
+	// Search paths: ./waypoints/<MapName>.waypoints.bin, ./ghosts/<MapName>.waypoints.bin
+	const char *pMapName = m_pGameContext->Server()->GetMapName();
+	char aPath[256];
+	str_format(aPath, sizeof(aPath), "waypoints/%s.waypoints.bin", pMapName);
+	if(!LoadWaypoints(aPath))
+	{
+		str_format(aPath, sizeof(aPath), "ghosts/%s.waypoints.bin", pMapName);
+		LoadWaypoints(aPath);
+	}
 }
 
 vec2 CBotManager::GetNextCheckpointPos(int CurrentIndex) const
@@ -1086,6 +1002,230 @@ int CBotManager::GetCheckpointAtPos(vec2 Pos, float Radius) const
 	return -1;
 }
 
+bool CBotManager::LoadWaypoints(const std::string &Path)
+{
+	FILE *pFile = fopen(Path.c_str(), "rb");
+	if(!pFile)
+	{
+		dbg_msg("rl/bots", "No waypoints file found at '%s'", Path.c_str());
+		return false;
+	}
+
+	uint32_t NumPoints;
+	if(fread(&NumPoints, sizeof(uint32_t), 1, pFile) != 1 || NumPoints == 0 || NumPoints > 100000)
+	{
+		dbg_msg("rl/bots", "Invalid waypoints file: bad point count %u", NumPoints);
+		fclose(pFile);
+		return false;
+	}
+
+	m_vWaypoints.resize(NumPoints);
+	float CumulDist = 0.0f;
+	float LastX = 0, LastY = 0;
+
+	for(uint32_t i = 0; i < NumPoints; i++)
+	{
+		float x, y;
+		if(fread(&x, sizeof(float), 1, pFile) != 1 || fread(&y, sizeof(float), 1, pFile) != 1)
+		{
+			dbg_msg("rl/bots", "Waypoints file truncated at point %u", i);
+			fclose(pFile);
+			m_vWaypoints.clear();
+			return false;
+		}
+
+		if(i > 0)
+		{
+			float dx = x - LastX;
+			float dy = y - LastY;
+			CumulDist += sqrtf(dx * dx + dy * dy);
+		}
+
+		m_vWaypoints[i].m_X = x;
+		m_vWaypoints[i].m_Y = y;
+		m_vWaypoints[i].m_CumulativeDist = CumulDist;
+		LastX = x;
+		LastY = y;
+	}
+
+	fclose(pFile);
+	m_TotalPathLength = CumulDist;
+	m_WaypointsLoaded = true;
+
+	dbg_msg("rl/bots", "Loaded %u waypoints, total path length: %.0f units",
+		NumPoints, m_TotalPathLength);
+
+	SegmentPathAtDiscontinuities();
+
+	UpdateMatchWindow();
+	return true;
+}
+
+// Size the forward search window from physics, not from a fixed constant. The
+// tee cannot cover more than MAX_TEE_SPEED * FrameSkip units of arc between two
+// calls, so anything beyond that is a wrong-strand match. Called from both
+// LoadWaypoints and SetFrameSkip, since either can arrive first.
+void CBotManager::UpdateMatchWindow()
+{
+	if(!m_WaypointsLoaded || m_vWaypoints.size() < 2)
+		return;
+
+	float Spacing = m_TotalPathLength / (float)(m_vWaypoints.size() - 1);
+	m_MaxAdvance = (int)ceilf(MAX_TEE_SPEED * (float)std::max(1, m_FrameSkip) / std::max(Spacing, 1.0f)) + 1;
+	dbg_msg("rl/bots", "Waypoint spacing %.0f units, match window +%d/-%d (frame skip %d)",
+		Spacing, m_MaxAdvance, MAX_RETREAT, m_FrameSkip);
+}
+
+// Temporally coherent nearest-waypoint search.
+//
+// A purely spatial window is not enough. Reference paths double back on
+// themselves at close range — on Tutorial the ghost passes within ~100 units of
+// a point ~1000 units later along its own path, only ~17 waypoints apart, well
+// inside the +/-100 window this used to use. Measured against ground truth
+// (waypoints are resampled from the ghost, so cumulative ghost length IS the
+// true arc position), the old window gave a max error of 1.8% of the map and
+// single-frame jumps of 1052 units; this gives 0.45% and 355 units, the latter
+// being the resampling floor. With a high-water-mark reward that error was
+// permanent; with potential shaping it is merely noise, but it is still wrong.
+//
+// SearchRadius is the forward allowance. Pass m_vWaypoints.size() to opt out
+// entirely — legitimate only at an episode boundary, where temporal continuity
+// is broken by design.
+int CBotManager::FindClosestWaypoint(vec2 Pos, int SearchStart, int SearchRadius) const
+{
+	if(m_vWaypoints.empty())
+		return -1;
+
+	const int NumWaypoints = (int)m_vWaypoints.size();
+	const bool Unrestricted = SearchRadius >= NumWaypoints;
+	SearchStart = std::clamp(SearchStart, 0, NumWaypoints - 1);
+
+	int Start = Unrestricted ? 0 : std::max(0, SearchStart - MAX_RETREAT);
+	int End = Unrestricted ? NumWaypoints : std::min(NumWaypoints, SearchStart + SearchRadius + 1);
+
+	int BestIdx = SearchStart;
+	float BestDist = 1e18f;
+	for(int i = Start; i < End; i++)
+	{
+		float dx = Pos.x - m_vWaypoints[i].m_X;
+		float dy = Pos.y - m_vWaypoints[i].m_Y;
+		float d = dx * dx + dy * dy;
+		if(d < BestDist)
+		{
+			BestDist = d;
+			BestIdx = i;
+		}
+	}
+
+	// Lost: teleported, or wandered far off the path. Re-acquire by scanning
+	// FORWARD only. A backward global snap mid-episode is always wrong — it lets
+	// the match land on an earlier strand of a path that doubles back.
+	if(!Unrestricted && BestDist > LOST_DIST * LOST_DIST)
+	{
+		for(int i = SearchStart; i < NumWaypoints; i++)
+		{
+			float dx = Pos.x - m_vWaypoints[i].m_X;
+			float dy = Pos.y - m_vWaypoints[i].m_Y;
+			float d = dx * dx + dy * dy;
+			if(d < BestDist)
+			{
+				BestDist = d;
+				BestIdx = i;
+			}
+		}
+	}
+
+	return BestIdx;
+}
+
+// Split the path wherever consecutive waypoints are not actually connected —
+// i.e. a teleport. resample_waypoints() walks the ghost polyline at fixed
+// spacing and happily interpolates straight across a teleport, laying phantom
+// waypoints through solid geometry and giving two physically distant regions
+// adjacent indices.
+//
+// Detection is by collision, not by distance: free fall legitimately reaches
+// ~72 units/tick and ghosts record at 25 Hz, so large gaps between consecutive
+// samples are normal, but a segment passing through solid tiles is not.
+void CBotManager::SegmentPathAtDiscontinuities()
+{
+	int SegmentId = 0;
+	int NumBreaks = 0;
+	if(!m_vWaypoints.empty())
+		m_vWaypoints[0].m_SegmentId = 0;
+
+	for(size_t i = 1; i < m_vWaypoints.size(); i++)
+	{
+		bool Break = false;
+		if(m_pCollision)
+		{
+			vec2 A(m_vWaypoints[i - 1].m_X, m_vWaypoints[i - 1].m_Y);
+			vec2 B(m_vWaypoints[i].m_X, m_vWaypoints[i].m_Y);
+			// Sample along the segment; any solid tile means these two points are
+			// not reachable from one another in a straight line.
+			float Len = distance(A, B);
+			int Steps = std::max(2, (int)(Len / 16.0f));
+			for(int s = 1; s < Steps; s++)
+			{
+				vec2 P = mix(A, B, (float)s / (float)Steps);
+				if(m_pCollision->CheckPoint(P.x, P.y))
+				{
+					Break = true;
+					break;
+				}
+			}
+		}
+		if(Break)
+		{
+			SegmentId++;
+			NumBreaks++;
+			// The portal edge contributes ZERO arc length — no free progress
+			// reward for the distance a teleport covers.
+			float PrevCumul = m_vWaypoints[i - 1].m_CumulativeDist;
+			float Delta = m_vWaypoints[i].m_CumulativeDist - PrevCumul;
+			for(size_t j = i; j < m_vWaypoints.size(); j++)
+				m_vWaypoints[j].m_CumulativeDist -= Delta;
+		}
+		m_vWaypoints[i].m_SegmentId = SegmentId;
+	}
+
+	if(NumBreaks > 0)
+	{
+		m_TotalPathLength = m_vWaypoints.back().m_CumulativeDist;
+		dbg_msg("rl/bots", "Path split into %d segments at %d discontinuity/ies, "
+			"corrected path length: %.0f units", SegmentId + 1, NumBreaks, m_TotalPathLength);
+	}
+}
+
+float CBotManager::GetPathProgress(vec2 Pos, int WaypointIdx) const
+{
+	if(m_vWaypoints.empty() || WaypointIdx < 0)
+		return 0.0f;
+
+	WaypointIdx = std::clamp(WaypointIdx, 0, (int)m_vWaypoints.size() - 1);
+
+	// Base progress = cumulative distance to this waypoint
+	float Progress = m_vWaypoints[WaypointIdx].m_CumulativeDist;
+
+	// Add fractional progress toward next waypoint
+	if(WaypointIdx + 1 < (int)m_vWaypoints.size())
+	{
+		vec2 WpCur(m_vWaypoints[WaypointIdx].m_X, m_vWaypoints[WaypointIdx].m_Y);
+		vec2 WpNext(m_vWaypoints[WaypointIdx + 1].m_X, m_vWaypoints[WaypointIdx + 1].m_Y);
+		vec2 Seg = WpNext - WpCur;
+		float SegLen = length(Seg);
+		if(SegLen > 0.1f)
+		{
+			vec2 ToPos = Pos - WpCur;
+			float Proj = dot(ToPos, Seg) / (SegLen * SegLen);
+			Proj = std::clamp(Proj, 0.0f, 1.0f);
+			Progress += Proj * SegLen;
+		}
+	}
+
+	return Progress;
+}
+
 void CBotManager::GetStats(int *pTotalTicks, int *pMissedActions, int *pMaxConsecutive, int64_t *pMaxLatencyUs) const
 {
 	if(pTotalTicks)
@@ -1107,6 +1247,7 @@ void CBotManager::SetFrameSkip(int FrameSkip)
 
 	m_FrameSkip = FrameSkip;
 	m_FrameSkipCounter = 0; // Reset counter
+	UpdateMatchWindow();  // window depends on frame skip; either may be set first
 	mem_zero(m_aAccumulatedRewards, sizeof(m_aAccumulatedRewards)); // Clear accumulated rewards
 
 	dbg_msg("rl/bots", "Frame skip set to %d (decision rate: server_tickrate/%d)", FrameSkip, FrameSkip);
