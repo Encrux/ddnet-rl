@@ -61,6 +61,11 @@ class PPOConfig:
     discrete_dims: Tuple[int, ...] = (3, 2, 2, 16)  # direction, jump, hook, aim sector
     continuous_dim: int = 1  # aim residual within the sector
 
+    # Learned action hold (see action_hold.py). Empty = disabled. When set, a
+    # final discrete head of size len(hold_durations) is appended, and the env
+    # latches the sampled action for the chosen number of decisions.
+    hold_durations: Tuple[int, ...] = ()
+
     # CNN Feature Extractor (for dict observations)
     use_cnn: bool = False
     tile_grid_height: int = 31   # 1.5x original (21 -> 31)
@@ -85,6 +90,14 @@ class PPOConfig:
     # With frame_skip=3: 8 frames × 3 ticks × 20ms = 480ms coverage
     n_frame_stack: int = 1  # Number of tile frames to stack (1 = no stacking, expensive)
     n_player_state_stack: int = 8  # Number of player state frames to stack (cheap, enables timing)
+
+    def __post_init__(self):
+        # The duration head is appended LAST so that every existing consumer of
+        # discrete_dims (env action packing reads columns 0-3, checkpoints, the
+        # action-usage stats) keeps working on unchanged indices.
+        if self.hold_durations:
+            self.hold_durations = tuple(self.hold_durations)
+            self.discrete_dims = tuple(self.discrete_dims) + (len(self.hold_durations),)
 
 
 def layer_init(layer: nn.Module, std: float = np.sqrt(2), bias_const: float = 0.0) -> nn.Module:
@@ -412,6 +425,19 @@ class HybridActor(nn.Module):
             for dim in config.discrete_dims
         ])
 
+        # Bias the duration head toward SHORT holds at init. A uniform prior over
+        # {1,2,4,8,16} means an average hold of 6.2 decisions from step one, which
+        # would degrade the fine control the agent already has on terrain it has
+        # solved. This prior gives a mean of ~3.3 while still drawing the longest
+        # hold 5.8% of the time — five orders of magnitude more often than the
+        # 0.425^16 it replaces, which is the entire point.
+        if config.hold_durations:
+            n_dur = len(config.hold_durations)
+            with torch.no_grad():
+                self.discrete_heads[-1].bias.copy_(
+                    torch.linspace(1.0, -1.0, n_dur)
+                )
+
         # Continuous action head
         self.continuous_mean = layer_init(
             nn.Linear(feature_dim, config.continuous_dim), std=0.01
@@ -642,6 +668,11 @@ class PPOAgent:
         self.dones = torch.zeros((ns, ne), device=self.device)
         self.values = torch.zeros((ns, ne), device=self.device)
 
+        # Which rows the policy actually chose an action on. Without a duration
+        # head every row is fresh, so this stays all-ones and the masked means
+        # below reduce exactly to the plain means.
+        self.fresh_mask = torch.ones((ns, ne), device=self.device)
+
         # Initialize async transfer buffers for CUDA
         self._init_async_transfer_buffers()
 
@@ -851,9 +882,18 @@ class PPOAgent:
         log_prob: np.ndarray,
         reward: np.ndarray,
         done: np.ndarray,
-        value: np.ndarray
+        value: np.ndarray,
+        fresh: Optional[np.ndarray] = None
     ):
-        """Store a transition in the rollout buffer."""
+        """Store a transition in the rollout buffer.
+
+        `fresh` marks rows where the policy chose the action. On held rows the
+        stored action is the latch, while `log_prob` belongs to the action that
+        was sampled and thrown away — a deliberate mismatch that never reaches
+        the loss, because `update()` masks those rows out of the surrogate
+        objective. They are kept in the buffer because their rewards and values
+        are real and the critic must learn them.
+        """
         if self.use_embeddings:
             # Embedding mode: tiles as long for nn.Embedding
             tiles = obs['tiles']
@@ -890,6 +930,10 @@ class PPOAgent:
         self.rewards[step] = torch.from_numpy(reward).to(self.device)
         self.dones[step] = torch.from_numpy(done.astype(np.float32)).to(self.device)
         self.values[step] = torch.from_numpy(value).to(self.device)
+        if fresh is None:
+            self.fresh_mask[step] = 1.0
+        else:
+            self.fresh_mask[step] = torch.from_numpy(fresh.astype(np.float32)).to(self.device)
 
     @torch.no_grad()
     def compute_advantages(
@@ -967,9 +1011,17 @@ class PPOAgent:
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = self.values.reshape(-1)
+        b_fresh = self.fresh_mask.reshape(-1)
 
-        # Normalize advantages
-        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+        # Normalize advantages over the rows that actually enter the surrogate
+        # objective. With a duration head the held rows sit mid-maneuver and have
+        # a systematically different advantage distribution, so including them
+        # would bias the shift and scale of the gradient inputs.
+        fresh_adv = b_advantages[b_fresh > 0]
+        if fresh_adv.numel() > 1:
+            b_advantages = (b_advantages - fresh_adv.mean()) / (fresh_adv.std() + 1e-8)
+        else:
+            b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
         minibatch_size = batch_size // cfg.num_minibatches
 
@@ -1006,6 +1058,10 @@ class PPOAgent:
                 mb_advantages = b_advantages[mb_indices]
                 mb_returns = b_returns[mb_indices]
                 mb_values = b_values[mb_indices]
+                mb_fresh = b_fresh[mb_indices]
+                # Denominator for every policy-side mean. Guarded because a
+                # minibatch could in principle contain no fresh rows.
+                mb_fresh_n = mb_fresh.sum().clamp(min=1.0)
 
                 # Validate discrete actions are within bounds (debug CUDA scatter/gather errors)
                 for i, dim in enumerate(cfg.discrete_dims):
@@ -1032,7 +1088,12 @@ class PPOAgent:
                     pg_loss2 = -mb_advantages * torch.clamp(
                         ratio, 1 - self.config.clip_coef, 1 + self.config.clip_coef
                     )
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    # Masked so that only steps where the policy actually chose an
+                    # action contribute. On a held step the stored action came
+                    # from the latch, not from pi_old, so its importance ratio is
+                    # meaningless and optimising it would train the policy to
+                    # reproduce its own hold.
+                    pg_loss = (torch.max(pg_loss1, pg_loss2) * mb_fresh).sum() / mb_fresh_n
 
                     # Value loss
                     if self.config.clip_vloss:
@@ -1047,17 +1108,27 @@ class PPOAgent:
                     else:
                         v_loss = 0.5 * ((new_value - mb_returns) ** 2).mean()
 
-                    # Entropy loss
-                    entropy_loss = entropy.mean()
+                    # Entropy loss, masked to match pg_loss. Entropy itself is a
+                    # property of the state, so held rows carry a valid value —
+                    # but averaging it over all rows while pg_loss averages over
+                    # a quarter of them would silently multiply the effective
+                    # ent_coef. Run B established that the entropy bonus is
+                    # load-bearing for exploration here, so its scale must not
+                    # drift as a side effect of adding the duration head.
+                    entropy_loss = (entropy * mb_fresh).sum() / mb_fresh_n
 
                     # Total loss
                     loss = pg_loss - self.config.ent_coef * entropy_loss + self.config.vf_coef * v_loss
 
                 # Approximate KL for early stopping (outside autocast)
                 with torch.no_grad():
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs.append(((ratio - 1.0).abs() > self.config.clip_coef).float().mean().item())
+                    # Masked too: on held rows the ratio compares the latched
+                    # action against the log-prob of a different, discarded one,
+                    # which would make both diagnostics read as huge divergence.
+                    old_approx_kl = (-logratio * mb_fresh).sum() / mb_fresh_n
+                    approx_kl = (((ratio - 1) - logratio) * mb_fresh).sum() / mb_fresh_n
+                    clipped = ((ratio - 1.0).abs() > self.config.clip_coef).float()
+                    clipfracs.append(((clipped * mb_fresh).sum() / mb_fresh_n).item())
                     all_approx_kl.append(approx_kl.item())
 
                 # Optimize (outside autocast)

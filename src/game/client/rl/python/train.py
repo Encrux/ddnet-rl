@@ -125,6 +125,7 @@ from teeworlds_vec_env import TeeWorldsVecEnv, EnvConfig
 from teeworlds_server_env import TeeWorldsServerEnv, ServerEnvConfig, FrameStackWrapper
 from ppo_hybrid import PPOAgent, PPOConfig
 from episode_tracker import EpisodeTracker
+from action_hold import ActionHold
 
 
 def parse_args():
@@ -256,6 +257,13 @@ def parse_args():
                         help="Bins before the frontier to sample restore slots from")
     parser.add_argument("--waypoints-path", type=str, default=None,
                         help="Override waypoint file autodiscovery (waypoints/, then ghosts/)")
+    parser.add_argument("--action-hold", action="store_true",
+                        help="Learned action hold: the policy picks how many decisions to hold "
+                             "each action for. Makes multi-step commitments (hook swings) "
+                             "discoverable — see action_hold.py.")
+    parser.add_argument("--hold-durations", type=str, default="1,2,4,8,16",
+                        help="Comma-separated hold lengths in decisions (default: 1,2,4,8,16). "
+                             "At frame_skip 3 that spans 0.06s to 0.96s.")
 
     # Curriculum learning
     parser.add_argument("--curriculum", type=str, default="none",
@@ -391,6 +399,12 @@ def main():
             obs_dim = obs.shape[1]
         print(f"Observation dimension: {obs_dim}")
 
+        hold_durations = ()
+        if args.action_hold:
+            hold_durations = tuple(int(x) for x in str(args.hold_durations).split(",") if x.strip())
+            print(f"Action hold: ON, durations={hold_durations} decisions "
+                  f"({[d * args.frame_skip for d in hold_durations]} ticks)")
+
         # Create PPO config
         ppo_config = PPOConfig(
             learning_rate=args.learning_rate,
@@ -413,6 +427,7 @@ def main():
             tile_encoder='cnn' if args.semantic_tiles else args.tile_encoder,
             n_frame_stack=args.n_frame_stack,
             n_player_state_stack=args.n_player_state_stack,
+            hold_durations=hold_durations,
         )
 
         # Create agent
@@ -422,6 +437,15 @@ def main():
             config=ppo_config,
             device=str(device),
         )
+
+        action_hold = None
+        if hold_durations:
+            action_hold = ActionHold(
+                num_envs=args.num_envs,
+                num_discrete=len(ppo_config.discrete_dims),
+                continuous_dim=ppo_config.continuous_dim,
+                durations=hold_durations,
+            )
 
         # Resume from checkpoint if specified
         if args.resume:
@@ -495,11 +519,25 @@ def main():
                 if args.server_side and args.sync_inference:
                     env.unpause()
 
+                # Latch the action for as long as the policy asked. `executed`
+                # is what the game sees and what goes in the buffer; `fresh`
+                # marks the rows the policy is allowed to be graded on.
+                if action_hold is not None:
+                    executed, fresh = action_hold.apply(action)
+                else:
+                    executed, fresh = action, None
+
                 # Environment step
-                next_obs, reward, done, truncated, infos = env.step(action)
+                next_obs, reward, done, truncated, infos = env.step(executed)
 
                 # Store transition
-                agent.store_transition(step, obs, action, log_prob, reward, done, value)
+                agent.store_transition(step, obs, executed, log_prob, reward, done, value, fresh)
+
+                # A reset invalidates the latch: the state the action was chosen
+                # for is gone, and under the curriculum the agent may have been
+                # restored somewhere else on the map entirely.
+                if action_hold is not None:
+                    action_hold.clear(done | truncated)
 
                 obs = next_obs
 
@@ -611,7 +649,7 @@ def main():
                     from torch.distributions import Categorical as _C, Normal as _N
                     with _t.no_grad():
                         logits, mu, sd = agent.actor(obs)
-                        names = ['direction', 'jump', 'hook', 'aim_sector']
+                        names = ['direction', 'jump', 'hook', 'aim_sector', 'hold']
                         for nm, lg in zip(names, logits):
                             e = _C(logits=lg.float().clamp(-50, 50), validate_args=False).entropy().mean()
                             writer.add_scalar(f"entropy/{nm}", e.item(), global_step)
@@ -622,6 +660,13 @@ def main():
                 except Exception as _e:
                     if update <= args.log_freq * 2:
                         print(f"  [warn] per-head entropy logging unavailable: {_e}")
+
+                # Hold usage. If mean_duration collapses to 1 the policy is
+                # declining the extra head and the experiment is a no-op — that
+                # needs to be visible, not inferred from the edge curve.
+                if action_hold is not None:
+                    for k, v in action_hold.stats().items():
+                        writer.add_scalar(k, v, global_step)
 
                 # Headline metrics: finish rate, progress percentiles, death heatmap
                 if tracker is not None:
