@@ -533,7 +533,8 @@ def main():
             if tracker is not None and base_env.spawn_manager is not None and \
                hasattr(base_env.spawn_manager, 'update_frontier'):
                 base_env.spawn_manager.update_frontier(tracker.frontier_bin(),
-                                                       tracker.reached_bins())
+                                                       tracker.reached_bins(),
+                                                       tracker.exploration_edge())
 
             # PPO update (optionally pause to prevent bots from acting with stale policy)
             rollout_time = time.time() - rollout_start
@@ -592,6 +593,30 @@ def main():
                 if episode_rewards:
                     writer.add_scalar("charts/episodic_return", mean_reward, global_step)
                     writer.add_scalar("charts/episodic_length", mean_length, global_step)
+
+                # Action usage + PER-HEAD entropy. The aggregate entropy number
+                # cannot distinguish "policy is uniform everywhere" from "sharp on
+                # movement, uniform on an aim head that currently does not matter".
+                for nm, val in (('hook', getattr(base_env, '_act_hook', 0.0)),
+                                ('jump', getattr(base_env, '_act_jump', 0.0)),
+                                ('move', getattr(base_env, '_act_move', 0.0))):
+                    writer.add_scalar(f"actions/{nm}_rate", val, global_step)
+                try:
+                    import torch as _t
+                    from torch.distributions import Categorical as _C, Normal as _N
+                    with _t.no_grad():
+                        logits, mu, sd = agent.actor(obs)
+                        names = ['direction', 'jump', 'hook', 'aim_sector']
+                        for nm, lg in zip(names, logits):
+                            e = _C(logits=lg.float().clamp(-50, 50), validate_args=False).entropy().mean()
+                            writer.add_scalar(f"entropy/{nm}", e.item(), global_step)
+                        writer.add_scalar("entropy/aim_residual",
+                                          _N(mu.float(), sd.float().clamp(min=1e-6),
+                                             validate_args=False).entropy().sum(-1).mean().item(),
+                                          global_step)
+                except Exception as _e:
+                    if update <= args.log_freq * 2:
+                        print(f"  [warn] per-head entropy logging unavailable: {_e}")
 
                 # Headline metrics: finish rate, progress percentiles, death heatmap
                 if tracker is not None:

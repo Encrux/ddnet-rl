@@ -183,22 +183,34 @@ class ProgressSpawnManager:
         self.window = window
         self.num_bins = num_bins
         self._frontier: Optional[int] = None
+        self._edge: Optional[int] = None
         self._reached = np.zeros(0, dtype=np.int64)
         self.last_sampled = np.zeros(0, dtype=np.int32)
 
-    def update_frontier(self, frontier_bin: Optional[int], reached_bins: np.ndarray) -> None:
-        """Feed in the tracker's stall-based frontier estimate."""
+    def update_frontier(self, frontier_bin: Optional[int], reached_bins: np.ndarray,
+                        edge: Optional[int] = None) -> None:
+        """Feed in the frontier estimate and the exploration edge.
+
+        Placement targets the EDGE, not the dwell-based frontier estimate. Using
+        dwell to place restores is a feedback loop: the estimate picks the bin
+        absorbing the most time, but the curriculum is what puts agents there, so
+        it locks onto its own restore point and stops advancing. Observed exactly
+        that - edge stuck at bin 91 for 64M steps while restores sat at bin 73,
+        never within a window of the real frontier. Dwell is kept as a diagnostic.
+        """
         self._frontier = frontier_bin
+        self._edge = edge if edge is not None else frontier_bin
         self._reached = reached_bins
 
     def sample(self, n: int) -> np.ndarray:
         """Sample n restore slots. -1 means spawn at the map start."""
         out = np.full(n, -1, dtype=np.int32)
-        if self._frontier is None or len(self._reached) == 0:
-            return out  # no frontier estimate yet: everyone starts at the beginning
+        target = self._edge if self._edge is not None else self._frontier
+        if target is None or len(self._reached) == 0:
+            return out  # no estimate yet: everyone starts at the beginning
 
-        lo = max(0, self._frontier - self.window)
-        hi = self._frontier
+        lo = max(0, target - self.window)
+        hi = target
         # Only offer slots agents have actually reached; anything else is very
         # likely an empty archive bin and would silently fall back to spawn.
         candidates = self._reached[(self._reached >= lo) & (self._reached <= hi)]
@@ -218,6 +230,7 @@ class ProgressSpawnManager:
     def get_stats(self) -> dict:
         s = {
             'curriculum/frontier_bin': float(self._frontier) if self._frontier is not None else -1.0,
+            'curriculum/edge_bin': float(self._edge) if self._edge is not None else -1.0,
             'curriculum/reached_bins': float(len(self._reached)),
         }
         if len(self.last_sampled):
@@ -1338,6 +1351,7 @@ class TeeWorldsServerEnv:
         self._dwell_done = np.full(self.num_bots, -1, dtype=np.int32)  # -1 = none this step
         self._dwell_steps_done = np.zeros(self.num_bots, dtype=np.int32)
         self._heading_valid = np.zeros(self.num_bots, dtype=bool)
+        self._act_hook = 0.0; self._act_jump = 0.0; self._act_move = 0.0
 
         # Checkpoint respawn manager
         self.spawn_manager = None
@@ -1762,6 +1776,15 @@ class TeeWorldsServerEnv:
             truncated: np.ndarray of shape (num_envs,) - True if max steps reached
             infos: List of dicts with additional info per environment
         """
+        # Action usage. Aggregate entropy is misleading with a factored aim head:
+        # the 16-way sector head contributes log(16)=2.77 nats and stays uniform
+        # whenever aim does not matter, which hides how sharp the rest is. Usage
+        # rates say directly whether the agent is even using its abilities.
+        d = actions['discrete']
+        self._act_hook = float(d[:, 2].mean())
+        self._act_jump = float(d[:, 1].mean())
+        self._act_move = float((d[:, 0] != 1).mean())   # 1 == no horizontal input
+
         t0 = time.perf_counter()
 
         # Parallel writes: submit all write tasks to thread pool
