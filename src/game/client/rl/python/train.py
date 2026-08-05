@@ -245,6 +245,10 @@ def parse_args():
     parser.add_argument("--finish-progress", type=float, default=1.0,
                         help="Virtual finish line as normalised path progress. 1.0 = real end of "
                              "map; lower slices the map short for fast iteration (default: 1.0)")
+    parser.add_argument("--semantic-tiles", action="store_true",
+                        help="Fixed 12-channel semantic tile encoding instead of raw index/15. "
+                             "Makes SOLID / NOHOOK / THROUGH orthogonal rather than neighbouring "
+                             "scalars (roadmap.md 1.9). Implies --use-embeddings plumbing.")
     parser.add_argument("--frontier-curriculum", action="store_true",
                         help="Restore agents near the stall-derived frontier (Phase 2.3). "
                              "Distinct from --curriculum, which selects maps/segments.")
@@ -330,7 +334,7 @@ def main():
             frame_skip=args.frame_skip,
             max_episode_steps=args.max_episode_steps,
             use_dict_obs=args.use_cnn,  # Enable dict observations for CNN
-            use_embeddings=args.use_embeddings,  # Enable embedding observations
+            use_embeddings=args.use_embeddings or args.semantic_tiles,  # int64 tile ids
             map_name=args.map,
             debug_timing=args.debug_timing,
             checkpoint_respawn=args.checkpoint_respawn,
@@ -403,9 +407,10 @@ def main():
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
             use_cnn=args.use_cnn,
-            use_embeddings=args.use_embeddings,
+            use_embeddings=args.use_embeddings or args.semantic_tiles,
+            semantic_tiles=args.semantic_tiles,
             tile_embed_dim=args.tile_embed_dim,
-            tile_encoder=args.tile_encoder,
+            tile_encoder='cnn' if args.semantic_tiles else args.tile_encoder,
             n_frame_stack=args.n_frame_stack,
             n_player_state_stack=args.n_player_state_stack,
         )

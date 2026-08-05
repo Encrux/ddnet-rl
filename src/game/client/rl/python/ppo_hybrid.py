@@ -71,7 +71,8 @@ class PPOConfig:
 
     # Embedding Feature Extractor (for raw tile IDs)
     use_embeddings: bool = False     # Use tile embeddings instead of normalized values
-    tile_embed_dim: int = 8          # Embedding dimension per tile
+    tile_embed_dim: int = 8
+    semantic_tiles: bool = False     # fixed semantic lookup instead of a learned embedding
     tile_encoder: str = "mlp"        # "mlp" or "cnn" for processing embedded tiles
 
     # Mixed precision training (2-3x speedup on modern GPUs)
@@ -188,6 +189,53 @@ class CNNFeatureExtractor(nn.Module):
         return self.combine(combined)
 
 
+
+# ---------------------------------------------------------------------------
+# Fixed semantic tile encoding (roadmap.md §1.9)
+#
+# The float32 path feeds the CNN a single channel of raw_tile_index / 15, so the
+# distinctions that matter most for movement are neighbouring scalars:
+#
+#     SOLID   = 1  -> 0.067   (blocking, hook ATTACHES)
+#     NOHOOK  = 3  -> 0.200   (blocking, hook does NOT attach)
+#     THROUGH = 6  -> 0.400   (hook PASSES THROUGH)
+#
+# SOLID/NOHOOK/THROUGH are semantic opposites sitting 0.13-0.33 apart on a
+# continuous axis, with NOLASER and THROUGH_CUT as distractors in between. A
+# hook-climb depends on exactly that discrimination, so the encoding makes the
+# single most important question the hardest one to extract.
+#
+# This table makes them orthogonal channels. It is FIXED, not learned: no
+# parameters, no gradient, no exploration cost - only a reindexing of
+# information the observation already carries.
+SEMANTIC_CHANNELS = 12
+(SEM_AIR, SEM_SOLID, SEM_NOHOOK, SEM_THROUGH, SEM_DEATH, SEM_FREEZE,
+ SEM_UNFREEZE, SEM_TELE, SEM_BOOST, SEM_JUMP, SEM_STOPPER, SEM_OTHER) = range(12)
+
+_TILE_SEMANTICS = {
+    0: SEM_AIR,
+    1: SEM_SOLID,                                   # hookable wall
+    3: SEM_NOHOOK,                                  # wall the hook slides off
+    5: SEM_THROUGH, 6: SEM_THROUGH,                 # THROUGH_CUT, THROUGH
+    66: SEM_THROUGH, 67: SEM_THROUGH,               # THROUGH_ALL, THROUGH_DIR
+    2: SEM_DEATH,
+    9: SEM_FREEZE, 12: SEM_FREEZE, 144: SEM_FREEZE, # FREEZE, DFREEZE, LFREEZE
+    11: SEM_UNFREEZE, 13: SEM_UNFREEZE, 145: SEM_UNFREEZE,
+    10: SEM_TELE, 26: SEM_TELE, 27: SEM_TELE, 30: SEM_TELE, 31: SEM_TELE, 63: SEM_TELE,
+    28: SEM_BOOST, 29: SEM_BOOST,
+    7: SEM_JUMP, 16: SEM_JUMP,                      # JUMP, WALLJUMP
+    60: SEM_STOPPER, 61: SEM_STOPPER, 62: SEM_STOPPER,
+}
+
+
+def build_semantic_table(device=None) -> torch.Tensor:
+    """(256, SEMANTIC_CHANNELS) one-hot lookup. Unmapped ids fall into OTHER."""
+    t = torch.zeros(256, SEMANTIC_CHANNELS, dtype=torch.float32)
+    for tid in range(256):
+        t[tid, _TILE_SEMANTICS.get(tid, SEM_OTHER)] = 1.0
+    return t.to(device) if device is not None else t
+
+
 class EmbeddingFeatureExtractor(nn.Module):
     """
     Feature extractor using learned tile embeddings.
@@ -212,8 +260,16 @@ class EmbeddingFeatureExtractor(nn.Module):
         embed_dim = config.tile_embed_dim
         tile_encoder = config.tile_encoder
 
-        # Learned tile embeddings: 256 possible tile IDs -> embed_dim
-        self.tile_embedding = nn.Embedding(256, embed_dim)
+        # Fixed semantic lookup, or a learned embedding.
+        self.semantic_tiles = getattr(config, 'semantic_tiles', False)
+        if self.semantic_tiles:
+            embed_dim = SEMANTIC_CHANNELS
+            self.tile_embedding = nn.Embedding(256, embed_dim)
+            with torch.no_grad():
+                self.tile_embedding.weight.copy_(build_semantic_table())
+            self.tile_embedding.weight.requires_grad_(False)
+        else:
+            self.tile_embedding = nn.Embedding(256, embed_dim)
 
         if tile_encoder == "mlp":
             # MLP: Flatten embedded tiles and project
