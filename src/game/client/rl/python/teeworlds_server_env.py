@@ -88,8 +88,8 @@ def get_shm_path(server_index: int = 0) -> str:
 # Struct sizes (must match C++ rl_protocol.h)
 HEADER_SIZE = 32        # SServerRLHeader
 ACTION_SIZE = 36        # SAction (9 x int32: direction, jump, hook, fire, aim_x, aim_y, weapon, reset, restore_slot)
-OBS_SIZE = 1452         # SStructuredObservation (tiles + player + nav)
-BOT_DATA_SIZE = 1504    # SBotData (legacy interleaved layout: 36 + 1452 + 16)
+OBS_SIZE = 1456         # SStructuredObservation (tiles + player + nav + max progress)
+BOT_DATA_SIZE = 1508    # SBotData (legacy interleaved layout: 36 + 1456 + 16)
 
 # Navigation block: normalised progress + geometric path lookahead.
 # Replaces the old 4-feature checkpoint block, which encoded mapper-authored
@@ -107,7 +107,12 @@ NUM_LOOKAHEAD = 8
 STUCK_WINDOW = 10
 STUCK_DIST = 64.0
 NUM_PROGRESS_BINS = 200
-NAV_DIM = 1 + 2 * NUM_LOOKAHEAD  # progress + (x, y) per lookahead point
+# progress + (x, y) per lookahead point + episode high-water progress.
+# The high-water mark is LAST so the strided (x, y) parse keeps its shape; it is
+# what ratchet shaping's potential is a function of, and without it the critic
+# cannot distinguish an agent that walked straight to a spot from one that has
+# already been further and come back.
+NAV_DIM = 1 + 2 * NUM_LOOKAHEAD + 1
 FLAT_OBS_DIM = 15 + NAV_DIM + 49  # MLP mode: player + nav + 7x7 tile crop
 # Per-index normalisation: lookahead k sits ~64 * 2^k units ahead, so dividing by
 # its own expected magnitude keeps every feature O(1) instead of spanning 62..8000.
@@ -118,7 +123,7 @@ LOOKAHEAD_SCALE = np.array([64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8
 # Layout: [Header][Action0..N][Obs0..N][Reward0..N][Done0..N][Truncated0..N][BotClientId0..N]
 CONTIGUOUS_ACTIONS_OFFSET = HEADER_SIZE  # 32
 CONTIGUOUS_OBS_OFFSET = CONTIGUOUS_ACTIONS_OFFSET + MAX_RL_BOTS * ACTION_SIZE  # 32 + 128*36 = 4640
-CONTIGUOUS_REWARDS_OFFSET = CONTIGUOUS_OBS_OFFSET + MAX_RL_BOTS * OBS_SIZE  # 4640 + 128*1400 = 183840
+CONTIGUOUS_REWARDS_OFFSET = CONTIGUOUS_OBS_OFFSET + MAX_RL_BOTS * OBS_SIZE  # 4640 + 128*1456 = 190008
 CONTIGUOUS_DONES_OFFSET = CONTIGUOUS_REWARDS_OFFSET + MAX_RL_BOTS * 4  # 183840 + 512 = 184352
 CONTIGUOUS_TRUNCATED_OFFSET = CONTIGUOUS_DONES_OFFSET + MAX_RL_BOTS * 4  # 184352 + 512 = 184864
 CONTIGUOUS_BOTIDS_OFFSET = CONTIGUOUS_TRUNCATED_OFFSET + MAX_RL_BOTS * 4  # 184864 + 512 = 185376
@@ -334,6 +339,9 @@ class ServerEnvConfig:
     waypoints_path: Optional[str] = None  # Override waypoint file autodiscovery
     curriculum: bool = False       # Restore agents near the frontier (Phase 2.3)
     frontier_window: int = 12      # Bins before the frontier to sample from
+    # Shaping potential is the episode's HIGH-WATER progress instead of current
+    # progress, so a tactical retreat costs only time. Server-side flag.
+    ratchet_shaping: bool = False
 
     def __post_init__(self):
         if self.server_path is None:
@@ -354,15 +362,17 @@ def _parse_flat_obs_numba(raw_arr: np.ndarray, n: int,
     Only extracts what's needed: player state, checkpoint, and 7x7 center tile crop.
     Much faster than CNN parsing since we skip the full 43x31 tile grid.
     """
-    # Offsets within SBotData (1448 bytes per bot)
-    OBS_START = 32  # After SAction
+    # Offsets within SBotData. Derived from the module constants rather than
+    # written out: these were left at 32/1400/1448 through two protocol changes
+    # and would silently read the wrong bytes rather than fail.
+    OBS_START = ACTION_SIZE       # After SAction
     LOCAL_PLAYER = OBS_START + 8  # After 8-byte header
     TILES = LOCAL_PLAYER + 36     # After SPlayerObs
     EXTRA_STATE = TILES + 1333    # After tile grid
     NAV = EXTRA_STATE + 4  # After extra state
-    REWARD_OFF = OBS_START + 1400 # After observation
+    REWARD_OFF = OBS_START + OBS_SIZE # After observation
     DONE_OFF = REWARD_OFF + 4
-    BOT_SIZE = 1448
+    BOT_SIZE = BOT_DATA_SIZE
 
     # Tile grid center offsets (player is at center of 43x31 grid)
     # Center is at (21, 15), so 7x7 crop is (18:25, 12:19)
@@ -411,9 +421,10 @@ def _parse_flat_obs_numba(raw_arr: np.ndarray, n: int,
         features[i, 14] = float(jumped) / 3.0
 
         # Checkpoint (4 features) - indices 15-18
-        nav_f = raw_arr[base + NAV:base + NAV + 4 + 8 * NUM_LOOKAHEAD].view(np.float32)
+        nav_f = raw_arr[base + NAV:base + NAV + 4 * NAV_DIM].view(np.float32)
 
         features[i, 15] = nav_f[0]  # normalised path progress
+        features[i, 16 + 2 * NUM_LOOKAHEAD] = nav_f[1 + 2 * NUM_LOOKAHEAD]  # high-water
         for k in range(NUM_LOOKAHEAD):
             features[i, 16 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + k] / LOOKAHEAD_SCALE[k]))
             features[i, 17 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + NUM_LOOKAHEAD + k] / LOOKAHEAD_SCALE[k]))
@@ -437,15 +448,17 @@ def _parse_cnn_obs_numba(raw_arr: np.ndarray, n: int,
 
     Tiles are parsed separately using numpy vectorized ops for speed.
     """
-    # Offsets within SBotData (1448 bytes per bot)
-    OBS_START = 32  # After SAction
+    # Offsets within SBotData. Derived from the module constants rather than
+    # written out: these were left at 32/1400/1448 through two protocol changes
+    # and would silently read the wrong bytes rather than fail.
+    OBS_START = ACTION_SIZE       # After SAction
     LOCAL_PLAYER = OBS_START + 8  # After 8-byte header
     TILES = LOCAL_PLAYER + 36     # After SPlayerObs
     EXTRA_STATE = TILES + 1333    # After tile grid
     NAV = EXTRA_STATE + 4  # After extra state
-    REWARD_OFF = OBS_START + 1400 # After observation
+    REWARD_OFF = OBS_START + OBS_SIZE # After observation
     DONE_OFF = REWARD_OFF + 4
-    BOT_SIZE = 1448
+    BOT_SIZE = BOT_DATA_SIZE
 
     for i in prange(n):
         base = i * BOT_SIZE
@@ -489,9 +502,10 @@ def _parse_cnn_obs_numba(raw_arr: np.ndarray, n: int,
         player_state[i, 14] = float(jumped) / 3.0
 
         # Navigation: progress + geometric path lookahead
-        nav_f = raw_arr[base + NAV:base + NAV + 4 + 8 * NUM_LOOKAHEAD].view(np.float32)
+        nav_f = raw_arr[base + NAV:base + NAV + 4 * NAV_DIM].view(np.float32)
 
         checkpoint[i, 0] = nav_f[0]  # normalised path progress
+        checkpoint[i, 1 + 2 * NUM_LOOKAHEAD] = nav_f[1 + 2 * NUM_LOOKAHEAD]  # high-water
         for k in range(NUM_LOOKAHEAD):
             checkpoint[i, 1 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + k] / LOOKAHEAD_SCALE[k]))
             checkpoint[i, 2 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + NUM_LOOKAHEAD + k] / LOOKAHEAD_SCALE[k]))
@@ -508,10 +522,10 @@ def _parse_flat_obs_contiguous_numba(obs_arr: np.ndarray, n: int,
                                        dones: np.ndarray) -> None:
     """Parse flat observations from CONTIGUOUS layout for MLP policy.
 
-    obs_arr: shape (n, 1400) - contiguous observations
+    obs_arr: shape (n, OBS_SIZE) - contiguous observations
     rewards/dones: already extracted from contiguous arrays
     """
-    # Offsets within SStructuredObservation (1400 bytes)
+    # Offsets within SStructuredObservation (OBS_SIZE bytes)
     LOCAL_PLAYER = 8
     TILES = LOCAL_PLAYER + 36  # 44
     EXTRA_STATE = TILES + 1333  # 1377
@@ -557,7 +571,7 @@ def _parse_flat_obs_contiguous_numba(obs_arr: np.ndarray, n: int,
         features[i, 14] = float(jumped) / 3.0
 
         # Checkpoint (4 features) - indices 15-18
-        nav_f = obs_arr[i, NAV:NAV + 4 + 8 * NUM_LOOKAHEAD].view(np.float32)
+        nav_f = obs_arr[i, NAV:NAV + 4 * NAV_DIM].view(np.float32)
 
         features[i, 15] = nav_f[0]  # normalised path progress
         for k in range(NUM_LOOKAHEAD):
@@ -581,8 +595,8 @@ def _parse_tiles_vectorized(raw_arr: np.ndarray, n: int, tiles: np.ndarray) -> N
     """
     from numpy.lib.stride_tricks import as_strided
 
-    BOT_SIZE = 1448
-    TILES_OFFSET = 32 + 8 + 36  # OBS_START + header + LocalPlayer = 76
+    BOT_SIZE = BOT_DATA_SIZE
+    TILES_OFFSET = ACTION_SIZE + 8 + 36  # OBS_START + header + LocalPlayer
     TILE_SIZE = 1333  # 31 * 43
 
     # Use strided view to access all tile data at once without copying
@@ -855,7 +869,7 @@ class ServerShmClient:
         player_state = np.empty((n, 15), dtype=np.float32)
         checkpoint = np.empty((n, NAV_DIM), dtype=np.float32)
 
-        # Offsets within SStructuredObservation (1400 bytes)
+        # Offsets within SStructuredObservation (OBS_SIZE bytes)
         # Layout: header(8) + LocalPlayer(36) + TileGrid(1333) + ExtraState(4) + Checkpoint(16) + Reserved(3)
         LOCAL_PLAYER = 8
         TILES = LOCAL_PLAYER + 36  # 44
@@ -904,12 +918,18 @@ class ServerShmClient:
         player_state[:, 13] = armor / 10.0
         player_state[:, 14] = jumped / 3.0
 
-        # ===== NAV (progress + path lookahead) =====
-        nav_raw = obs_arr[:, NAV:NAV + 4 + 8 * NUM_LOOKAHEAD].copy().view(np.float32).reshape(n, NAV_DIM)
+        # ===== NAV (progress + path lookahead + episode high-water progress) =====
+        # Slices are explicitly bounded rather than open-ended strides: NAV_DIM is
+        # no longer 1 + 2*NUM_LOOKAHEAD, so `1::2` would now run one element past
+        # the lookahead block and overwrite the high-water field.
+        nav_raw = obs_arr[:, NAV:NAV + 4 * NAV_DIM].copy().view(np.float32).reshape(n, NAV_DIM)
 
         checkpoint[:, 0] = nav_raw[:, 0]  # normalised path progress
-        checkpoint[:, 1::2] = np.clip(nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
-        checkpoint[:, 2::2] = np.clip(nav_raw[:, 1 + NUM_LOOKAHEAD:] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 1:1 + 2 * NUM_LOOKAHEAD:2] = np.clip(
+            nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 2:2 + 2 * NUM_LOOKAHEAD:2] = np.clip(
+            nav_raw[:, 1 + NUM_LOOKAHEAD:1 + 2 * NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 1 + 2 * NUM_LOOKAHEAD] = nav_raw[:, 1 + 2 * NUM_LOOKAHEAD]
 
         # Sanitize NaN/inf
         np.nan_to_num(player_state, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -951,7 +971,7 @@ class ServerShmClient:
         player_state = np.empty((n, 15), dtype=np.float32)
         checkpoint = np.empty((n, NAV_DIM), dtype=np.float32)
 
-        # Offsets within SStructuredObservation (1400 bytes)
+        # Offsets within SStructuredObservation (OBS_SIZE bytes)
         LOCAL_PLAYER = 8
         TILES = LOCAL_PLAYER + 36  # 44
         EXTRA_STATE = TILES + 1333  # 1377
@@ -995,12 +1015,18 @@ class ServerShmClient:
         player_state[:, 13] = armor / 10.0
         player_state[:, 14] = jumped / 3.0
 
-        # ===== NAV (progress + path lookahead) =====
-        nav_raw = obs_arr[:, NAV:NAV + 4 + 8 * NUM_LOOKAHEAD].copy().view(np.float32).reshape(n, NAV_DIM)
+        # ===== NAV (progress + path lookahead + episode high-water progress) =====
+        # Slices are explicitly bounded rather than open-ended strides: NAV_DIM is
+        # no longer 1 + 2*NUM_LOOKAHEAD, so `1::2` would now run one element past
+        # the lookahead block and overwrite the high-water field.
+        nav_raw = obs_arr[:, NAV:NAV + 4 * NAV_DIM].copy().view(np.float32).reshape(n, NAV_DIM)
 
         checkpoint[:, 0] = nav_raw[:, 0]  # normalised path progress
-        checkpoint[:, 1::2] = np.clip(nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
-        checkpoint[:, 2::2] = np.clip(nav_raw[:, 1 + NUM_LOOKAHEAD:] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 1:1 + 2 * NUM_LOOKAHEAD:2] = np.clip(
+            nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 2:2 + 2 * NUM_LOOKAHEAD:2] = np.clip(
+            nav_raw[:, 1 + NUM_LOOKAHEAD:1 + 2 * NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 1 + 2 * NUM_LOOKAHEAD] = nav_raw[:, 1 + 2 * NUM_LOOKAHEAD]
 
         # Sanitize NaN/inf
         np.nan_to_num(player_state, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -1014,9 +1040,9 @@ class ServerShmClient:
                                          dones: np.ndarray) -> None:
         """Fallback Python parsing for CNN observations when Numba is not available.
 
-        New struct layout (1448 bytes per bot):
+        New struct layout (BOT_DATA_SIZE bytes per bot):
         - SAction: 32 bytes
-        - SStructuredObservation: 1400 bytes
+        - SStructuredObservation: OBS_SIZE bytes
           - Header: 8 bytes (tick, flags, state, reserved)
           - LocalPlayer: 36 bytes
           - TileGrid: 1333 bytes (43x31)
@@ -1028,13 +1054,13 @@ class ServerShmClient:
         - Truncated: 4 bytes
         - BotClientId: 4 bytes
         """
-        # Offsets within SBotData (1448 bytes per bot)
-        OBS_START = 32  # After SAction
+        # Offsets within SBotData (BOT_DATA_SIZE bytes per bot)
+        OBS_START = ACTION_SIZE  # After SAction
         LOCAL_PLAYER = OBS_START + 8  # After 8-byte header
         TILES = LOCAL_PLAYER + 36     # After SPlayerObs
         EXTRA_STATE = TILES + 1333    # After tile grid
         NAV = EXTRA_STATE + 4  # After extra state
-        REWARD_OFF = OBS_START + 1400 # After observation
+        REWARD_OFF = OBS_START + OBS_SIZE # After observation
         DONE_OFF = REWARD_OFF + 4
 
         bot_offsets = np.arange(n) * BOT_DATA_SIZE
@@ -1084,8 +1110,11 @@ class ServerShmClient:
             dtype=np.float32).reshape(len(bot_offsets), NAV_DIM)
 
         checkpoint[:, 0] = nav_raw[:, 0]  # normalised path progress
-        checkpoint[:, 1::2] = np.clip(nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
-        checkpoint[:, 2::2] = np.clip(nav_raw[:, 1 + NUM_LOOKAHEAD:] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 1:1 + 2 * NUM_LOOKAHEAD:2] = np.clip(
+            nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 2:2 + 2 * NUM_LOOKAHEAD:2] = np.clip(
+            nav_raw[:, 1 + NUM_LOOKAHEAD:1 + 2 * NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        checkpoint[:, 1 + 2 * NUM_LOOKAHEAD] = nav_raw[:, 1 + 2 * NUM_LOOKAHEAD]
 
         # Full tile grid (31, 43) - normalized by 15
         for i in range(n):
@@ -1103,7 +1132,7 @@ class ServerShmClient:
         TILES = LOCAL_PLAYER + 36
         EXTRA_STATE = TILES + 1333
         NAV = EXTRA_STATE + 4
-        REWARD_OFF = OBS_START + 1400
+        REWARD_OFF = OBS_START + OBS_SIZE
         DONE_OFF = REWARD_OFF + 4
 
         # Tile grid center
@@ -1157,8 +1186,11 @@ class ServerShmClient:
             dtype=np.float32).reshape(len(bot_offsets), NAV_DIM)
 
         features[:, 15] = nav_raw[:, 0]  # normalised path progress
-        features[:, 16:15 + NAV_DIM:2] = np.clip(nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
-        features[:, 17:15 + NAV_DIM:2] = np.clip(nav_raw[:, 1 + NUM_LOOKAHEAD:] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        features[:, 16:16 + 2 * NUM_LOOKAHEAD:2] = np.clip(
+            nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        features[:, 17:17 + 2 * NUM_LOOKAHEAD:2] = np.clip(
+            nav_raw[:, 1 + NUM_LOOKAHEAD:1 + 2 * NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        features[:, 16 + 2 * NUM_LOOKAHEAD] = nav_raw[:, 1 + 2 * NUM_LOOKAHEAD]
 
         # 7x7 center tile crop (49 features) - indices 19-67
         for ty in range(7):
@@ -1171,7 +1203,7 @@ class ServerShmClient:
     def _parse_observations_flat_contiguous_python(self, obs_arr: np.ndarray, n: int,
                                                      features: np.ndarray) -> None:
         """Fallback Python parsing for flat MLP observations with CONTIGUOUS layout."""
-        # Offsets within SStructuredObservation (1400 bytes)
+        # Offsets within SStructuredObservation (OBS_SIZE bytes)
         LOCAL_PLAYER = 8
         TILES = LOCAL_PLAYER + 36  # 44
         EXTRA_STATE = TILES + 1333  # 1377
@@ -1217,11 +1249,14 @@ class ServerShmClient:
         features[:, 14] = jumped / 3.0
 
         # Checkpoint (4 features) - indices 15-18
-        nav_raw = obs_arr[:, NAV:NAV + 4 + 8 * NUM_LOOKAHEAD].copy().view(np.float32).reshape(n, NAV_DIM)
+        nav_raw = obs_arr[:, NAV:NAV + 4 * NAV_DIM].copy().view(np.float32).reshape(n, NAV_DIM)
 
         features[:, 15] = nav_raw[:, 0]  # normalised path progress
-        features[:, 16:15 + NAV_DIM:2] = np.clip(nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
-        features[:, 17:15 + NAV_DIM:2] = np.clip(nav_raw[:, 1 + NUM_LOOKAHEAD:] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        features[:, 16:16 + 2 * NUM_LOOKAHEAD:2] = np.clip(
+            nav_raw[:, 1:1 + NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        features[:, 17:17 + 2 * NUM_LOOKAHEAD:2] = np.clip(
+            nav_raw[:, 1 + NUM_LOOKAHEAD:1 + 2 * NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
+        features[:, 16 + 2 * NUM_LOOKAHEAD] = nav_raw[:, 1 + 2 * NUM_LOOKAHEAD]
 
         # 7x7 center tile crop (49 features) - indices 19-67
         for ty in range(7):
@@ -1545,11 +1580,13 @@ class TeeWorldsServerEnv:
 
         # RL-specific settings (these must come after basic server setup)
         server_cmd.extend([
-            # ORDER MATTERS: sv_rl_frame_skip is a no-op unless the bot manager
-            # already exists (ConRLFrameSkip bails with "RL bots not active"), so
-            # sv_rl_bots MUST come first. Reversed, frame skip silently stays 1.
+            # ORDER MATTERS: sv_rl_frame_skip and sv_rl_ratchet are no-ops unless
+            # the bot manager already exists (they bail with "RL bots not
+            # active"), so sv_rl_bots MUST come first. Reversed, frame skip
+            # silently stays 1 and shaping silently stays non-ratcheted.
             f"sv_rl_bots {self.num_bots_per_server} {server_idx}",
             f"sv_rl_frame_skip {self.config.frame_skip}",
+            f"sv_rl_ratchet {1 if self.config.ratchet_shaping else 0}",
         ])
 
         # Server 0 logs to /tmp/rl_server.log for debugging (tail -f /tmp/rl_server.log)
@@ -1604,11 +1641,13 @@ class TeeWorldsServerEnv:
             ])
 
         server_cmd.extend([
-            # ORDER MATTERS: sv_rl_frame_skip is a no-op unless the bot manager
-            # already exists (ConRLFrameSkip bails with "RL bots not active"), so
-            # sv_rl_bots MUST come first. Reversed, frame skip silently stays 1.
+            # ORDER MATTERS: sv_rl_frame_skip and sv_rl_ratchet are no-ops unless
+            # the bot manager already exists (they bail with "RL bots not
+            # active"), so sv_rl_bots MUST come first. Reversed, frame skip
+            # silently stays 1 and shaping silently stays non-ratcheted.
             f"sv_rl_bots {self.num_bots_per_server} {server_idx}",
             f"sv_rl_frame_skip {self.config.frame_skip}",
+            f"sv_rl_ratchet {1 if self.config.ratchet_shaping else 0}",
         ])
 
         # Server 0 logs to /tmp/rl_server.log for debugging (tail -f /tmp/rl_server.log)

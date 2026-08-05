@@ -3936,6 +3936,7 @@ void CGameContext::OnConsoleInit()
 	Console()->Register("sv_rl_bots", "i[num_bots] ?i[server_index]", CFGFLAG_SERVER, ConRLBots, this, "Enable RL mode with specified number of bots (0 to disable). Optional server_index for multi-server setups.");
 	Console()->Register("sv_rl_status", "", CFGFLAG_SERVER, ConRLStatus, this, "Show RL bot status");
 	Console()->Register("sv_rl_frame_skip", "?i[skip]", CFGFLAG_SERVER, ConRLFrameSkip, this, "Set frame skip (1=no skip, 4=act every 4th tick). Get current value if no argument.");
+	Console()->Register("sv_rl_ratchet", "?i[on]", CFGFLAG_SERVER, ConRLRatchet, this, "Ratchet shaping: pay only for new high-water progress, never charge for backtracking. Must be issued AFTER sv_rl_bots.");
 	Console()->Register("sv_rl_allow_pause", "?i[0|1]", CFGFLAG_SERVER, ConRLAllowPause, this, "Allow Python to pause simulation during updates (default: 1). Set to 0 for smoother video recording.");
 
 	Console()->Chain("sv_motd", ConchainSpecialMotdupdate, this);

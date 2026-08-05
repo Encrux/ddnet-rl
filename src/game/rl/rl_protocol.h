@@ -132,13 +132,23 @@ struct SStructuredObservation
 	float m_aLookaheadX[NUM_LOOKAHEAD];      // Egocentric world offsets to points
 	float m_aLookaheadY[NUM_LOOKAHEAD];      // ahead along the path
 
-	// Padding for alignment (3 bytes to reach 1452 total)
+	// Highest progress reached this episode. Under ratchet shaping the reward
+	// depends on this high-water mark, so without it in the observation the
+	// value function is guessing: two agents at the same spot, one that walked
+	// straight there and one that already went further and came back, have
+	// different remaining returns and identical observations.
+	//
+	// Appended AFTER the lookahead block so the existing strided parse of the
+	// (x, y) pairs keeps its shape.
+	float m_MaxProgress;
+
+	// Padding for alignment (3 bytes to reach 1456 total)
 	uint8_t m_Reserved3[3];
 };
 #pragma pack(pop)
 
-// Size: 8 + 36 + 1333 + 4 + 4 + 64 + 3 = 1452 bytes
-static_assert(sizeof(SStructuredObservation) == 1452, "SStructuredObservation must be 1452 bytes");
+// Size: 8 + 36 + 1333 + 4 + 4 + 64 + 4 + 3 = 1456 bytes
+static_assert(sizeof(SStructuredObservation) == 1456, "SStructuredObservation must be 1456 bytes");
 
 // ============================================================================
 // Action (from Python to server/client)
@@ -202,8 +212,8 @@ struct SBotData
 };
 #pragma pack(pop)
 
-// Size: 36 + 1452 + 16 = 1504 bytes
-static_assert(sizeof(SBotData) == 1504, "SBotData must be 1504 bytes");
+// Size: 36 + 1456 + 16 = 1508 bytes
+static_assert(sizeof(SBotData) == 1508, "SBotData must be 1508 bytes");
 
 // Legacy interleaved shared memory layout (kept for reference)
 // Total size: 32 + 128 * 1448 = 185,376 bytes (~181 KB)

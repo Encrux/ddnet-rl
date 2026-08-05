@@ -48,6 +48,11 @@ public:
 	void SetFrameSkip(int FrameSkip);
 	int GetFrameSkip() const { return m_FrameSkip; }
 
+	// Ratchet shaping: pay only for NEW high-water progress, never charge for
+	// giving ground back. Runtime-switchable so an A/B needs no rebuild.
+	void SetRatchetShaping(bool On) { m_RatchetShaping = On; }
+	bool GetRatchetShaping() const { return m_RatchetShaping; }
+
 	// Pause support (for PPO updates)
 	void SetAllowPause(bool Allow) { m_AllowPause = Allow; }
 	bool GetAllowPause() const { return m_AllowPause; }
@@ -123,6 +128,7 @@ private:
 		int m_WaypointIndex;  // Tracked waypoint index; only moves within a
 		                      // physically plausible window (see FindClosestWaypoint)
 		float m_LastPhi;      // Previous normalised progress, for potential-based shaping
+		float m_MaxPhi;       // Highest progress this episode; the ratchet's potential
 		int m_LastBin;        // Progress bin last snapshotted from; capture only on change
 
 		// Exploration tracking - coarse grid (8x8 tiles per region)
@@ -251,6 +257,7 @@ private:
 	// Frame skip (only exchange with Python every N ticks)
 	int m_FrameSkip;
 	int m_FrameSkipCounter;
+	bool m_RatchetShaping = false;
 	float m_aAccumulatedRewards[MAX_RL_BOTS];
 
 	// Pause support

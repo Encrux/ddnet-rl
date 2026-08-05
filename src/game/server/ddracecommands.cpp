@@ -748,6 +748,33 @@ void CGameContext::ConRLFrameSkip(IConsole::IResult *pResult, void *pUserData)
 	}
 }
 
+void CGameContext::ConRLRatchet(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+
+	if(!pSelf->m_pBotManager || !pSelf->m_pBotManager->IsEnabled())
+	{
+		// Same ordering trap as sv_rl_frame_skip: issued before sv_rl_bots this
+		// silently does nothing, and the run would look like a null result
+		// rather than a misconfiguration.
+		dbg_msg("rl/bots", "WARNING: sv_rl_ratchet IGNORED - bot manager not created yet. "
+			"Issue sv_rl_bots FIRST, otherwise shaping stays non-ratcheted.");
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", "RL bots not active");
+		return;
+	}
+
+	if(pResult->NumArguments() > 0)
+	{
+		bool On = pResult->GetInteger(0) != 0;
+		pSelf->m_pBotManager->SetRatchetShaping(On);
+		dbg_msg("rl/bots", "Ratchet shaping %s", On ? "ENABLED" : "disabled");
+	}
+
+	char aBuf[128];
+	str_format(aBuf, sizeof(aBuf), "Ratchet shaping: %d", pSelf->m_pBotManager->GetRatchetShaping() ? 1 : 0);
+	pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+}
+
 void CGameContext::ConRLAllowPause(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;

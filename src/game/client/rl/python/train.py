@@ -257,6 +257,10 @@ def parse_args():
                         help="Bins before the frontier to sample restore slots from")
     parser.add_argument("--waypoints-path", type=str, default=None,
                         help="Override waypoint file autodiscovery (waypoints/, then ghosts/)")
+    parser.add_argument("--ratchet", action="store_true",
+                        help="Ratchet shaping: the potential is the episode's high-water progress, "
+                             "so backtracking costs only time. Removes the certain, immediate "
+                             "penalty on the first step of any obstacle needing a run-up.")
     parser.add_argument("--action-hold", action="store_true",
                         help="Learned action hold: the policy picks how many decisions to hold "
                              "each action for. Makes multi-step commitments (hook swings) "
@@ -352,6 +356,7 @@ def main():
             waypoints_path=args.waypoints_path,
             curriculum=args.frontier_curriculum,
             frontier_window=args.frontier_window,
+            ratchet_shaping=args.ratchet,
         )
         # Use default server_path (resolved relative to teeworlds_server_env.py)
         env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)

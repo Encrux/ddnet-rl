@@ -510,6 +510,7 @@ void CBotManager::ExtractObservations()
 				TickReward = CalculateReward(i, pObs, true);
 
 				pObs->m_Progress = State.m_LastPhi;
+				pObs->m_MaxProgress = State.m_MaxPhi;
 				FillLookahead(i, Pos, pObs);
 				CaptureSnapshot(i, pChar, State.m_LastPhi);
 			}
@@ -774,7 +775,45 @@ float CBotManager::CalculateReward(int BotIndex, const SStructuredObservation *p
 	if(IsDecisionTick && m_WaypointsLoaded)
 	{
 		float Phi = GetNormalizedProgress(BotIndex, Pos);
-		Reward += SHAPING_K * (SHAPING_GAMMA * Phi - State.m_LastPhi);
+
+		if(m_RatchetShaping)
+		{
+			// Potential is the HIGH-WATER progress, not the current progress.
+			//
+			// Plain shaping charges for every unit of ground given back, which
+			// makes the first step of any obstacle that needs a run-up
+			// immediately and certainly negative. At the 0.455 wall the correct
+			// play starts by backing up ~3 tiles: -0.086 reward, about 29
+			// decisions' worth of time penalty, paid up front against a payoff
+			// that during exploration almost never arrives. GAE therefore hands
+			// the retreat a reliably negative advantage and the policy learns an
+			// aversion to the PREFIX of the solution.
+			//
+			// Still potential-based: max-progress is part of the (augmented)
+			// state and monotone, so the shaping telescopes to
+			// K * (MaxPhi_final - MaxPhi_initial) exactly as before, and the
+			// optimal policy is unchanged.
+			//
+			// Monotonicity is also what makes this safe. The tempting
+			// alternative -- full credit forward, reduced penalty backward -- is
+			// FARMABLE: oscillating over 32 units nets +0.021 per cycle against
+			// ~0.018 of time penalty, so the agent can earn reward forever
+			// without going anywhere. A ratchet can never re-earn ground.
+			float Gain = Phi - State.m_MaxPhi;
+			if(Gain > 0.0f)
+			{
+				Reward += SHAPING_K * Gain;
+				State.m_MaxPhi = Phi;
+			}
+		}
+		else
+		{
+			Reward += SHAPING_K * (SHAPING_GAMMA * Phi - State.m_LastPhi);
+			// Tracked even when unused by the reward, so the observation field
+			// and its logging mean the same thing in both arms of the A/B.
+			State.m_MaxPhi = std::max(State.m_MaxPhi, Phi);
+		}
+
 		State.m_LastPhi = Phi;
 	}
 
@@ -812,6 +851,10 @@ void CBotManager::ResetRewardState(int BotIndex, vec2 SpawnPos)
 		State.m_WaypointIndex = 0;
 		State.m_LastPhi = 0.0f;
 	}
+	// The high-water mark starts wherever the episode starts, NOT at zero. A
+	// curriculum restore drops the agent mid-map; seeding at 0 would hand it the
+	// whole prefix as free ratchet reward for standing still.
+	State.m_MaxPhi = State.m_LastPhi;
 	// Seed the bin too, or the first tick after a restore snapshots a state we
 	// just restored from and overwrites a good entry with a duplicate.
 	State.m_LastBin = ProgressToBin(State.m_LastPhi);
