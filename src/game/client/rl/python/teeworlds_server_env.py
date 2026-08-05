@@ -198,17 +198,36 @@ class ProgressSpawnManager:
 
     def __init__(self, begin_bias: float = 0.2, window: int = 12, num_bins: int = 200,
                  num_servers: int = 1, bots_per_server: int = 1,
-                 rarity_alpha: float = 0.5):
+                 restore_beta: float = 0.5, max_variant_share: float = 0.4):
         self.begin_bias = begin_bias
         self.window = window
         self.num_bins = num_bins
         self.num_servers = num_servers
         self.bots_per_server = max(1, bots_per_server)
-        # Weight ∝ visits**-alpha. 0 = uniform over occupied cells, 1 = full
-        # inverse-count. 0.5 is the usual Go-Explore-ish compromise: it favours
-        # the rare cell that one bot stumbled into without ignoring the common
-        # ones the policy still needs to practise chaining through.
-        self.rarity_alpha = rarity_alpha
+        # Cell weight ∝ visits**beta.
+        #
+        #   beta =  1   sample in proportion to how often agents are naturally
+        #               in that cell
+        #   beta =  0   uniform over occupied cells
+        #   beta = -0.5 strong rarity preference
+        #
+        # It shipped at -0.5 and that was a mistake worth recording. Rare cells
+        # are overwhelmingly HOOKED cells, and hooked cells are transient, so
+        # 82% of restores landed mid-hook: 31.6% hook+fall, 25.6% hook+level,
+        # 25.0% hook+rise against 17.8% for all three grounded classes combined.
+        # The agent spent its practice budget dangling instead of running the
+        # map and p50_from_start collapsed 0.363 -> 0.205.
+        #
+        # Rarity is a bad proxy for "worth practising" when most rare states are
+        # simply doomed. Go-Explore's cells are reachable AND resumable; a rare
+        # cell here is often a tee mid-fall into a freeze. beta = 0.5 keeps a
+        # mild boost for the rare cell one bot stumbled into while leaving the
+        # bulk of restores where agents actually spend their time.
+        self.restore_beta = restore_beta
+        # Hard ceiling on the share of restores any single variant can absorb,
+        # as a backstop independent of the weighting. Without it the failure
+        # above is only ever one bad beta away.
+        self.max_variant_share = max_variant_share
         self._frontier: Optional[int] = None
         self._edge: Optional[int] = None
         self._reached = np.zeros(0, dtype=np.int64)
@@ -236,6 +255,40 @@ class ProgressSpawnManager:
         self._frontier = frontier_bin
         self._edge = edge if edge is not None else frontier_bin
         self._reached = reached_bins
+
+    def _cap_variant_shares(self, shares: np.ndarray) -> np.ndarray:
+        """Water-fill: hold any variant above the cap AT the cap, redistribute
+        the freed mass proportionally among the rest, repeat.
+
+        A cap is only satisfiable if cap * (variants present) >= 1. Below that
+        no distribution can honour it and the closest thing is uniform, which is
+        what this returns -- stated explicitly because a silently-ignored cap is
+        exactly the kind of thing that produced the 82%-hooked failure.
+        """
+        present = shares > 0
+        n_present = int(present.sum())
+        if n_present == 0:
+            return shares
+        if self.max_variant_share * n_present <= 1.0 + 1e-12:
+            out = np.zeros_like(shares)
+            out[present] = 1.0 / n_present
+            return out
+
+        out = shares.astype(np.float64).copy()
+        locked = np.zeros_like(out, dtype=bool)
+        for _ in range(NUM_SNAPSHOT_VARIANTS):
+            over = (~locked) & (out > self.max_variant_share + 1e-12)
+            if not over.any():
+                break
+            out[over] = self.max_variant_share
+            locked |= over
+            free = (~locked) & present
+            free_mass = 1.0 - out[locked].sum()
+            cur = out[free].sum()
+            if not free.any() or cur <= 0 or free_mass <= 0:
+                break
+            out[free] *= free_mass / cur
+        return out
 
     def sample(self, env_indices: np.ndarray) -> np.ndarray:
         """Sample a restore slot per resetting env. -1 means spawn at map start.
@@ -273,10 +326,16 @@ class ProgressSpawnManager:
             if not occupied.any():
                 continue  # this server has nothing in the window; spawn at start
             slots = window_slots[occupied]
-            # Rarity weighting: a cell one bot reached once is worth practising
-            # more than one every bot walks through. This is the half of
-            # Go-Explore that a purely frontier-based sampler leaves unused.
-            weights = counts[occupied].astype(np.float64) ** (-self.rarity_alpha)
+            raw = counts[occupied].astype(np.float64) ** self.restore_beta
+            variants = slots % NUM_SNAPSHOT_VARIANTS
+
+            # Split into "which variant" x "which cell within it", so the cap
+            # below acts on the variant marginal without disturbing the rarity
+            # ordering inside each variant.
+            vsum = np.bincount(variants, weights=raw, minlength=NUM_SNAPSHOT_VARIANTS)
+            within = raw / vsum[variants]                       # sums to 1 per variant
+            target = self._cap_variant_shares(vsum / vsum.sum())
+            weights = within * target[variants]
             weights /= weights.sum()
 
             take = use_archive & (servers == srv)
@@ -426,6 +485,10 @@ class ServerEnvConfig:
     # progress alone. Off reproduces the old latest-wins-per-bin archive, which
     # is what the ablation needs.
     archive_variants: bool = True
+    # Restore cell weight ∝ visits**beta (1 = natural occupancy, 0 = uniform
+    # over cells, negative = prefer rare). See ProgressSpawnManager.
+    restore_beta: float = 0.5
+    max_variant_share: float = 0.4
 
     def __post_init__(self):
         if self.server_path is None:
@@ -1496,9 +1559,9 @@ class TeeWorldsServerEnv:
                 num_servers=self.num_servers,
                 bots_per_server=self.num_bots_per_server,
                 # With the variant axis off every state lands in variant 0, so
-                # rarity weighting would just re-weight the old bins. Uniform
-                # keeps the ablation arm faithful to the previous behaviour.
-                rarity_alpha=0.5 if self.config.archive_variants else 0.0,
+                # the cap is inert and only beta matters.
+                restore_beta=self.config.restore_beta,
+                max_variant_share=self.config.max_variant_share,
             )
         elif self.config.checkpoint_respawn:
             self.spawn_manager = CheckpointSpawnManager(

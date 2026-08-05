@@ -257,6 +257,12 @@ def parse_args():
                         help="Bins before the frontier to sample restore slots from")
     parser.add_argument("--waypoints-path", type=str, default=None,
                         help="Override waypoint file autodiscovery (waypoints/, then ghosts/)")
+    parser.add_argument("--restore-beta", type=float, default=0.5,
+                        help="Restore cell weight ∝ visits**beta. 1 = natural occupancy, "
+                             "0 = uniform over cells, negative = prefer rare cells. "
+                             "-0.5 put 82%% of restores into transient hooked states.")
+    parser.add_argument("--max-variant-share", type=float, default=0.4,
+                        help="Ceiling on the share of restores any one cell variant may absorb")
     parser.add_argument("--legacy-archive", action="store_true",
                         help="Ablation: key archive cells by progress bin alone (latest-wins), "
                              "reproducing the pre-variant behaviour.")
@@ -268,6 +274,9 @@ def parse_args():
                         help="Learned action hold: the policy picks how many decisions to hold "
                              "each action for. Makes multi-step commitments (hook swings) "
                              "discoverable — see action_hold.py.")
+    parser.add_argument("--hold-ent-coef", type=float, default=0.0,
+                        help="Extra entropy coefficient on the duration head alone. Stops the "
+                             "policy training its own long holds away (measured 3.27 -> 2.19).")
     parser.add_argument("--hold-durations", type=str, default="1,2,4,8,16",
                         help="Comma-separated hold lengths in decisions (default: 1,2,4,8,16). "
                              "At frame_skip 3 that spans 0.06s to 0.96s.")
@@ -361,6 +370,8 @@ def main():
             frontier_window=args.frontier_window,
             ratchet_shaping=args.ratchet,
             archive_variants=not args.legacy_archive,
+            restore_beta=args.restore_beta,
+            max_variant_share=args.max_variant_share,
         )
         # Use default server_path (resolved relative to teeworlds_server_env.py)
         env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)
@@ -437,6 +448,7 @@ def main():
             n_frame_stack=args.n_frame_stack,
             n_player_state_stack=args.n_player_state_stack,
             hold_durations=hold_durations,
+            hold_ent_coef=args.hold_ent_coef,
         )
 
         # Create agent

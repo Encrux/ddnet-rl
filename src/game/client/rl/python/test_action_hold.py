@@ -197,6 +197,74 @@ def test_masked_update_equivalence():
           abs(stats_partial['policy_loss'] - stats_none['policy_loss']) > 1e-9)
 
 
+def test_hold_entropy_floor():
+    """The duration head must be able to get its own entropy pressure.
+
+    Measures the HEAD ENTROPY, which the coefficient controls directly. Mean
+    duration is downstream of it and moves too slowly on synthetic advantages to
+    assert on.
+    """
+    print("\n[6] Duration-head entropy coefficient")
+
+    def run(hold_ent_coef, n_updates=12):
+        torch.manual_seed(0)
+        np.random.seed(0)
+        cfg = PPOConfig(hold_durations=(1, 2, 4, 8, 16), use_cnn=False, use_compile=False,
+                        use_amp=False, num_steps=8, num_minibatches=2, update_epochs=2,
+                        hold_ent_coef=hold_ent_coef)
+        agent = PPOAgent(obs_dim=16, num_envs=4, config=cfg, device="cpu")
+        for _ in range(n_updates):
+            for t in range(agent.num_steps):
+                act = {
+                    'discrete': np.stack([
+                        np.random.randint(0, d, size=4) for d in agent.config.discrete_dims
+                    ], axis=-1).astype(np.int64),
+                    'continuous': np.random.randn(4, 1).astype(np.float32),
+                }
+                agent.store_transition(
+                    t, np.random.randn(4, 16).astype(np.float32), act,
+                    np.random.randn(4).astype(np.float32),
+                    np.random.randn(4).astype(np.float32),
+                    np.zeros(4, dtype=bool),
+                    np.random.randn(4).astype(np.float32), None)
+            stats = agent.update(np.random.randn(4, 16).astype(np.float32),
+                                 np.zeros(4, dtype=bool))
+        with torch.no_grad():
+            logits, _, _ = agent.actor(torch.randn(256, 16))
+            from torch.distributions import Categorical
+            hold_ent = float(Categorical(logits=logits[-1]).entropy().mean())
+            probs = torch.softmax(logits[-1], dim=-1).mean(0)
+            mean_dur = float((probs * torch.tensor([1.0, 2, 4, 8, 16])).sum())
+        return stats, hold_ent, mean_dur
+
+    off_stats, off_ent, off_dur = run(0.0)
+    on_stats, on_ent, on_dur = run(0.05)
+    print(f"      hold-head entropy: {off_ent:.4f} (off) -> {on_ent:.4f} (on),"
+          f"  max possible {np.log(5):.4f}")
+    print(f"      mean duration:     {off_dur:.3f} (off) -> {on_dur:.3f} (on)")
+    check("coefficient of 0 leaves the update finite", np.isfinite(off_stats['entropy']))
+    check("nonzero coefficient changes the entropy term",
+          abs(on_stats['entropy'] - off_stats['entropy']) > 1e-6,
+          f"{on_stats['entropy']:.5f} vs {off_stats['entropy']:.5f}")
+    check("extra coefficient RAISES duration-head entropy",
+          on_ent > off_ent, f"{on_ent:.4f} vs {off_ent:.4f}")
+    check("higher entropy means longer holds are drawn more often",
+          on_dur > off_dur, f"{on_dur:.3f} vs {off_dur:.3f}")
+
+
+def test_per_head_entropy_shape():
+    print("\n[7] Per-head entropy plumbing")
+    from ppo_hybrid import HybridActor
+    cfg = PPOConfig(hold_durations=(1, 2, 4, 8, 16), use_cnn=False, use_compile=False)
+    actor = HybridActor(obs_dim=16, config=cfg)
+    _, lp, ent, head_ents = actor.get_action(torch.randn(7, 16))
+    check("head entropies have one column per discrete head",
+          head_ents.shape == (7, len(cfg.discrete_dims)), f"{tuple(head_ents.shape)}")
+    check("head entropies sum into the total (plus continuous)",
+          bool((head_ents.sum(-1) <= ent + 1e-4).all()))
+    check("log_prob shape unchanged", lp.shape == (7,))
+
+
 def test_discovery_arithmetic():
     print("\n[6] The number this exists for")
     p_hook = 0.425
@@ -238,6 +306,8 @@ if __name__ == "__main__":
     test_stats()
     test_config_and_head()
     test_masked_update_equivalence()
+    test_hold_entropy_floor()
+    test_per_head_entropy_shape()
     test_discovery_arithmetic()
     print("\n" + "=" * 66)
     print(f"{len(PASS)} passed, {len(FAIL)} failed")

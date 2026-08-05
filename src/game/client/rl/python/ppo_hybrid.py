@@ -66,6 +66,21 @@ class PPOConfig:
     # latches the sampled action for the chosen number of decisions.
     hold_durations: Tuple[int, ...] = ()
 
+    # Extra entropy coefficient applied to the duration head alone.
+    #
+    # Measured: with a plain shared ent_coef the policy DRIVES ITS OWN HOLDS
+    # DOWN, from the 3.27 init prior to 2.19. A long hold is locally costly
+    # everywhere on the map -- the agent is blind for its duration -- while its
+    # exploration payoff is diffuse, delayed, and only collected at one
+    # obstacle. Gradient descent correctly kills it, and kills the mechanism
+    # with it. Ratchet shaping recovered some of this (2.19 -> 2.64) by removing
+    # the penalty on the retreat, but did not restore the prior.
+    #
+    # This protects P(long hold) from that pressure. It is the on-policy
+    # equivalent of what makes injected ez-greedy holds work: they cannot be
+    # trained away because no gradient reaches them.
+    hold_ent_coef: float = 0.0
+
     # CNN Feature Extractor (for dict observations)
     use_cnn: bool = False
     tile_grid_height: int = 31   # 1.5x original (21 -> 31)
@@ -483,7 +498,8 @@ class HybridActor(nn.Module):
         Returns:
             action: Dict with 'discrete' and 'continuous' tensors
             log_prob: Log probability of the action
-            entropy: Entropy of the action distribution
+            entropy: Total entropy of the action distribution
+            head_entropies: Per-discrete-head entropy, (batch, n_heads)
         """
         discrete_logits, cont_mean, cont_std = self.forward(x)
 
@@ -517,8 +533,11 @@ class HybridActor(nn.Module):
 
         total_log_prob = discrete_log_probs + continuous_log_prob
 
-        # Compute entropy
-        discrete_entropy = torch.stack([d.entropy() for d in discrete_dists], dim=-1).sum(dim=-1)
+        # Compute entropy. Per-head values are returned alongside the sum so a
+        # single head can be given its own coefficient (see hold_ent_coef)
+        # without paying for another forward pass.
+        head_entropies = torch.stack([d.entropy() for d in discrete_dists], dim=-1)
+        discrete_entropy = head_entropies.sum(dim=-1)
         continuous_entropy = cont_dist.entropy().sum(dim=-1)
         total_entropy = discrete_entropy + continuous_entropy
 
@@ -528,7 +547,7 @@ class HybridActor(nn.Module):
             'continuous': continuous_action,
         }
 
-        return action_out, total_log_prob, total_entropy
+        return action_out, total_log_prob, total_entropy, head_entropies
 
 
 class Critic(nn.Module):
@@ -849,7 +868,7 @@ class PPOAgent:
         else:
             obs_t = self._obs_to_tensor(obs)
 
-        action, log_prob, _ = self.actor.get_action(obs_t, deterministic=deterministic)
+        action, log_prob, _, _ = self.actor.get_action(obs_t, deterministic=deterministic)
         value = self.critic(obs_t)
 
         # Use pinned memory for faster D2H transfer on CUDA
@@ -1076,7 +1095,7 @@ class PPOAgent:
 
                 # Forward pass (with optional mixed precision)
                 with torch.amp.autocast("cuda", enabled=self.use_amp):
-                    _, new_log_prob, entropy = self.actor.get_action(mb_obs, mb_action)
+                    _, new_log_prob, entropy, head_ents = self.actor.get_action(mb_obs, mb_action)
                     new_value = self.critic(mb_obs).squeeze(-1)
 
                     # Policy loss
@@ -1116,6 +1135,14 @@ class PPOAgent:
                     # load-bearing for exploration here, so its scale must not
                     # drift as a side effect of adding the duration head.
                     entropy_loss = (entropy * mb_fresh).sum() / mb_fresh_n
+
+                    # Extra entropy pressure on the duration head alone. Without
+                    # it the policy trains its own long holds away (3.27 -> 2.19
+                    # measured), which removes the exploration mechanism the head
+                    # exists to provide.
+                    if cfg.hold_durations and cfg.hold_ent_coef > 0.0:
+                        hold_entropy = (head_ents[:, -1] * mb_fresh).sum() / mb_fresh_n
+                        entropy_loss = entropy_loss + (cfg.hold_ent_coef / max(cfg.ent_coef, 1e-8)) * hold_entropy
 
                     # Total loss
                     loss = pg_loss - self.config.ent_coef * entropy_loss + self.config.vf_coef * v_loss
