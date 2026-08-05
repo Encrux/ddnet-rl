@@ -208,6 +208,13 @@ int32_t *CServerShm::GetBotClientId(int BotIndex)
 	return &static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aBotClientIds[BotIndex];
 }
 
+uint32_t *CServerShm::GetSnapshotVisits()
+{
+	if(!m_pShmPtr)
+		return nullptr;
+	return static_cast<SContiguousServerRLShm *>(m_pShmPtr)->m_aSnapshotVisits;
+}
+
 // Batch accessors
 SAction *CServerShm::GetActionsArray()
 {

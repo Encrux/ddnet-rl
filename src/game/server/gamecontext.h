@@ -175,6 +175,7 @@ class CGameContext : public IGameServer
 	static void ConRLStatus(IConsole::IResult *pResult, void *pUserData);
 	static void ConRLFrameSkip(IConsole::IResult *pResult, void *pUserData);
 	static void ConRLRatchet(IConsole::IResult *pResult, void *pUserData);
+	static void ConRLArchiveVariants(IConsole::IResult *pResult, void *pUserData);
 	static void ConRLAllowPause(IConsole::IResult *pResult, void *pUserData);
 	static void ConchainSpecialMotdupdate(IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData);
 	static void ConchainSettingUpdate(IConsole::IResult *pResult, void *pUserData, IConsole::FCommandCallback pfnCallback, void *pCallbackUserData);

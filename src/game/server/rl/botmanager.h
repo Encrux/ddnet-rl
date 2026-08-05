@@ -53,6 +53,12 @@ public:
 	void SetRatchetShaping(bool On) { m_RatchetShaping = On; }
 	bool GetRatchetShaping() const { return m_RatchetShaping; }
 
+	// Archive variant axis. Off collapses every state into variant 0, which
+	// reproduces the old latest-wins-per-progress-bin archive exactly. Exists so
+	// the cell change can be ablated against the other two.
+	void SetArchiveVariants(bool On) { m_ArchiveVariants = On; }
+	bool GetArchiveVariants() const { return m_ArchiveVariants; }
+
 	// Pause support (for PPO updates)
 	void SetAllowPause(bool Allow) { m_AllowPause = Allow; }
 	bool GetAllowPause() const { return m_AllowPause; }
@@ -129,7 +135,7 @@ private:
 		                      // physically plausible window (see FindClosestWaypoint)
 		float m_LastPhi;      // Previous normalised progress, for potential-based shaping
 		float m_MaxPhi;       // Highest progress this episode; the ratchet's potential
-		int m_LastBin;        // Progress bin last snapshotted from; capture only on change
+		int m_LastSlot;       // Archive cell last snapshotted from; capture only on change
 
 		// Exploration tracking - coarse grid (8x8 tiles per region)
 		// 64x64 regions = 4096 bits = 512 bytes per bot
@@ -216,15 +222,18 @@ private:
 	// obstacle donate their state to the majority that cannot.
 	//
 	// Binned by normalised path progress so a slot index means the same thing on
-	// every map and at every stage of training.
-	static constexpr int NUM_PROGRESS_BINS = 200;  // 0.5% of the path each
-	std::vector<CSaveTee> m_vSnapshots;            // NUM_PROGRESS_BINS entries
+	// every map and at every stage of training, and sub-binned by hook engagement
+	// and vertical velocity so a mid-swing state cannot be overwritten by a bot
+	// walking through the same bin on the ground. See rl_protocol.h for why one
+	// scalar is too coarse a cell.
+	std::vector<CSaveTee> m_vSnapshots;    // NUM_SNAPSHOT_SLOTS entries
 	std::vector<uint8_t> m_vSnapshotValid;
 	int m_SnapshotsCaptured;
 
 	void CaptureSnapshot(int BotIndex, CCharacter *pChar, float Phi);
 	bool RestoreSnapshot(int Slot, CCharacter *pChar);
 	static int ProgressToBin(float Phi);
+	int SnapshotVariant(const CCharacter *pChar) const;
 
 	// Temporal-coherence window for waypoint matching. A merely spatial search
 	// matches the wrong strand wherever the path doubles back on itself — on
@@ -258,6 +267,7 @@ private:
 	int m_FrameSkip;
 	int m_FrameSkipCounter;
 	bool m_RatchetShaping = false;
+	bool m_ArchiveVariants = true;
 	float m_aAccumulatedRewards[MAX_RL_BOTS];
 
 	// Pause support

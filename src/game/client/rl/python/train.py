@@ -257,6 +257,9 @@ def parse_args():
                         help="Bins before the frontier to sample restore slots from")
     parser.add_argument("--waypoints-path", type=str, default=None,
                         help="Override waypoint file autodiscovery (waypoints/, then ghosts/)")
+    parser.add_argument("--legacy-archive", action="store_true",
+                        help="Ablation: key archive cells by progress bin alone (latest-wins), "
+                             "reproducing the pre-variant behaviour.")
     parser.add_argument("--ratchet", action="store_true",
                         help="Ratchet shaping: the potential is the episode's high-water progress, "
                              "so backtracking costs only time. Removes the certain, immediate "
@@ -357,6 +360,7 @@ def main():
             curriculum=args.frontier_curriculum,
             frontier_window=args.frontier_window,
             ratchet_shaping=args.ratchet,
+            archive_variants=not args.legacy_archive,
         )
         # Use default server_path (resolved relative to teeworlds_server_env.py)
         env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)
@@ -583,6 +587,11 @@ def main():
                 base_env.spawn_manager.update_frontier(tracker.frontier_bin(),
                                                        tracker.reached_bins(),
                                                        tracker.exploration_edge())
+                # Archive occupancy is per-server and only the server knows it.
+                # Without this the sampler would request cells that are empty on
+                # some servers and get a silent fallback to the map spawn.
+                if hasattr(base_env, 'refresh_snapshot_visits'):
+                    base_env.refresh_snapshot_visits()
 
             # PPO update (optionally pause to prevent bots from acting with stale policy)
             rollout_time = time.time() - rollout_start

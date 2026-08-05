@@ -693,25 +693,58 @@ int CBotManager::ProgressToBin(float Phi)
 	return std::clamp(Bin, 0, NUM_PROGRESS_BINS - 1);
 }
 
-// Latest-wins per bin. A snapshot from the current policy is a more useful
+// Which sub-cell of a progress bin this state belongs to.
+//
+// Hook engagement and vertical motion are what distinguish a state worth
+// returning to from an ordinary one at the same point on the path. A tee that is
+// hooked and rising is mid-maneuver; a tee at the same progress standing on the
+// floor is not, and must not be allowed to overwrite it.
+int CBotManager::SnapshotVariant(const CCharacter *pChar) const
+{
+	if(!m_ArchiveVariants)
+		return 0;  // ablation: collapse to the old progress-only archive
+
+	const CCharacterCore *pCore = pChar->Core();
+	if(!pCore)
+		return 0;
+
+	const int Hooked = pCore->m_HookState == HOOK_GRABBED ? 1 : 0;
+	const float Vy = pCore->m_Vel.y;
+	const int VyClass = Vy < VY_RISING ? 0 : (Vy > VY_FALLING ? 2 : 1);
+	return Hooked * NUM_VY_CLASSES + VyClass;
+}
+
+// Latest-wins per CELL. A snapshot from the current policy is a more useful
 // restore point than a stale one from an earlier, worse policy, and it keeps the
 // archive self-refreshing without needing a "better" metric or per-bot timers.
+//
+// Capture fires on cell transitions, which now includes changing variant WITHIN
+// a bin. That matters: a hook swing happens inside one progress bin, so under the
+// old bin-only rule the mid-swing state was never captured at all.
 void CBotManager::CaptureSnapshot(int BotIndex, CCharacter *pChar, float Phi)
 {
 	if(!pChar || !pChar->IsAlive() || m_vSnapshots.empty())
 		return;
 
 	SBotRewardState &State = m_aBotState[BotIndex];
-	int Bin = ProgressToBin(Phi);
-	if(Bin == State.m_LastBin)
-		return;  // only on bin transitions, not every decision tick
-	State.m_LastBin = Bin;
+	const int Slot = SnapshotSlot(ProgressToBin(Phi), SnapshotVariant(pChar));
+	if(Slot == State.m_LastSlot)
+		return;  // only on cell transitions, not every decision tick
+	State.m_LastSlot = Slot;
 
 	// AddPenalty = false: this is not a /save, we do not want the time penalty.
-	m_vSnapshots[Bin].Save(pChar, false);
-	if(!m_vSnapshotValid[Bin])
+	m_vSnapshots[Slot].Save(pChar, false);
+	if(!m_vSnapshotValid[Slot])
 		m_SnapshotsCaptured++;
-	m_vSnapshotValid[Bin] = 1;
+	m_vSnapshotValid[Slot] = 1;
+
+	// Publish occupancy so the sampler never asks for an empty slot. Each server
+	// has its own archive, so this cannot be inferred Python-side.
+	if(m_pShm)
+	{
+		if(uint32_t *pVisits = m_pShm->GetSnapshotVisits())
+			pVisits[Slot]++;
+	}
 }
 
 bool CBotManager::RestoreSnapshot(int Slot, CCharacter *pChar)
@@ -857,7 +890,7 @@ void CBotManager::ResetRewardState(int BotIndex, vec2 SpawnPos)
 	State.m_MaxPhi = State.m_LastPhi;
 	// Seed the bin too, or the first tick after a restore snapshots a state we
 	// just restored from and overwrites a good entry with a duplicate.
-	State.m_LastBin = ProgressToBin(State.m_LastPhi);
+	State.m_LastSlot = -1;
 }
 
 void CBotManager::RespawnAllBots()
@@ -1136,8 +1169,8 @@ bool CBotManager::LoadWaypoints(const std::string &Path)
 	SegmentPathAtDiscontinuities();
 
 	// Archive is progress-binned, so it only makes sense once a path exists.
-	m_vSnapshots.assign(NUM_PROGRESS_BINS, CSaveTee());
-	m_vSnapshotValid.assign(NUM_PROGRESS_BINS, 0);
+	m_vSnapshots.assign(NUM_SNAPSHOT_SLOTS, CSaveTee());
+	m_vSnapshotValid.assign(NUM_SNAPSHOT_SLOTS, 0);
 	m_SnapshotsCaptured = 0;
 
 	UpdateMatchWindow();

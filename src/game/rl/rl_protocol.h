@@ -229,8 +229,30 @@ struct SServerRLSharedMemory
 // Contiguous Shared Memory Layout (Optimized for batch operations)
 // ============================================================================
 
+// Snapshot archive geometry.
+//
+// A cell is NOT just a progress bin. Binning on progress alone throws away
+// exactly the states worth returning to: a mid-swing state (hooked, moving up)
+// sits at a LOWER progress bin than the obstacle it is solving, and with
+// latest-wins the next bot to walk through that bin on the ground overwrites it
+// within milliseconds. Go-Explore's own cell representation is a downsampled
+// image for the same reason -- one scalar is too coarse to preserve what makes
+// a state interesting.
+//
+// The variant axis is hook engagement x coarse vertical velocity, which is the
+// minimum needed to tell "swinging upward through this bin" apart from "walking
+// along the floor of this bin".
+constexpr int NUM_PROGRESS_BINS = 200;
+constexpr int NUM_HOOK_CLASSES = 2;  // not attached / attached
+constexpr int NUM_VY_CLASSES = 3;    // rising / level / falling
+constexpr int NUM_SNAPSHOT_VARIANTS = NUM_HOOK_CLASSES * NUM_VY_CLASSES;
+constexpr int NUM_SNAPSHOT_SLOTS = NUM_PROGRESS_BINS * NUM_SNAPSHOT_VARIANTS;
+constexpr float VY_RISING = -2.0f;   // world units/tick; negative y is up
+constexpr float VY_FALLING = 2.0f;
+
 // New contiguous layout - single memcpy for actions/observations
-// Layout: [Header][Action0..N][Obs0..N][Reward0..N][Done0..N][Truncated0..N][BotClientId0..N]
+// Layout: [Header][Action0..N][Obs0..N][Reward0..N][Done0..N][Truncated0..N]
+//         [BotClientId0..N][SnapshotVisits0..NUM_SNAPSHOT_SLOTS]
 #pragma pack(push, 1)
 struct SContiguousServerRLShm
 {
@@ -241,6 +263,16 @@ struct SContiguousServerRLShm
 	int32_t m_aDones[MAX_RL_BOTS];
 	int32_t m_aTruncated[MAX_RL_BOTS];
 	int32_t m_aBotClientIds[MAX_RL_BOTS];
+
+	// Times each archive slot has been captured into. 0 means the slot is empty
+	// and restoring from it would silently fall back to the map spawn.
+	//
+	// Each server owns an INDEPENDENT archive, so Python cannot infer occupancy
+	// from its own observations -- it would sample slots that exist on one
+	// server and not another. Publishing the real counts also lets the sampler
+	// prefer rarely-visited cells, which is the half of Go-Explore that a
+	// frontier-only sampler leaves on the table.
+	uint32_t m_aSnapshotVisits[NUM_SNAPSHOT_SLOTS];
 };
 #pragma pack(pop)
 
@@ -251,7 +283,11 @@ inline constexpr size_t GetContiguousRewardsOffset() { return GetContiguousObser
 inline constexpr size_t GetContiguousDonesOffset() { return GetContiguousRewardsOffset() + MAX_RL_BOTS * sizeof(float); }
 inline constexpr size_t GetContiguousTruncatedOffset() { return GetContiguousDonesOffset() + MAX_RL_BOTS * sizeof(int32_t); }
 inline constexpr size_t GetContiguousBotClientIdsOffset() { return GetContiguousTruncatedOffset() + MAX_RL_BOTS * sizeof(int32_t); }
+inline constexpr size_t GetContiguousSnapshotVisitsOffset() { return GetContiguousBotClientIdsOffset() + MAX_RL_BOTS * sizeof(int32_t); }
 inline constexpr size_t GetContiguousServerRLShmSize() { return sizeof(SContiguousServerRLShm); }
+
+// Archive slot index. Keep in sync with the Python sampler.
+inline constexpr int SnapshotSlot(int Bin, int Variant) { return Bin * NUM_SNAPSHOT_VARIANTS + Variant; }
 
 // ============================================================================
 // Helper Functions

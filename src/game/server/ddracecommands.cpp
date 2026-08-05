@@ -775,6 +775,30 @@ void CGameContext::ConRLRatchet(IConsole::IResult *pResult, void *pUserData)
 	pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
 }
 
+void CGameContext::ConRLArchiveVariants(IConsole::IResult *pResult, void *pUserData)
+{
+	CGameContext *pSelf = (CGameContext *)pUserData;
+
+	if(!pSelf->m_pBotManager || !pSelf->m_pBotManager->IsEnabled())
+	{
+		dbg_msg("rl/bots", "WARNING: sv_rl_archive_variants IGNORED - bot manager not created yet. "
+			"Issue sv_rl_bots FIRST.");
+		pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", "RL bots not active");
+		return;
+	}
+
+	if(pResult->NumArguments() > 0)
+	{
+		bool On = pResult->GetInteger(0) != 0;
+		pSelf->m_pBotManager->SetArchiveVariants(On);
+		dbg_msg("rl/bots", "Archive variant axis %s", On ? "ENABLED" : "disabled (progress-only)");
+	}
+
+	char aBuf[128];
+	str_format(aBuf, sizeof(aBuf), "Archive variants: %d", pSelf->m_pBotManager->GetArchiveVariants() ? 1 : 0);
+	pSelf->Console()->Print(IConsole::OUTPUT_LEVEL_STANDARD, "rl", aBuf);
+}
+
 void CGameContext::ConRLAllowPause(IConsole::IResult *pResult, void *pUserData)
 {
 	CGameContext *pSelf = (CGameContext *)pUserData;

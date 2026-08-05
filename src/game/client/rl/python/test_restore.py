@@ -11,7 +11,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from teeworlds_server_env import ServerEnvConfig, TeeWorldsServerEnv
+from teeworlds_server_env import NAV_DIM, ServerEnvConfig, TeeWorldsServerEnv
 
 N_BOTS = 8
 REPLAY_STEPS = 100
@@ -78,7 +78,7 @@ def main():
         # inputs. Position alone matching is not sufficient.
         obs_buf = {'tiles': np.zeros((N_BOTS, 1, 31, 43), dtype=np.float32),
                    'player_state': np.zeros((N_BOTS, 15), dtype=np.float32),
-                   'checkpoint': np.zeros((N_BOTS, 17), dtype=np.float32)}
+                   'checkpoint': np.zeros((N_BOTS, NAV_DIM), dtype=np.float32)}
         env._reset_envs_fast(np.ones(N_BOTS, dtype=bool), obs_buf,
                              spawn_checkpoints=np.full(N_BOTS, slot, dtype=np.int32))
         start = env._read_positions().copy()

@@ -43,6 +43,11 @@ public:
 	int32_t *GetTruncated(int BotIndex);
 	int32_t *GetBotClientId(int BotIndex);
 
+	// Per-slot capture counts for the snapshot archive. Published so the Python
+	// sampler knows which cells actually exist on THIS server (each server owns
+	// an independent archive) and how rare each one is.
+	uint32_t *GetSnapshotVisits();
+
 	// Batch accessors
 	SAction *GetActionsArray();
 	SStructuredObservation *GetObservationsArray();

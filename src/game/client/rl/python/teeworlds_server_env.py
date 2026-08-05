@@ -107,6 +107,18 @@ NUM_LOOKAHEAD = 8
 STUCK_WINDOW = 10
 STUCK_DIST = 64.0
 NUM_PROGRESS_BINS = 200
+
+# Snapshot archive geometry — must match rl_protocol.h.
+#
+# A cell is (progress bin, hook engaged, coarse vertical velocity). Binning on
+# progress alone discards the states worth returning to: a mid-swing state sits
+# at a LOWER progress bin than the obstacle it solves, and under latest-wins the
+# next bot to walk that bin on the ground overwrites it immediately.
+NUM_HOOK_CLASSES = 2
+NUM_VY_CLASSES = 3
+NUM_SNAPSHOT_VARIANTS = NUM_HOOK_CLASSES * NUM_VY_CLASSES
+NUM_SNAPSHOT_SLOTS = NUM_PROGRESS_BINS * NUM_SNAPSHOT_VARIANTS
+VARIANT_NAMES = ('rise', 'level', 'fall', 'hook+rise', 'hook+level', 'hook+fall')
 # progress + (x, y) per lookahead point + episode high-water progress.
 # The high-water mark is LAST so the strided (x, y) parse keeps its shape; it is
 # what ratchet shaping's potential is a function of, and without it the critic
@@ -126,8 +138,9 @@ CONTIGUOUS_OBS_OFFSET = CONTIGUOUS_ACTIONS_OFFSET + MAX_RL_BOTS * ACTION_SIZE  #
 CONTIGUOUS_REWARDS_OFFSET = CONTIGUOUS_OBS_OFFSET + MAX_RL_BOTS * OBS_SIZE  # 4640 + 128*1456 = 190008
 CONTIGUOUS_DONES_OFFSET = CONTIGUOUS_REWARDS_OFFSET + MAX_RL_BOTS * 4  # 183840 + 512 = 184352
 CONTIGUOUS_TRUNCATED_OFFSET = CONTIGUOUS_DONES_OFFSET + MAX_RL_BOTS * 4  # 184352 + 512 = 184864
-CONTIGUOUS_BOTIDS_OFFSET = CONTIGUOUS_TRUNCATED_OFFSET + MAX_RL_BOTS * 4  # 184864 + 512 = 185376
-CONTIGUOUS_SHM_SIZE = CONTIGUOUS_BOTIDS_OFFSET + MAX_RL_BOTS * 4  # 185376 + 512 = 185888
+CONTIGUOUS_BOTIDS_OFFSET = CONTIGUOUS_TRUNCATED_OFFSET + MAX_RL_BOTS * 4
+CONTIGUOUS_SNAPSHOT_VISITS_OFFSET = CONTIGUOUS_BOTIDS_OFFSET + MAX_RL_BOTS * 4
+CONTIGUOUS_SHM_SIZE = CONTIGUOUS_SNAPSHOT_VISITS_OFFSET + NUM_SNAPSHOT_SLOTS * 4
 
 # Global reference for signal handler cleanup
 _active_server_env: Optional['TeeWorldsServerEnv'] = None
@@ -183,14 +196,31 @@ class ProgressSpawnManager:
     trains a policy that only ever sees it from a standstill.
     """
 
-    def __init__(self, begin_bias: float = 0.2, window: int = 12, num_bins: int = 200):
+    def __init__(self, begin_bias: float = 0.2, window: int = 12, num_bins: int = 200,
+                 num_servers: int = 1, bots_per_server: int = 1,
+                 rarity_alpha: float = 0.5):
         self.begin_bias = begin_bias
         self.window = window
         self.num_bins = num_bins
+        self.num_servers = num_servers
+        self.bots_per_server = max(1, bots_per_server)
+        # Weight ∝ visits**-alpha. 0 = uniform over occupied cells, 1 = full
+        # inverse-count. 0.5 is the usual Go-Explore-ish compromise: it favours
+        # the rare cell that one bot stumbled into without ignoring the common
+        # ones the policy still needs to practise chaining through.
+        self.rarity_alpha = rarity_alpha
         self._frontier: Optional[int] = None
         self._edge: Optional[int] = None
         self._reached = np.zeros(0, dtype=np.int64)
         self.last_sampled = np.zeros(0, dtype=np.int32)
+        # (num_servers, NUM_SNAPSHOT_SLOTS) capture counts, refreshed per update.
+        self._visits = np.zeros((num_servers, NUM_SNAPSHOT_SLOTS), dtype=np.int64)
+        self._last_variant_hist = np.zeros(NUM_SNAPSHOT_VARIANTS, dtype=np.int64)
+
+    def update_visits(self, visits: np.ndarray) -> None:
+        """Feed in per-server archive occupancy read from shared memory."""
+        if visits.shape == self._visits.shape:
+            self._visits = visits.astype(np.int64, copy=False)
 
     def update_frontier(self, frontier_bin: Optional[int], reached_bins: np.ndarray,
                         edge: Optional[int] = None) -> None:
@@ -207,28 +237,57 @@ class ProgressSpawnManager:
         self._edge = edge if edge is not None else frontier_bin
         self._reached = reached_bins
 
-    def sample(self, n: int) -> np.ndarray:
-        """Sample n restore slots. -1 means spawn at the map start."""
+    def sample(self, env_indices: np.ndarray) -> np.ndarray:
+        """Sample a restore slot per resetting env. -1 means spawn at map start.
+
+        Takes env indices rather than a count because each server owns its own
+        archive: a cell that exists on server 3 may be empty on server 5, and
+        asking for an empty one silently falls back to the map spawn.
+        """
+        env_indices = np.asarray(env_indices)
+        n = len(env_indices)
         out = np.full(n, -1, dtype=np.int32)
         target = self._edge if self._edge is not None else self._frontier
-        if target is None or len(self._reached) == 0:
+        if target is None or n == 0:
             return out  # no estimate yet: everyone starts at the beginning
 
         lo = max(0, target - self.window)
-        hi = target
-        # Only offer slots agents have actually reached; anything else is very
-        # likely an empty archive bin and would silently fall back to spawn.
-        candidates = self._reached[(self._reached >= lo) & (self._reached <= hi)]
-        if len(candidates) == 0:
-            return out
+        hi = min(self.num_bins - 1, target)
+        # Every cell of every bin in the window, not just the bins agents ended
+        # episodes in. The whole point of the variant axis is that the useful
+        # cell (hooked, rising) is one a progress-only view cannot name.
+        bins = np.arange(lo, hi + 1)
+        window_slots = (bins[:, None] * NUM_SNAPSHOT_VARIANTS +
+                        np.arange(NUM_SNAPSHOT_VARIANTS)[None, :]).ravel()
 
         # begin_bias never goes away. It is both the honest from-start metric and
         # the guard against Go-Explore's phase-2 failure, where a policy learns
         # every segment and cannot chain them.
         use_archive = np.random.random(n) >= self.begin_bias
-        k = int(use_archive.sum())
-        if k:
-            out[use_archive] = np.random.choice(candidates, size=k)
+        servers = np.minimum(env_indices // self.bots_per_server, self.num_servers - 1)
+
+        variant_hist = np.zeros(NUM_SNAPSHOT_VARIANTS, dtype=np.int64)
+        for srv in np.unique(servers[use_archive]) if use_archive.any() else []:
+            counts = self._visits[srv, window_slots]
+            occupied = counts > 0
+            if not occupied.any():
+                continue  # this server has nothing in the window; spawn at start
+            slots = window_slots[occupied]
+            # Rarity weighting: a cell one bot reached once is worth practising
+            # more than one every bot walks through. This is the half of
+            # Go-Explore that a purely frontier-based sampler leaves unused.
+            weights = counts[occupied].astype(np.float64) ** (-self.rarity_alpha)
+            weights /= weights.sum()
+
+            take = use_archive & (servers == srv)
+            k = int(take.sum())
+            if k:
+                chosen = np.random.choice(slots, size=k, p=weights)
+                out[take] = chosen
+                variant_hist += np.bincount(chosen % NUM_SNAPSHOT_VARIANTS,
+                                            minlength=NUM_SNAPSHOT_VARIANTS)
+
+        self._last_variant_hist = variant_hist
         self.last_sampled = out
         return out
 
@@ -242,7 +301,28 @@ class ProgressSpawnManager:
             restored = self.last_sampled[self.last_sampled >= 0]
             s['curriculum/restore_fraction'] = float(len(restored) / len(self.last_sampled))
             if len(restored):
-                s['curriculum/restore_bin_mean'] = float(restored.mean())
+                # Report the BIN, not the raw slot, so the number stays
+                # comparable with every run before the variant axis existed.
+                s['curriculum/restore_bin_mean'] = float((restored // NUM_SNAPSHOT_VARIANTS).mean())
+
+        occupied = self._visits > 0
+        s['archive/occupied_slots'] = float(occupied.sum(axis=1).mean())
+        s['archive/occupied_bins'] = float(
+            occupied.reshape(self.num_servers, self.num_bins, NUM_SNAPSHOT_VARIANTS)
+            .any(axis=2).sum(axis=1).mean())
+        # How much the variant axis is actually buying: cells per occupied bin.
+        # 1.0 means the extra axis is dead weight and the archive is effectively
+        # the old progress-only one. Guard only against division by zero — a
+        # `max(bins, 1.0)` floor silently reports 1.0 whenever the per-server
+        # mean is itself below 1, which is exactly when the archive is sparse.
+        bins_occ = s['archive/occupied_bins']
+        s['archive/cells_per_bin'] = float(s['archive/occupied_slots'] / bins_occ) if bins_occ > 0 else 0.0
+        hooked = occupied.reshape(self.num_servers, self.num_bins, NUM_SNAPSHOT_VARIANTS)[..., 3:]
+        s['archive/hooked_cells'] = float(hooked.sum(axis=(1, 2)).mean())
+        if self._last_variant_hist.sum():
+            frac = self._last_variant_hist / self._last_variant_hist.sum()
+            for i, nm in enumerate(VARIANT_NAMES):
+                s[f'restore_variant/{nm}'] = float(frac[i])
         return s
 
 
@@ -342,6 +422,10 @@ class ServerEnvConfig:
     # Shaping potential is the episode's HIGH-WATER progress instead of current
     # progress, so a tactical retreat costs only time. Server-side flag.
     ratchet_shaping: bool = False
+    # Archive cells keyed by (progress, hook, vertical velocity) instead of
+    # progress alone. Off reproduces the old latest-wins-per-bin archive, which
+    # is what the ablation needs.
+    archive_variants: bool = True
 
     def __post_init__(self):
         if self.server_path is None:
@@ -789,6 +873,21 @@ class ServerShmClient:
         except Exception as e:
             print(f"Error parsing observation for bot {bot_index}: {e}")
             return None, 0.0, True
+
+    def read_snapshot_visits(self) -> np.ndarray:
+        """Per-slot capture counts for THIS server's archive. 0 == empty slot.
+
+        Each server owns an independent archive, so a slot populated on one
+        server may be empty on another. Restoring from an empty slot silently
+        falls back to the map spawn, which would degrade the curriculum without
+        showing up anywhere — hence reading the real occupancy rather than
+        inferring it from Python-side observations.
+        """
+        if not self._connected:
+            return np.zeros(NUM_SNAPSHOT_SLOTS, dtype=np.uint32)
+        self.shm_mmap.seek(CONTIGUOUS_SNAPSHOT_VISITS_OFFSET)
+        raw = self.shm_mmap.read(NUM_SNAPSHOT_SLOTS * 4)
+        return np.frombuffer(raw, dtype=np.uint32).copy()
 
     def read_observations_batch(self) -> Tuple[List[Optional[StructuredObservation]], np.ndarray, np.ndarray]:
         """Read all observations, rewards, and dones at once."""
@@ -1394,6 +1493,12 @@ class TeeWorldsServerEnv:
             self.spawn_manager = ProgressSpawnManager(
                 begin_bias=self.config.begin_bias,
                 window=self.config.frontier_window,
+                num_servers=self.num_servers,
+                bots_per_server=self.num_bots_per_server,
+                # With the variant axis off every state lands in variant 0, so
+                # rarity weighting would just re-weight the old bins. Uniform
+                # keeps the ablation arm faithful to the previous behaviour.
+                rarity_alpha=0.5 if self.config.archive_variants else 0.0,
             )
         elif self.config.checkpoint_respawn:
             self.spawn_manager = CheckpointSpawnManager(
@@ -1587,6 +1692,7 @@ class TeeWorldsServerEnv:
             f"sv_rl_bots {self.num_bots_per_server} {server_idx}",
             f"sv_rl_frame_skip {self.config.frame_skip}",
             f"sv_rl_ratchet {1 if self.config.ratchet_shaping else 0}",
+            f"sv_rl_archive_variants {1 if self.config.archive_variants else 0}",
         ])
 
         # Server 0 logs to /tmp/rl_server.log for debugging (tail -f /tmp/rl_server.log)
@@ -1648,6 +1754,7 @@ class TeeWorldsServerEnv:
             f"sv_rl_bots {self.num_bots_per_server} {server_idx}",
             f"sv_rl_frame_skip {self.config.frame_skip}",
             f"sv_rl_ratchet {1 if self.config.ratchet_shaping else 0}",
+            f"sv_rl_archive_variants {1 if self.config.archive_variants else 0}",
         ])
 
         # Server 0 logs to /tmp/rl_server.log for debugging (tail -f /tmp/rl_server.log)
@@ -2011,7 +2118,8 @@ class TeeWorldsServerEnv:
             n_reset = int(reset_mask.sum())
             if isinstance(self.spawn_manager, ProgressSpawnManager):
                 spawn_cps = np.full(self.num_envs, -1, dtype=np.int32)
-                spawn_cps[reset_mask] = self.spawn_manager.sample(n_reset)
+                reset_idx = np.where(reset_mask)[0]
+                spawn_cps[reset_mask] = self.spawn_manager.sample(reset_idx)
             elif self.spawn_manager is not None:
                 cp_indices = self._read_checkpoint_indices()
                 for i in np.where(reset_mask)[0]:
@@ -2192,6 +2300,20 @@ class TeeWorldsServerEnv:
                   f"path start ({wp0[0]:.0f}, {wp0[1]:.0f}) — progress is flat over that gap, "
                   f"so shaping gives no gradient there. Consider prepending the spawn to the "
                   f"waypoint file.")
+
+    def refresh_snapshot_visits(self) -> np.ndarray:
+        """Pull every server's archive occupancy into the spawn manager.
+
+        Called once per PPO update rather than per step: the archive changes far
+        more slowly than the rollout, and 8 x 1200 x 4 bytes per step would be
+        190 MB/s of pointless reads.
+        """
+        visits = np.zeros((self.num_servers, NUM_SNAPSHOT_SLOTS), dtype=np.int64)
+        for server_idx, shm_client in enumerate(self.shm_clients):
+            visits[server_idx] = shm_client.read_snapshot_visits()
+        if isinstance(self.spawn_manager, ProgressSpawnManager):
+            self.spawn_manager.update_visits(visits)
+        return visits
 
     def _read_positions(self) -> np.ndarray:
         """Read every bot's world position from raw shm. Returns (num_envs, 2) float32.
