@@ -97,15 +97,32 @@ Fixed in `f0fc15377`: placement now targets the exploration edge — the furthes
 agents reach, which no part of the curriculum can move on its own. Dwell is kept as a
 diagnostic only.
 
-Mechanism confirmed on resume: mean restore bin 73 → **85.1** (edge 91), thrash 0.63 →
-0.50, mean heading 0.10 → 0.50. **Whether the edge itself breaks past 0.455 is not yet
-demonstrated** — Run E has only ~2M steps since the fix, and Run D needed ~7M to move
-0.370 → 0.455.
+Mechanism confirmed on resume: mean restore bin 73 → **85.1** (edge 91), well inside the
+12-bin window.
+
+**But the fix did not break the plateau.** 26M steps later the edge is still exactly
+0.4550, slope +0.00000. The early improvement (thrash 0.63 → 0.41, heading 0.10 → 0.50)
+was transient and reverted to thrash 0.74 as the policy adapted to the new restore
+distribution.
+
+So the placement bug was real, and worth fixing, but it was **not the cause of the
+plateau**. Agents are now dropped within a window of the frontier and still cannot get
+past it. That makes 0.455 a genuine capability limit, not a curriculum artifact — which
+is a more informative result than the fix working would have been.
 
 **The wall at 0.455** is at world (33,615, 1583), tile (1050, 49). The path there dips
 then climbs ~15 tiles at near-constant x (wp 815 y=1600 → wp 823 y=1124) — a vertical
-shaft that needs a hook. The frontier band holds only **1.8%** of thrash time, i.e. the
-agent barely reaches it, which is exactly what the placement bug caused.
+shaft that requires a hook.
+
+A hook-climb is a multi-step precise sequence (aim, hook, swing, release, re-hook). With
+a near-uniform aim distribution and no temporal structure in the policy, the probability
+of stumbling onto it by exploration is negligible — and no amount of restoring *just
+before* it changes that.
+
+**This exposes a structural limit of the archive.** It is seeded exclusively from agent
+experience, so it can only ever contain states the agent already reached. It therefore
+cannot help past any wall the agent cannot cross unaided. The curriculum accelerates
+progress through terrain that is already solvable; it cannot manufacture a capability.
 
 ---
 
@@ -143,8 +160,19 @@ one dead run). Runs need `setsid` plus an explicit liveness check.
 
 Ordered by expected value.
 
-1. **Confirm the sampler fix moves the edge.** Everything else is downstream of whether
-   0.455 breaks. Needs ~10M steps on Run E's config, ideally two seeds given §5.
+1. **Seed the archive from the ghost (roadmap §3.2).** This is now the top item. The
+   archive cannot contain states beyond the wall because no agent has ever been there —
+   but the ghost has. Constructing restore points from ghost fields (pos, vel, hook
+   state are all in the `.gho`; `ghost_parser.py` already decodes them) puts the agent
+   *past* 0.455 so it can learn the terrain beyond, and gives the backward curriculum
+   something to walk back from. It is the one mechanism that breaks the
+   experience-bootstrapping deadlock, and the parser work is already done.
+
+   The stronger version, if restore-point seeding is not enough: recover the ghost's
+   *actions*. Direction, hook state and aim angle are recorded directly; only jump is
+   missing and is recoverable by a 2-tick search against the recorded velocity. That
+   turns the ghost into behaviour-cloning data for exactly the segments the agent
+   cannot discover.
 
 2. **Widen `frontier_window` and raise `begin_bias`.** The window is 12 bins = 6% of the
    path; with restores now at the edge, a wider band gives more varied approach practice.
