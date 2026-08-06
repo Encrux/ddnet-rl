@@ -6,9 +6,15 @@ episode starts next to the obstacle, needs only a couple of attempts, and every
 extra step delays the reset that produces the next restore -- and curriculum
 turnover happens only at episode boundaries.
 
-Stall patience is the safer version of "make frontier episodes short": it cannot
-truncate a productive attempt, because by construction it only fires when the
-episode has stopped beating its own high-water progress.
+Stall patience is the safer version of "make frontier episodes short" -- it only
+starts counting once forward progress stops. It is NOT immune to truncating a
+solution though: "no new high-water" includes productive RETREAT, and the
+obstacle at 0.4557 is cleared by backing up first. Size it above the longest
+maneuver, not just above the dead time.
+
+It applies to RESTORED episodes only. Applying it to from-start episodes killed
+them at the first place they stalled, so they never traversed the map at all --
+median from-start progress 0.0556 against 0.21-0.31 for every other config.
 
 Run: python test_episode_caps.py
 
@@ -42,14 +48,20 @@ def idle(n):
     }
 
 
-def run(**cfg_kw):
+def run(from_start=True, steps=500, **cfg_kw):
+    """Drive idle bots and collect episode lengths.
+
+    `from_start` forces the episode-type flag, because stall patience applies
+    ONLY to restored episodes and all bots naturally spawn from the start.
+    """
     cfg = ServerEnvConfig(frame_skip=3, use_dict_obs=True, map_name='Tutorial',
                           finish_progress=1.0, **cfg_kw)
     env = TeeWorldsServerEnv(num_bots=N_BOTS, num_servers=1, config=cfg)
     try:
         env.reset()
         lengths = []
-        for step in range(500):
+        for step in range(steps):
+            env._episode_from_start[:] = from_start
             _, _, _, trunc, infos = env.step(idle(N_BOTS))
             for info in infos:
                 if 'episode' in info:
@@ -69,8 +81,9 @@ def main():
     check("episodes truncate at the plain cap", len(lens) > 0 and set(lens) == {80},
           f"lengths seen {sorted(set(lens))[:5]}")
 
-    print("\n[2] Stall patience truncates an idle episode much sooner")
-    lens_p = run(max_episode_steps=400, stall_patience=25)
+    print("\n[2] Stall patience truncates an idle RESTORED episode much sooner")
+    lens_p = run(from_start=False, max_episode_steps=400,
+                 max_episode_steps_restored=400, stall_patience=25)
     check("patience fires well before the hard cap",
           len(lens_p) > 0 and max(lens_p) < 400,
           f"max length {max(lens_p) if lens_p else 'none'} vs cap 400")
@@ -79,6 +92,12 @@ def main():
           f"lengths {sorted(set(lens_p))[:5]}")
     check("patience produces many more episodes than the plain cap",
           len(lens_p) > len(lens), f"{len(lens_p)} vs {len(lens)} episodes in 500 steps")
+
+    print("\n[2b] Patience must NOT touch from-start episodes")
+    lens_fs = run(from_start=True, steps=300, max_episode_steps=250, stall_patience=25)
+    check("idle FROM-START episodes run to the full cap, not the patience limit",
+          len(lens_fs) > 0 and min(lens_fs) == 250,
+          f"lengths {sorted(set(lens_fs))[:5]} (patience 25, cap 250)")
 
     print("\n[3] Patience does NOT cut an episode that is still progressing")
     # Drive right: bots make progress, so the high-water mark keeps moving and

@@ -535,8 +535,9 @@ class ServerEnvConfig:
     #
     # <= 0 means "same as max_episode_steps".
     max_episode_steps_restored: int = 0
-    # Truncate after this many consecutive steps without beating the episode's
-    # own high-water progress. 0 disables.
+    # Truncate a RESTORED episode after this many consecutive steps without
+    # beating its own high-water progress. 0 disables. Never applies to
+    # from-start episodes -- see the guard in step().
     #
     # This is the knob that actually matters. A short fixed cap cuts dead time
     # but also truncates live attempts, which is fatal for any obstacle whose
@@ -2280,7 +2281,21 @@ class TeeWorldsServerEnv:
             np.add(self._steps_since_gain, 1, out=self._steps_since_gain,
                    where=self._stalled)
             self._steps_since_gain[~self._stalled] = 0
-            truncated |= self._steps_since_gain >= self.config.stall_patience
+            # RESTORED episodes only.
+            #
+            # Applying this to from-start episodes as well cost a whole run: a
+            # from-start episode got killed at the first place it stalled for 12
+            # seconds, which is somewhere early in the map, so it never
+            # traversed anything. Median from-start progress fell to 0.0556 at
+            # 20M steps where every other config was at 0.21-0.31, and the run
+            # ended worse than BOTH configs it was meant to combine.
+            #
+            # The two types want opposite treatment: from-start episodes are
+            # practising the whole chain and need to run long, restored episodes
+            # are practising one obstacle and should be recycled as soon as they
+            # stop making progress.
+            truncated |= ((self._steps_since_gain >= self.config.stall_patience)
+                          & ~self._episode_from_start)
 
         for i in range(self.num_envs):
             info = {}
