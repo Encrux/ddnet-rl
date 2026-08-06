@@ -263,6 +263,10 @@ def parse_args():
                              "-0.5 put 82%% of restores into transient hooked states.")
     parser.add_argument("--max-variant-share", type=float, default=0.4,
                         help="Ceiling on the share of restores any one cell variant may absorb")
+    parser.add_argument("--frontier-share", type=float, default=0.3,
+                        help="Share of archive restores reserved for bins BEYOND the bulk "
+                             "exploration edge -- states reached only by clearing an obstacle "
+                             "the agent usually cannot. 0 = old edge-capped behaviour.")
     parser.add_argument("--legacy-archive", action="store_true",
                         help="Ablation: key archive cells by progress bin alone (latest-wins), "
                              "reproducing the pre-variant behaviour.")
@@ -372,6 +376,7 @@ def main():
             archive_variants=not args.legacy_archive,
             restore_beta=args.restore_beta,
             max_variant_share=args.max_variant_share,
+            frontier_share=args.frontier_share,
         )
         # Use default server_path (resolved relative to teeworlds_server_env.py)
         env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)

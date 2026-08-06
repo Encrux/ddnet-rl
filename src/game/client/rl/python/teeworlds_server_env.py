@@ -198,7 +198,8 @@ class ProgressSpawnManager:
 
     def __init__(self, begin_bias: float = 0.2, window: int = 12, num_bins: int = 200,
                  num_servers: int = 1, bots_per_server: int = 1,
-                 restore_beta: float = 0.5, max_variant_share: float = 0.4):
+                 restore_beta: float = 0.5, max_variant_share: float = 0.4,
+                 frontier_share: float = 0.3):
         self.begin_bias = begin_bias
         self.window = window
         self.num_bins = num_bins
@@ -228,6 +229,10 @@ class ProgressSpawnManager:
         # as a backstop independent of the weighting. Without it the failure
         # above is only ever one bad beta away.
         self.max_variant_share = max_variant_share
+        # Guaranteed share of archive restores that go to bins BEYOND the bulk
+        # exploration edge -- states an agent reached only by clearing something
+        # it usually cannot. Zero restores the old edge-capped behaviour.
+        self.frontier_share = frontier_share
         self._frontier: Optional[int] = None
         self._edge: Optional[int] = None
         self._reached = np.zeros(0, dtype=np.int64)
@@ -235,6 +240,8 @@ class ProgressSpawnManager:
         # (num_servers, NUM_SNAPSHOT_SLOTS) capture counts, refreshed per update.
         self._visits = np.zeros((num_servers, NUM_SNAPSHOT_SLOTS), dtype=np.int64)
         self._last_variant_hist = np.zeros(NUM_SNAPSHOT_VARIANTS, dtype=np.int64)
+        self._last_beyond_share = 0.0
+        self._last_max_offered = -1
 
     def update_visits(self, visits: np.ndarray) -> None:
         """Feed in per-server archive occupancy read from shared memory."""
@@ -305,11 +312,22 @@ class ProgressSpawnManager:
             return out  # no estimate yet: everyone starts at the beginning
 
         lo = max(0, target - self.window)
-        hi = min(self.num_bins - 1, target)
-        # Every cell of every bin in the window, not just the bins agents ended
-        # episodes in. The whole point of the variant axis is that the useful
-        # cell (hooked, rising) is one a progress-only view cannot name.
-        bins = np.arange(lo, hi + 1)
+        # Deliberately NOT capped at the edge.
+        #
+        # It used to be `hi = target`, and that was self-limiting. Snapshots are
+        # captured wherever an agent actually gets to -- CaptureSnapshot has no
+        # upper bound -- so the rare episode that clears an obstacle DOES leave a
+        # snapshot at bin 92, 93... But `target` is exploration_edge, whose floor
+        # is max(200, 1% of the busiest bin): with hundreds of thousands of
+        # visits piled up at the frontier that is thousands of visits, which a
+        # bin touched by a handful of episodes can never reach. So those slots
+        # were never offered, never accumulated visits, never became the edge,
+        # and never got offered. The one state worth returning to was recorded
+        # and then ignored.
+        #
+        # The window now runs to the furthest bin that actually HAS a snapshot,
+        # and bins beyond the bulk edge get a guaranteed share of restores below.
+        bins = np.arange(lo, self.num_bins)
         window_slots = (bins[:, None] * NUM_SNAPSHOT_VARIANTS +
                         np.arange(NUM_SNAPSHOT_VARIANTS)[None, :]).ravel()
 
@@ -320,35 +338,71 @@ class ProgressSpawnManager:
         servers = np.minimum(env_indices // self.bots_per_server, self.num_servers - 1)
 
         variant_hist = np.zeros(NUM_SNAPSHOT_VARIANTS, dtype=np.int64)
+        beyond_n = 0
+        archive_n = 0
+        max_chosen = -1
         for srv in np.unique(servers[use_archive]) if use_archive.any() else []:
             counts = self._visits[srv, window_slots]
             occupied = counts > 0
             if not occupied.any():
                 continue  # this server has nothing in the window; spawn at start
-            slots = window_slots[occupied]
-            raw = counts[occupied].astype(np.float64) ** self.restore_beta
-            variants = slots % NUM_SNAPSHOT_VARIANTS
 
-            # Split into "which variant" x "which cell within it", so the cap
-            # below acts on the variant marginal without disturbing the rarity
-            # ordering inside each variant.
-            vsum = np.bincount(variants, weights=raw, minlength=NUM_SNAPSHOT_VARIANTS)
-            within = raw / vsum[variants]                       # sums to 1 per variant
-            target = self._cap_variant_shares(vsum / vsum.sum())
-            weights = within * target[variants]
-            weights /= weights.sum()
+            slots = window_slots[occupied]
+            cnt = counts[occupied].astype(np.float64)
+            beyond = (slots // NUM_SNAPSHOT_VARIANTS) > target
+
+            # Two pools, mixed at a FIXED ratio rather than by weight.
+            #
+            # Weighting alone cannot surface these: a bin-93 cell with 20 visits
+            # scores 4.5 at beta 0.5 against 224 for a bin-85 cell with 50,000,
+            # so the states that actually cleared the obstacle would get ~2% of
+            # one ordinary bin's mass and effectively never be drawn. A
+            # guaranteed share is the point -- these are the rare situations
+            # worth resuming from precisely BECAUSE they are rare and forward.
+            #
+            # This is the directed version of the rarity weighting that failed:
+            # "rare" alone picked out tees mid-fall into a freeze, while "rare
+            # AND past the frontier" can only pick out achievements.
+            if beyond.any() and self.frontier_share > 0.0:
+                w = np.zeros(len(slots), dtype=np.float64)
+                w[beyond] = self._pool_weights(slots[beyond], cnt[beyond]) * self.frontier_share
+                near = ~beyond
+                if near.any():
+                    w[near] = self._pool_weights(slots[near], cnt[near]) * (1.0 - self.frontier_share)
+            else:
+                w = self._pool_weights(slots, cnt)
+            w /= w.sum()
 
             take = use_archive & (servers == srv)
             k = int(take.sum())
             if k:
-                chosen = np.random.choice(slots, size=k, p=weights)
+                chosen = np.random.choice(slots, size=k, p=w)
                 out[take] = chosen
                 variant_hist += np.bincount(chosen % NUM_SNAPSHOT_VARIANTS,
                                             minlength=NUM_SNAPSHOT_VARIANTS)
+                beyond_n += int(((chosen // NUM_SNAPSHOT_VARIANTS) > target).sum())
+                archive_n += k
+                max_chosen = max(max_chosen, int(chosen.max() // NUM_SNAPSHOT_VARIANTS))
 
         self._last_variant_hist = variant_hist
+        self._last_beyond_share = (beyond_n / archive_n) if archive_n else 0.0
+        # The furthest bin actually RESTORED INTO. Reporting the window's upper
+        # bound instead would always read 199 and mean nothing.
+        self._last_max_offered = max_chosen
         self.last_sampled = out
         return out
+
+    def _pool_weights(self, slots: np.ndarray, counts: np.ndarray) -> np.ndarray:
+        """Normalised within-pool weights: visits**beta, with the variant cap."""
+        raw = counts ** self.restore_beta
+        variants = slots % NUM_SNAPSHOT_VARIANTS
+        # Split into "which variant" x "which cell within it", so the cap acts on
+        # the variant marginal without disturbing the ordering inside a variant.
+        vsum = np.bincount(variants, weights=raw, minlength=NUM_SNAPSHOT_VARIANTS)
+        within = raw / vsum[variants]                       # sums to 1 per variant
+        shares = self._cap_variant_shares(vsum / vsum.sum())
+        w = within * shares[variants]
+        return w / w.sum()
 
     def get_stats(self) -> dict:
         s = {
@@ -364,7 +418,15 @@ class ProgressSpawnManager:
                 # comparable with every run before the variant axis existed.
                 s['curriculum/restore_bin_mean'] = float((restored // NUM_SNAPSHOT_VARIANTS).mean())
 
+        s['curriculum/beyond_edge_share'] = float(self._last_beyond_share)
+        s['curriculum/max_bin_restored'] = float(self._last_max_offered)
         occupied = self._visits > 0
+        # Furthest bin with a snapshot ANYWHERE. If this sits above edge_bin the
+        # archive is holding states the bulk policy cannot reach on its own,
+        # which is exactly what the frontier share exists to replay.
+        occ_bins = occupied.reshape(self.num_servers, self.num_bins, NUM_SNAPSHOT_VARIANTS).any(axis=2)
+        far = [int(np.nonzero(r)[0][-1]) if r.any() else -1 for r in occ_bins]
+        s['archive/max_occupied_bin'] = float(np.mean(far))
         s['archive/occupied_slots'] = float(occupied.sum(axis=1).mean())
         s['archive/occupied_bins'] = float(
             occupied.reshape(self.num_servers, self.num_bins, NUM_SNAPSHOT_VARIANTS)
@@ -489,6 +551,8 @@ class ServerEnvConfig:
     # over cells, negative = prefer rare). See ProgressSpawnManager.
     restore_beta: float = 0.5
     max_variant_share: float = 0.4
+    # Share of archive restores reserved for bins beyond the bulk edge.
+    frontier_share: float = 0.3
 
     def __post_init__(self):
         if self.server_path is None:
@@ -1562,6 +1626,7 @@ class TeeWorldsServerEnv:
                 # the cap is inert and only beta matters.
                 restore_beta=self.config.restore_beta,
                 max_variant_share=self.config.max_variant_share,
+                frontier_share=self.config.frontier_share,
             )
         elif self.config.checkpoint_respawn:
             self.spawn_manager = CheckpointSpawnManager(

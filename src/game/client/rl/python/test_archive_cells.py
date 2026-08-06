@@ -133,6 +133,58 @@ def test_restore_weighting():
           abs(infeasible - 0.5) < 0.03, f"{infeasible:.1%}, uniform would be 50.0%")
 
 
+def test_frontier_share():
+    """The states past the wall must actually be offered.
+
+    Models the observed situation: a busy frontier at bin 91 with hundreds of
+    thousands of visits, and two cells at bins 92-93 that a handful of episodes
+    reached by clearing the obstacle. The old sampler capped its window at the
+    edge and never offered them at all.
+    """
+    print("\n[1c] Frontier share (states past the bulk edge)")
+    EDGE = 91
+    visits = np.zeros((1, NUM_SNAPSHOT_SLOTS), dtype=np.int64)
+    for b in range(79, EDGE + 1):
+        for v in range(NUM_SNAPSHOT_VARIANTS):
+            visits[0, b * NUM_SNAPSHOT_VARIANTS + v] = 200_000 if v < 3 else 5_000
+    beyond_slots = [92 * NUM_SNAPSHOT_VARIANTS + 3, 93 * NUM_SNAPSHOT_VARIANTS + 4]
+    for sl in beyond_slots:
+        visits[0, sl] = 20          # a handful of crossings
+
+    def share(frontier_share):
+        mgr = ProgressSpawnManager(begin_bias=0.0, window=12, num_servers=1,
+                                   bots_per_server=8, restore_beta=0.5,
+                                   max_variant_share=0.4,
+                                   frontier_share=frontier_share)
+        mgr.update_visits(visits)
+        mgr.update_frontier(EDGE, np.arange(79, EDGE + 1), EDGE)
+        got = mgr.sample(np.tile(np.arange(8), 500))
+        got = got[got >= 0]
+        return ((got // NUM_SNAPSHOT_VARIANTS) > EDGE).mean(), got
+
+    off, got_off = share(0.0)
+    on, got_on = share(0.3)
+    print(f"      restores past bin {EDGE}:  frontier_share=0 {off:.2%}   "
+          f"frontier_share=0.3 {on:.1%}")
+    check("weighting alone essentially never offers them", off < 0.02, f"{off:.3%}")
+    check("a guaranteed share does", 0.24 < on < 0.36, f"{on:.1%}")
+    check("both beyond-edge cells get used",
+          len(set((got_on[(got_on // NUM_SNAPSHOT_VARIANTS) > EDGE]).tolist())) == 2)
+    check("the near window still gets the bulk", (1 - on) > 0.6, f"{1-on:.1%}")
+
+    # And the window must reach them at all: the old code capped hi at the edge.
+    mgr = ProgressSpawnManager(begin_bias=0.0, window=12, num_servers=1,
+                               bots_per_server=8, frontier_share=0.3)
+    mgr.update_visits(visits)
+    mgr.update_frontier(EDGE, np.arange(79, EDGE + 1), EDGE)
+    mgr.sample(np.tile(np.arange(8), 20))
+    st = mgr.get_stats()
+    check("sampler actually restores into bins above the edge",
+          st['curriculum/max_bin_restored'] > EDGE, f"{st['curriculum/max_bin_restored']}")
+    check("archive reports its furthest occupied bin",
+          st['archive/max_occupied_bin'] == 93.0, f"{st['archive/max_occupied_bin']}")
+
+
 def test_archive_live():
     """Occupancy from a real server: do the extra cells actually get filled?"""
     print("\n[2] Live archive occupancy")
@@ -196,6 +248,7 @@ def main():
     print("=" * 70)
     test_sampler_offline()
     test_restore_weighting()
+    test_frontier_share()
     test_archive_live()
     print("\n" + "=" * 70)
     if _failures:
