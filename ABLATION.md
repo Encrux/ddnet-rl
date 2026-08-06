@@ -129,6 +129,35 @@ pace**. So for every run above:
 The sizing rule was already in `configs/slice.yaml`; it was not re-derived when
 CLI overrides moved the slice from 0.05 to 0.50. It applies to overrides too.
 
+## 5d. Correct sizing works, and exposes a second trade (I1, I2)
+
+At `max_episode_steps 3000` the from-start policy finally reaches the obstacle:
+median from-start episode ends at **0.4518 / 0.4568**, essentially exactly the
+wall at 0.4557, against a hard truncation at 0.3847 under the old cap. The agent
+is now failing AT the wall rather than failing to arrive.
+
+But the finish rate goes to zero and peak progress drops to 0.4740 (both runs,
+identically). Every curriculum restore happens at an episode boundary, so tripling
+episode length at a fixed step budget gives ~2.5x fewer restores. The curriculum
+is what drives the frontier forward, and lengthening episodes throttles it —
+archive max bin 93.5/92.5 against 95.6 at the short cap.
+
+| | 1200 steps (H1/H2) | 3000 steps (I1/I2) |
+|---|---|---|
+| p50 from start | 0.212 / 0.324 | **0.452 / 0.457** |
+| finish rate | **24.7% / 11.0%** | 0.00% / 0.00% |
+| peak progress | 0.505 / 0.501 | 0.474 / 0.474 |
+| archive max bin | 95.6 / 93.1 | 93.5 / 92.5 |
+
+Both settings replicate 2/2 in opposite directions, so this is a real trade, not
+seed noise. The two episode types want different caps: a from-start episode needs
+~3000 steps to reach the wall, a restored episode starts near the frontier and
+does not. Splitting the cap by episode type decouples curriculum turnover from
+from-start reach.
+
+Across all four frontier-share runs the exploration edge moved (0.4694, 0.4650,
+0.4694, 0.4700) against 0.4550 in all seven runs without it — 4/4 vs 0/7.
+
 ## 6. Where this leaves the wall
 
 Exploration pressure does not solve it. Crossings happen occasionally and never
