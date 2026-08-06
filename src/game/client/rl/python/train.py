@@ -263,6 +263,15 @@ def parse_args():
                              "-0.5 put 82%% of restores into transient hooked states.")
     parser.add_argument("--max-variant-share", type=float, default=0.4,
                         help="Ceiling on the share of restores any one cell variant may absorb")
+    parser.add_argument("--max-episode-steps-restored", type=int, default=0,
+                        help="Separate episode cap for RESTORED episodes (0 = same as "
+                             "--max-episode-steps). From-start episodes need length to reach "
+                             "the frontier; restored ones start next to it and only delay the "
+                             "next restore.")
+    parser.add_argument("--stall-patience", type=int, default=0,
+                        help="Truncate after N consecutive steps without beating the episode's "
+                             "own high-water progress. 0 disables. Cannot cut a productive "
+                             "attempt, so it is safe for slow obstacles unlike a short cap.")
     parser.add_argument("--frontier-share", type=float, default=0.3,
                         help="Share of archive restores reserved for bins BEYOND the bulk "
                              "exploration edge -- states reached only by clearing an obstacle "
@@ -361,6 +370,8 @@ def main():
             sv_tickrate=args.sv_tickrate,
             frame_skip=args.frame_skip,
             max_episode_steps=args.max_episode_steps,
+            max_episode_steps_restored=args.max_episode_steps_restored,
+            stall_patience=args.stall_patience,
             use_dict_obs=args.use_cnn,  # Enable dict observations for CNN
             use_embeddings=args.use_embeddings or args.semantic_tiles,  # int64 tile ids
             map_name=args.map,
@@ -408,6 +419,8 @@ def main():
             sv_tickrate=args.sv_tickrate,
             frame_skip=args.frame_skip,
             max_episode_steps=args.max_episode_steps,
+            # Per-type caps and stall patience are server-side-env only; the
+            # legacy client-side EnvConfig has no such fields.
         )
         env = TeeWorldsVecEnv(num_envs=args.num_envs, config=env_config)
         _global_env = env  # Register for global cleanup

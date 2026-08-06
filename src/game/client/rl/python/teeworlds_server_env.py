@@ -522,6 +522,32 @@ class ServerEnvConfig:
     sv_tickrate: int = 50
     frame_skip: int = 1      # 1 = no skip, 4 = act every 4th tick (decision rate = tickrate/frame_skip)
     max_episode_steps: int = 2000
+    # Separate cap for RESTORED episodes.
+    #
+    # The two episode types are doing different jobs. A from-start episode is
+    # practising the whole chain and needs enough time to physically reach the
+    # frontier -- at 1200 steps it was truncated at 0.3847 progress, before the
+    # obstacle at 0.4557, so it never even arrived. A restored episode starts
+    # next to the obstacle and only needs time for a couple of attempts; every
+    # step after that is thrash, AND it delays the reset that produces the next
+    # restore. Curriculum turnover happens only at episode boundaries, which is
+    # why tripling the cap to 3000 cut the finish rate from ~18% to 0%.
+    #
+    # <= 0 means "same as max_episode_steps".
+    max_episode_steps_restored: int = 0
+    # Truncate after this many consecutive steps without beating the episode's
+    # own high-water progress. 0 disables.
+    #
+    # This is the knob that actually matters. A short fixed cap cuts dead time
+    # but also truncates live attempts, which is fatal for any obstacle whose
+    # solution takes a while. Patience on the high-water mark cannot truncate a
+    # productive attempt by construction -- progress is still improving -- so it
+    # gives "uncapped while productive, cut when stuck" instead.
+    #
+    # NOT a reward term. The freeze/stuck penalties removed in the Phase 1b
+    # rewrite changed the optimal policy; a truncation only changes which states
+    # the agent spends its time in, which is the curriculum's whole job.
+    stall_patience: int = 0
     startup_wait: float = 3.0
     action_timeout: float = 0.5  # Timeout waiting for observations (increased for debugging)
     use_dict_obs: bool = False   # Return dict observations for CNN policy
@@ -1594,6 +1620,7 @@ class TeeWorldsServerEnv:
         # High-water progress this episode, for stall detection.
         self._best_progress = np.zeros(self.num_bots, dtype=np.float32)
         self._stalled = np.zeros(self.num_bots, dtype=bool)
+        self._steps_since_gain = np.zeros(self.num_bots, dtype=np.int32)
         self._step_positions = np.zeros((self.num_bots, 2), dtype=np.float32)
         # Diagnostics that disambiguate "stall" into its distinct causes.
         # "Didn't beat high-water progress" fuses being stuck, thrashing, moving
@@ -2223,7 +2250,22 @@ class TeeWorldsServerEnv:
 
         self.episode_steps += 1
         self.episode_rewards += rewards
-        truncated[:] = self.episode_steps >= self.config.max_episode_steps
+
+        # Per-type hard cap.
+        restored_cap = (self.config.max_episode_steps_restored
+                        if self.config.max_episode_steps_restored > 0
+                        else self.config.max_episode_steps)
+        caps = np.where(self._episode_from_start,
+                        self.config.max_episode_steps, restored_cap)
+        truncated[:] = self.episode_steps >= caps
+
+        # Patience on the high-water mark. `_stalled` is already "did not beat
+        # this episode's best progress this step", computed above.
+        if self.config.stall_patience > 0 and self.path_progress is not None:
+            np.add(self._steps_since_gain, 1, out=self._steps_since_gain,
+                   where=self._stalled)
+            self._steps_since_gain[~self._stalled] = 0
+            truncated |= self._steps_since_gain >= self.config.stall_patience
 
         for i in range(self.num_envs):
             info = {}
@@ -2278,6 +2320,7 @@ class TeeWorldsServerEnv:
                 start_progress = self.path_progress.update(landed)
                 self._last_progress[reset_mask] = start_progress[reset_mask]
                 self._best_progress[reset_mask] = start_progress[reset_mask]
+                self._steps_since_gain[reset_mask] = 0
                 self._prev_positions[reset_mask] = landed[reset_mask]
                 self._disp_window[reset_mask] = 0.0
                 self._bin_dwell[reset_mask] = 0
@@ -2287,6 +2330,7 @@ class TeeWorldsServerEnv:
                 self._episode_from_start[reset_mask] = start_progress[reset_mask] < 0.002
             else:
                 self._best_progress[reset_mask] = 0.0
+                self._steps_since_gain[reset_mask] = 0
                 self._episode_from_start[reset_mask] = (
                     True if spawn_cps is None else spawn_cps[reset_mask] < 0)
 
