@@ -544,6 +544,19 @@ class ServerEnvConfig:
     # productive attempt by construction -- progress is still improving -- so it
     # gives "uncapped while productive, cut when stuck" instead.
     #
+    # CAVEAT, and it is the important one: "no new high-water" includes
+    # PRODUCTIVE RETREAT. The obstacle at 0.4557 is cleared by backing up ~3
+    # tiles first, and backing up does not beat the high-water mark, so patience
+    # counts up through exactly the phase this whole line of work exists to
+    # enable. Patience is therefore NOT free of the "too short truncates the
+    # solution" problem -- it is just far more forgiving than a fixed cap,
+    # because it only starts counting once forward progress stops.
+    #
+    # Size it well above the longest single maneuver, not just above the dead
+    # time you want to cut. A backtrack-hook-swing is ~3s ~= 50 decisions at
+    # frame_skip 3, so 60 is dangerously tight and 200 (12s) has real margin.
+    # Measured at 60: mean episode length collapsed to 61-88 steps.
+    #
     # NOT a reward term. The freeze/stuck penalties removed in the Phase 1b
     # rewrite changed the optimal policy; a truncation only changes which states
     # the agent spends its time in, which is the curriculum's whole job.
@@ -1621,6 +1634,8 @@ class TeeWorldsServerEnv:
         self._best_progress = np.zeros(self.num_bots, dtype=np.float32)
         self._stalled = np.zeros(self.num_bots, dtype=bool)
         self._steps_since_gain = np.zeros(self.num_bots, dtype=np.int32)
+        self._boot_mask = np.zeros(self.num_bots, dtype=bool)
+        self._final_obs = None
         self._step_positions = np.zeros((self.num_bots, 2), dtype=np.float32)
         # Diagnostics that disambiguate "stall" into its distinct causes.
         # "Didn't beat high-water progress" fuses being stuck, thrashing, moving
@@ -2281,6 +2296,25 @@ class TeeWorldsServerEnv:
                     info['episode']['pos'] = positions[i].copy()
             infos.append(info)
 
+        # Time-limit bootstrapping needs the observation AS OF the truncation,
+        # and _reset_envs_fast overwrites obs_out in place a few lines below.
+        #
+        # Only for episodes that were TRUNCATED and not terminated. A death or a
+        # finish is a genuine terminal whose continuation value is zero; a
+        # truncation is the clock running out on an episode that was still
+        # going, and treating those the same understates every state near the
+        # cap. This matters more the shorter episodes get, which is exactly the
+        # direction stall_patience pushes.
+        boot_mask = truncated & ~dones
+        self._boot_mask = boot_mask
+        if boot_mask.any():
+            if isinstance(obs_out, dict):
+                self._final_obs = {k: v.copy() for k, v in obs_out.items()}
+            else:
+                self._final_obs = obs_out.copy()
+        else:
+            self._final_obs = None
+
         # Auto-reset environments that are done or truncated
         reset_mask = dones | truncated
         if np.any(reset_mask):
@@ -2718,6 +2752,30 @@ class FrameStackWrapper:
         obs, reward, done, truncated, info = self.env.step(action)
         n_ps = self.n_player_state_stack
         feat = self._player_feat
+
+        # Stacked observation as of a truncation, for time-limit bootstrapping.
+        #
+        # Built BEFORE any wrapper state is touched. The policy sees stacked
+        # observations, so V(final) has to be evaluated on the stack the agent
+        # would have seen -- and the inner env has already auto-reset, so the
+        # final frame only exists in its _final_obs stash.
+        self._final_stacked = None
+        boot = getattr(self.env, '_boot_mask', None)
+        fin = getattr(self.env, '_final_obs', None)
+        if boot is not None and fin is not None and boot.any():
+            if self._stack_tiles:
+                frames = list(self.tile_frames)[-(self.n_tile_stack - 1):] if self.n_tile_stack > 1 else []
+                f_tiles = np.concatenate(frames + [fin['tiles']], axis=1)
+            else:
+                f_tiles = fin['tiles']
+            ring = self._player_ring.copy()
+            ptr0 = self._player_ptr
+            ring[:, ptr0 * feat:(ptr0 + 1) * feat] = fin['player_state']
+            nptr = (ptr0 + 1) % n_ps
+            f_player = ring if nptr == 0 else np.concatenate(
+                [ring[:, nptr * feat:], ring[:, :nptr * feat]], axis=1)
+            self._final_stacked = {'tiles': f_tiles, 'player_state': f_player,
+                                   'checkpoint': fin['checkpoint']}
 
         # Update tiles
         if self._stack_tiles:

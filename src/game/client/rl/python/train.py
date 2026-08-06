@@ -544,6 +544,7 @@ def main():
                     param_group['lr'] = lr
 
             # Collect rollout
+            n_bootstrapped = 0
             for step in range(args.num_steps):
                 global_step += args.num_envs
 
@@ -569,8 +570,27 @@ def main():
                 # Environment step
                 next_obs, reward, done, truncated, infos = env.step(executed)
 
-                # Store transition
-                agent.store_transition(step, obs, executed, log_prob, reward, done, value, fresh)
+                # Time-limit bootstrapping. A truncated episode has not really
+                # ended, so its last transition needs gamma * V(final obs) added
+                # to the reward and must then be marked terminal. Without this,
+                # GAE either propagated advantage into the NEXT episode's states
+                # (mid-rollout, because the env auto-resets) or dropped the
+                # continuation value entirely (at a rollout boundary, where
+                # next_done already included truncation). Both were happening,
+                # in opposite directions. It matters more the shorter episodes
+                # get, which is the direction stall_patience pushes.
+                boot = getattr(base_env, '_boot_mask', None)
+                final_stacked = getattr(env, '_final_stacked', None)
+                if boot is not None and final_stacked is not None and boot.any():
+                    v_final = agent.value_of(final_stacked)
+                    reward = reward.copy()
+                    reward[boot] += args.gamma * v_final[boot]
+                    n_bootstrapped += int(boot.sum())
+
+                # Truncation counts as terminal HERE because its continuation
+                # value is now carried by the reward above.
+                agent.store_transition(step, obs, executed, log_prob, reward,
+                                       done | truncated, value, fresh)
 
                 # A reset invalidates the latch: the state the action was chosen
                 # for is gone, and under the curriculum the agent may have been
@@ -711,6 +731,9 @@ def main():
                 if action_hold is not None:
                     for k, v in action_hold.stats().items():
                         writer.add_scalar(k, v, global_step)
+                writer.add_scalar("charts/bootstrapped_truncations",
+                                  n_bootstrapped / max(1, args.num_steps * args.num_envs),
+                                  global_step)
 
                 # Headline metrics: finish rate, progress percentiles, death heatmap
                 if tracker is not None:

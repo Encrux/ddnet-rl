@@ -893,6 +893,16 @@ class PPOAgent:
                 value.squeeze(-1).cpu().numpy()
             )
 
+    @torch.no_grad()
+    def value_of(self, obs: Union[np.ndarray, Dict[str, np.ndarray]]) -> np.ndarray:
+        """Critic value for an arbitrary observation batch.
+
+        Used for time-limit bootstrapping: a truncated episode's remaining
+        return is gamma * V(final observation), which has to be folded into the
+        reward because the env has already auto-reset by the time we see it.
+        """
+        return self.critic(self._obs_to_tensor(obs)).squeeze(-1).cpu().numpy()
+
     def store_transition(
         self,
         step: int,
