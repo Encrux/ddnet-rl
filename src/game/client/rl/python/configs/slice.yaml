@@ -32,6 +32,23 @@ frame_skip: 3
 #
 # Do NOT lower finish_progress below current p50 (~0.024) to make it fit — that
 # just measures an already-solved slice.
+#
+# THE RULE APPLIES TO CLI OVERRIDES TOO. It was violated for a whole day of runs:
+# `--finish-progress 0.50 --max-episode-steps 1200` needs 1560 steps AT GHOST
+# PACE and ~2600 at the agent's actual pace, so a from-start episode was
+# truncated at 0.385 progress no matter how well the policy played. Consequences:
+#
+#   * episodes/finish_rate_from_start was structurally pinned at 0.00%, which
+#     read as a hard problem rather than an unreachable target;
+#   * progress/p50_from_start saturated — the ghost-pace ceiling is 0.3847 and
+#     the control sat at 0.3605, i.e. 93.7% of it, so every comparison drawn on
+#     that metric was inside the top ~7% of its range;
+#   * from-start episodes were cut off BEFORE the obstacle at 0.4557, so the
+#     from-start policy never once encountered the thing it was failing at.
+#
+# Quick check: ghost-pace ceiling = 598 * max_episode_steps * frame_skip / 50
+#              / 111928. If that is below finish_progress, the finish is
+#              unreachable and the run cannot answer the question being asked.
 finish_progress: 0.05
 max_episode_steps: 800
 

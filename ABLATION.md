@@ -82,6 +82,53 @@ Go-Explore cells are reachable *and resumable*; a rare cell here is often a tee
 mid-fall into a freeze. Now `visits**+0.5`, measured live at 30.5% hooked, with
 a water-filled per-variant cap as a backstop.
 
+## 5b. The wall, actually broken (H1, H2)
+
+The archive was already recording the rare episodes that clear the wall, and the
+sampler was discarding them. `CaptureSnapshot` has no upper bound, so a crossing
+leaves a snapshot at bin 92+; but the sampler used `hi = exploration_edge`, whose
+floor no rarely-visited bin can clear. Never offered, so never accumulates
+visits, so never becomes the edge, so never offered — self-limiting, the same
+shape as the dwell-estimator loop fixed in `f0fc15377`.
+
+Fixed by running the window to the furthest bin that HAS a snapshot and reserving
+`frontier_share` (0.3) of restores for bins beyond the bulk edge. A fixed share,
+not a weight: a bin-93 cell with 20 visits scores 4.5 at beta 0.5 against 224 for
+a bin-85 cell with 50,000, so weighting alone gives them 0.00% of restores.
+
+| | prior 7 runs | H1 | H2 |
+|---|---|---|---|
+| `stall/exploration_edge` | 0.4550 (all 7) | **0.4694** | **0.4650** |
+| `episodes/finish_rate` | 0.00% (all 7) | **24.70%** | **11.00%** |
+| peak progress | <= 0.4685 | 0.5048 | 0.5009 |
+
+2/2 against 0/7, on a bulk-policy metric that no single episode can move. H1's
+trace shows the mechanism directly: stalled at the wall from 22M like every other
+run, one crossing at 32.5M, then edge 0.4550 -> 0.4700 and finish rate compounding
+0.05% -> 1.2% -> 14% -> 24.7% within 3M steps.
+
+This is the directed version of the rarity weighting that failed in §5. "Rare"
+alone selects tees mid-fall into a freeze; "rare AND past the frontier" can only
+select achievements.
+
+**Retracted:** H1's `p50_from_start` of 0.212 was reported as the Go-Explore
+chaining cost of this change. H2 came in at 0.3241, in line with the controls. It
+was seed variance.
+
+## 5c. The episode cap invalidated the from-start metrics
+
+`--finish-progress 0.50 --max-episode-steps 1200` needs **1560 steps at ghost
+pace**. So for every run above:
+
+- `finish_rate_from_start` was pinned at 0.00% by arithmetic, not difficulty;
+- `p50_from_start` saturated — ceiling 0.3847, control at 0.3605, i.e. **93.7%**
+  of it, so every comparison drawn on it sat in the top ~7% of its range;
+- from-start episodes were truncated at 0.3847, **before the obstacle at 0.4557**,
+  so the from-start policy never once reached the thing it was failing at.
+
+The sizing rule was already in `configs/slice.yaml`; it was not re-derived when
+CLI overrides moved the slice from 0.05 to 0.50. It applies to overrides too.
+
 ## 6. Where this leaves the wall
 
 Exploration pressure does not solve it. Crossings happen occasionally and never
@@ -89,13 +136,16 @@ consolidate into the bulk policy, and the one change that manufactured more
 commitment (G) made everything worse because blind execution is expensive
 everywhere else on the map.
 
-That argues for removing the need to *discover* the maneuver at all:
-**seed the archive from ghost states past 0.4557** (Salimans & Chen 2018,
-reset-from-demonstration). It assumes only that a human *was* there, not that
-they were good, so it survives the objection that the ghost is not optimal. All
-the machinery now exists — the archive stores `CSaveTee` snapshots, cells can
-hold hooked states without them being overwritten, and `ghost_parser.py` already
-decodes position, velocity and hook state.
+Superseded by §5b: replaying the agent's OWN rare crossings works and needs no
+demonstration. Ghost seeding (Salimans & Chen 2018) drops to a fallback for
+obstacles the agent never clears even once — self-seeding has nothing to
+bootstrap from there. The machinery is in place either way: the archive stores
+`CSaveTee` snapshots, cells hold hooked states without being overwritten, and
+`ghost_parser.py` already decodes position, velocity and hook state.
+
+Next binding constraint is chaining: `finish_rate_from_start` is 0.00% in every
+run, but §5c shows that was structurally unreachable, so it has never actually
+been measured.
 
 The honest caveat for whatever comes next: at n=1 per arm and 65 minutes per run,
 this design can only detect large effects. The crossing rate needs several
