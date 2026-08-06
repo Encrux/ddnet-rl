@@ -158,6 +158,43 @@ from-start reach.
 Across all four frontier-share runs the exploration edge moved (0.4694, 0.4650,
 0.4694, 0.4700) against 0.4550 in all seven runs without it — 4/4 vs 0/7.
 
+## 5e. Episode length is a two-sided trade (J, K)
+
+Splitting the cap by episode type was meant to take H's finish rate and I's
+from-start reach together. Two attempts:
+
+| run | config | edge | p50_from_start | finish |
+|---|---|---|---|---|
+| J1 | split caps, patience on ALL episodes | 0.4600 | 0.1953 | 0.00% |
+| K1 | split caps, patience on RESTORED only | 0.4550 | **0.4524** | 0.00% |
+
+**J1 was a plumbing error, not a design failure.** Applying stall patience to
+from-start episodes killed them at the first place they stalled -- somewhere
+early in the map, not at the frontier -- so they never traversed anything.
+Median from-start progress hit 0.0556 at 20M against 0.21-0.31 for every other
+config, and the run ended worse than BOTH configs it was meant to combine.
+Fixed by gating patience on `~_episode_from_start`; `test_episode_caps.py` now
+asserts that idle from-start episodes ignore patience entirely.
+
+**K1 held the from-start column and ran out of budget on the other.** Its
+p50_from_start of 0.4524 sits alongside I1/I2 (0.4518/0.4568), so the split works.
+But it reached the wall at 29.9M leaving only 10.1M steps there, and H1's
+crossing came 11.7M steps AFTER arriving. It never got enough time at the wall.
+
+The slowness is arithmetic. With begin_bias 0.2, one episode in five starts from
+the map beginning and those are now 3-4x longer than restored ones, so from-start
+practice consumes ~55% of the step budget:
+
+    0.2*2000 / (0.2*2000 + 0.8*400) ~= 0.55
+
+That is the direct price of the long from-start cap: the frontier gets about
+half the compute it had under the uniform 1200 cap, and arrives ~1.4x slower at
+every milestone (0.30 at 15.6M vs H1's 13.0M, wall at 29.9M vs 20.8M).
+
+Two levers if 60M is not enough: lower begin_bias to ~0.1 (same episode
+structure, more compute at the frontier), or accept that these two goals need
+separate runs.
+
 ## 6. Where this leaves the wall
 
 Exploration pressure does not solve it. Crossings happen occasionally and never
