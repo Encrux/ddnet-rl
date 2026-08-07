@@ -33,6 +33,18 @@ constexpr int TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT; // 1333
 // sub-tile guidance and a sense of where the route goes well beyond its 43x31
 // tile view — which a fixed stride could not do in the same budget.
 constexpr int NUM_LOOKAHEAD = 8;
+
+// Hook reachability probes, one per aim sector (must match AIM_SECTORS in
+// teeworlds_server_env.py so each value lines up with a choice of the aim head).
+//
+// This is the information DDNet shows human players as the red/green aim line.
+// The client computes it in CPlayers::RenderHookCollLine, but that is rendering
+// code -- render positions, interpolation, graphics items -- and unreachable
+// from the server, so the march is ported into the bot manager instead. It
+// shares IntersectLineTeleHook with the real hook, so it agrees with the physics
+// by construction, including teleporters and the diagonal block-gap case where
+// a hook aimed "into" no-hook tiles actually reaches a hookable through the gap.
+constexpr int NUM_AIM_SECTORS = 16;
 constexpr int LOOKAHEAD_OFFSETS[NUM_LOOKAHEAD] = {1, 2, 4, 8, 16, 32, 64, 128};
 
 // ============================================================================
@@ -142,13 +154,20 @@ struct SStructuredObservation
 	// (x, y) pairs keeps its shape.
 	float m_MaxProgress;
 
-	// Padding for alignment (3 bytes to reach 1456 total)
+	// Per-sector hook reachability. 0 = a hook fired that way would NOT grab
+	// (nothing in range, or it hits TILE_NOHOOK). Otherwise in (0, 1], larger
+	// when the grab point is closer. The semantic tile grid already shows WHERE
+	// hookable tiles are; what it cannot cheaply express is line-of-sight along
+	// a direction, which is exactly what fails at a diagonal gap.
+	float m_aHookReach[NUM_AIM_SECTORS];
+
+	// Padding for alignment (3 bytes to reach 1520 total)
 	uint8_t m_Reserved3[3];
 };
 #pragma pack(pop)
 
-// Size: 8 + 36 + 1333 + 4 + 4 + 64 + 4 + 3 = 1456 bytes
-static_assert(sizeof(SStructuredObservation) == 1456, "SStructuredObservation must be 1456 bytes");
+// Size: 8 + 36 + 1333 + 4 + 4 + 64 + 4 + 64 + 3 = 1520 bytes
+static_assert(sizeof(SStructuredObservation) == 1520, "SStructuredObservation must be 1520 bytes");
 
 // ============================================================================
 // Action (from Python to server/client)
@@ -212,8 +231,8 @@ struct SBotData
 };
 #pragma pack(pop)
 
-// Size: 36 + 1456 + 16 = 1508 bytes
-static_assert(sizeof(SBotData) == 1508, "SBotData must be 1508 bytes");
+// Size: 36 + 1520 + 16 = 1572 bytes
+static_assert(sizeof(SBotData) == 1572, "SBotData must be 1572 bytes");
 
 // Legacy interleaved shared memory layout (kept for reference)
 // Total size: 32 + 128 * 1448 = 185,376 bytes (~181 KB)

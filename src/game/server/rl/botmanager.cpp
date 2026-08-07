@@ -512,6 +512,7 @@ void CBotManager::ExtractObservations()
 				pObs->m_Progress = State.m_LastPhi;
 				pObs->m_MaxProgress = State.m_MaxPhi;
 				FillLookahead(i, Pos, pObs);
+				FillHookReach(pChar, pObs);
 				CaptureSnapshot(i, pChar, State.m_LastPhi);
 			}
 			else
@@ -684,6 +685,83 @@ void CBotManager::FillLookahead(int BotIndex, vec2 Pos, SStructuredObservation *
 		int Idx = std::min(Base + LOOKAHEAD_OFFSETS[k], Last);
 		pObs->m_aLookaheadX[k] = m_vWaypoints[Idx].m_X - Pos.x;
 		pObs->m_aLookaheadY[k] = m_vWaypoints[Idx].m_Y - Pos.y;
+	}
+}
+
+// Would a hook fired from this tee in direction Dir grab something?
+//
+// Ported from the client's CPlayers::RenderHookCollLine, minus everything to do
+// with rendering (render positions, interpolation, graphics items, colours) and
+// minus player collisions, which do not apply to solo race. What remains is the
+// same forward march the hook itself performs: step HookFireSpeed per tick and
+// test the segment with IntersectLineTeleHook, exactly as CCharacterCore::Tick
+// does at HOOK_FLYING. Sharing that call is the point -- it means this agrees
+// with the physics by construction, including teleporters and the diagonal
+// block-gap case where a hook aimed "into" no-hook tiles reaches a hookable
+// through the gap. A tile-type heuristic would get that case wrong.
+//
+// Returns 0 for "would not grab" (nothing in range, or the line hits
+// TILE_NOHOOK, which makes the real hook retract). Otherwise (0, 1], larger when
+// the grab point is closer, so the value carries both reachability and distance.
+float CBotManager::HookReachInDirection(const CCharacterCore *pCore, vec2 Dir) const
+{
+	if(!m_pCollision || !pCore)
+		return 0.0f;
+
+	const float HookLength = pCore->m_Tuning.m_HookLength;
+	const float FireSpeed = pCore->m_Tuning.m_HookFireSpeed;
+	static const float HOOK_START_DISTANCE = CCharacterCore::PhysicalSize() * 1.5f;
+	// Same guard as the client: below this the march cannot even start.
+	if(HookLength < HOOK_START_DISTANCE || FireSpeed <= 0.0f)
+		return 0.0f;
+
+	const vec2 Base = pCore->m_Pos;
+	vec2 SegmentStart = Base + Dir * HOOK_START_DISTANCE;
+
+	// HookLength / FireSpeed steps to full extension (380/80 ~ 5 on default
+	// tuning); the +2 is slack for the start offset and the final clamp.
+	const int MaxSteps = (int)(HookLength / FireSpeed) + 2;
+	for(int Step = 0; Step < MaxSteps; Step++)
+	{
+		vec2 SegmentEnd = SegmentStart + Dir * FireSpeed;
+		if(distance(Base, SegmentEnd) > HookLength)
+			SegmentEnd = Base + normalize(SegmentEnd - Base) * HookLength;
+
+		vec2 HitPos;
+		const int Hit = m_pCollision->IntersectLineTeleHook(SegmentStart, SegmentEnd, &HitPos, nullptr, nullptr);
+		if(Hit)
+		{
+			if(Hit == TILE_NOHOOK)
+				return 0.0f;  // the real hook retracts here, so this is a wasted shot
+			// Floor at 0.05 so that 0 unambiguously means "no grab" even for a
+			// hookable found at maximum range.
+			return maximum(0.05f, 1.0f - distance(Base, HitPos) / HookLength);
+		}
+
+		if(distance(Base, SegmentEnd) >= HookLength)
+			break;
+		SegmentStart = SegmentEnd;
+	}
+	return 0.0f;
+}
+
+// One probe per aim sector, using the SAME sector centres the Python action head
+// samples from, so value k answers "what happens if the aim head picks k".
+void CBotManager::FillHookReach(CCharacter *pChar, SStructuredObservation *pObs)
+{
+	const CCharacterCore *pCore = pChar ? pChar->Core() : nullptr;
+	if(!pCore)
+	{
+		for(int k = 0; k < NUM_AIM_SECTORS; k++)
+			pObs->m_aHookReach[k] = 0.0f;
+		return;
+	}
+
+	for(int k = 0; k < NUM_AIM_SECTORS; k++)
+	{
+		// Mirrors write_actions_batch: centre = (k + 0.5) * 2pi/N - pi.
+		const float Angle = ((float)k + 0.5f) * (2.0f * pi / (float)NUM_AIM_SECTORS) - pi;
+		pObs->m_aHookReach[k] = HookReachInDirection(pCore, vec2(cosf(Angle), sinf(Angle)));
 	}
 }
 

@@ -21,6 +21,7 @@
 class CGameContext;
 class CPlayer;
 class CCharacter;
+class CCharacterCore;
 class CCollision;
 
 namespace rl {
@@ -96,6 +97,10 @@ private:
 
 	// Egocentric path lookahead written into the observation.
 	void FillLookahead(int BotIndex, vec2 Pos, SStructuredObservation *pObs);
+
+	// Per-sector hook reachability -- the red/green aim line DDNet shows humans.
+	void FillHookReach(CCharacter *pChar, SStructuredObservation *pObs);
+	float HookReachInDirection(const CCharacterCore *pCore, vec2 Dir) const;
 
 	// Spawn position for respawn
 	vec2 GetSpawnPos();

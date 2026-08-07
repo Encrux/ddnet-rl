@@ -86,7 +86,7 @@ class PPOConfig:
     tile_grid_height: int = 31   # 1.5x original (21 -> 31)
     tile_grid_width: int = 43    # 1.5x original (29 -> 43)
     player_state_dim: int = 15   # Player state features
-    checkpoint_dim: int = 18     # Nav: progress(1) + 8 lookahead (x,y) + high-water progress(1)
+    checkpoint_dim: int = 34     # progress(1) + 8 lookahead (x,y) + high-water(1) + 16 hook-reach
     cnn_channels: Tuple[int, ...] = (32, 64, 64)  # CNN channel progression
 
     # Embedding Feature Extractor (for raw tile IDs)

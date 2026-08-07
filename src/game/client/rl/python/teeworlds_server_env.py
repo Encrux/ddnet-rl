@@ -88,8 +88,8 @@ def get_shm_path(server_index: int = 0) -> str:
 # Struct sizes (must match C++ rl_protocol.h)
 HEADER_SIZE = 32        # SServerRLHeader
 ACTION_SIZE = 36        # SAction (9 x int32: direction, jump, hook, fire, aim_x, aim_y, weapon, reset, restore_slot)
-OBS_SIZE = 1456         # SStructuredObservation (tiles + player + nav + max progress)
-BOT_DATA_SIZE = 1508    # SBotData (legacy interleaved layout: 36 + 1456 + 16)
+OBS_SIZE = 1520         # SStructuredObservation (tiles + player + nav + hook reach)
+BOT_DATA_SIZE = 1572    # SBotData (legacy interleaved layout: 36 + 1520 + 16)
 
 # Navigation block: normalised progress + geometric path lookahead.
 # Replaces the old 4-feature checkpoint block, which encoded mapper-authored
@@ -140,7 +140,18 @@ VARIANT_NAMES = ('rise', 'level', 'fall', 'hook+rise', 'hook+level', 'hook+fall'
 # what ratchet shaping's potential is a function of, and without it the critic
 # cannot distinguish an agent that walked straight to a spot from one that has
 # already been further and come back.
-NAV_DIM = 1 + 2 * NUM_LOOKAHEAD + 1
+# Hook reachability, one probe per aim sector -- the red/green aim line DDNet
+# shows human players, computed server-side by the same forward march the hook
+# itself performs (see FillHookReach in botmanager.cpp). 0 means a hook fired
+# that way would not grab; larger means a closer grab point.
+#
+# The semantic tile grid already shows WHERE hookable tiles are. What it cannot
+# cheaply express is line-of-sight along a direction, which is exactly what a
+# diagonal block-gap breaks: the hook is aimed "into" no-hook tiles yet reaches a
+# hookable through the gap. Sharing IntersectLineTeleHook with the real hook
+# means these values cannot disagree with the physics.
+NUM_AIM_SECTORS = 16
+NAV_DIM = 1 + 2 * NUM_LOOKAHEAD + 1 + NUM_AIM_SECTORS
 FLAT_OBS_DIM = 15 + NAV_DIM + 49  # MLP mode: player + nav + 7x7 tile crop
 # Per-index normalisation: lookahead k sits ~64 * 2^k units ahead, so dividing by
 # its own expected magnitude keeps every feature O(1) instead of spanning 62..8000.
@@ -696,6 +707,8 @@ def _parse_flat_obs_numba(raw_arr: np.ndarray, n: int,
 
         features[i, 15] = nav_f[0]  # normalised path progress
         features[i, 16 + 2 * NUM_LOOKAHEAD] = nav_f[1 + 2 * NUM_LOOKAHEAD]  # high-water
+        for k in range(NUM_AIM_SECTORS):
+            features[i, 17 + 2 * NUM_LOOKAHEAD + k] = nav_f[2 + 2 * NUM_LOOKAHEAD + k]
         for k in range(NUM_LOOKAHEAD):
             features[i, 16 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + k] / LOOKAHEAD_SCALE[k]))
             features[i, 17 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + NUM_LOOKAHEAD + k] / LOOKAHEAD_SCALE[k]))
@@ -781,6 +794,8 @@ def _parse_cnn_obs_numba(raw_arr: np.ndarray, n: int,
 
         checkpoint[i, 0] = nav_f[0]  # normalised path progress
         checkpoint[i, 1 + 2 * NUM_LOOKAHEAD] = nav_f[1 + 2 * NUM_LOOKAHEAD]  # high-water
+        for k in range(NUM_AIM_SECTORS):
+            checkpoint[i, 2 + 2 * NUM_LOOKAHEAD + k] = nav_f[2 + 2 * NUM_LOOKAHEAD + k]
         for k in range(NUM_LOOKAHEAD):
             checkpoint[i, 1 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + k] / LOOKAHEAD_SCALE[k]))
             checkpoint[i, 2 + 2 * k] = min(4.0, max(-4.0, nav_f[1 + NUM_LOOKAHEAD + k] / LOOKAHEAD_SCALE[k]))
@@ -1232,6 +1247,8 @@ class ServerShmClient:
         checkpoint[:, 2:2 + 2 * NUM_LOOKAHEAD:2] = np.clip(
             nav_raw[:, 1 + NUM_LOOKAHEAD:1 + 2 * NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
         checkpoint[:, 1 + 2 * NUM_LOOKAHEAD] = nav_raw[:, 1 + 2 * NUM_LOOKAHEAD]
+        _hr = 2 + 2 * NUM_LOOKAHEAD
+        checkpoint[:, _hr:_hr + NUM_AIM_SECTORS] = nav_raw[:, _hr:_hr + NUM_AIM_SECTORS]
 
         # Sanitize NaN/inf
         np.nan_to_num(player_state, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -1337,6 +1354,8 @@ class ServerShmClient:
         checkpoint[:, 2:2 + 2 * NUM_LOOKAHEAD:2] = np.clip(
             nav_raw[:, 1 + NUM_LOOKAHEAD:1 + 2 * NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
         checkpoint[:, 1 + 2 * NUM_LOOKAHEAD] = nav_raw[:, 1 + 2 * NUM_LOOKAHEAD]
+        _hr = 2 + 2 * NUM_LOOKAHEAD
+        checkpoint[:, _hr:_hr + NUM_AIM_SECTORS] = nav_raw[:, _hr:_hr + NUM_AIM_SECTORS]
 
         # Sanitize NaN/inf
         np.nan_to_num(player_state, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -1433,6 +1452,8 @@ class ServerShmClient:
         checkpoint[:, 2:2 + 2 * NUM_LOOKAHEAD:2] = np.clip(
             nav_raw[:, 1 + NUM_LOOKAHEAD:1 + 2 * NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
         checkpoint[:, 1 + 2 * NUM_LOOKAHEAD] = nav_raw[:, 1 + 2 * NUM_LOOKAHEAD]
+        _hr = 2 + 2 * NUM_LOOKAHEAD
+        checkpoint[:, _hr:_hr + NUM_AIM_SECTORS] = nav_raw[:, _hr:_hr + NUM_AIM_SECTORS]
 
         # Full tile grid (31, 43) - normalized by 15
         for i in range(n):
@@ -1517,6 +1538,9 @@ class ServerShmClient:
         features[:, 17:17 + 2 * NUM_LOOKAHEAD:2] = np.clip(
             nav_raw[:, 1 + NUM_LOOKAHEAD:1 + 2 * NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
         features[:, 16 + 2 * NUM_LOOKAHEAD] = nav_raw[:, 1 + 2 * NUM_LOOKAHEAD]
+        _hr = 2 + 2 * NUM_LOOKAHEAD
+        features[:, 17 + 2 * NUM_LOOKAHEAD:17 + 2 * NUM_LOOKAHEAD + NUM_AIM_SECTORS] = \
+            nav_raw[:, _hr:_hr + NUM_AIM_SECTORS]
 
         # 7x7 center tile crop (49 features) - indices 19-67
         for ty in range(7):
@@ -1591,6 +1615,9 @@ class ServerShmClient:
         features[:, 17:17 + 2 * NUM_LOOKAHEAD:2] = np.clip(
             nav_raw[:, 1 + NUM_LOOKAHEAD:1 + 2 * NUM_LOOKAHEAD] / LOOKAHEAD_SCALE, -4.0, 4.0)
         features[:, 16 + 2 * NUM_LOOKAHEAD] = nav_raw[:, 1 + 2 * NUM_LOOKAHEAD]
+        _hr = 2 + 2 * NUM_LOOKAHEAD
+        features[:, 17 + 2 * NUM_LOOKAHEAD:17 + 2 * NUM_LOOKAHEAD + NUM_AIM_SECTORS] = \
+            nav_raw[:, _hr:_hr + NUM_AIM_SECTORS]
 
         # 7x7 center tile crop (49 features) - indices 19-67
         for ty in range(7):
