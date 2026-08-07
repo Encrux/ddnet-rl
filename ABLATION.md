@@ -195,6 +195,39 @@ Two levers if 60M is not enough: lower begin_bias to ~0.1 (same episode
 structure, more compute at the frontier), or accept that these two goals need
 separate runs.
 
+## 5f. The hook aim-line, and the first from-start finishes (P1)
+
+`m_HookState` was one-hot encoded over {0, 1, 2}. DDNet's enum is sparse and has
+no value 2: RETRACTED=-1 (uint8 255), IDLE=0, RETRACT_START=1, RETRACT_END=3,
+FLYING=4, GRABBED=5. So FLYING, GRABBED and RETRACTED all collapsed to the
+all-zeros vector -- measured in play, the agent could not distinguish its hook
+state 60.0% of the time, including the 41.1% it spent GRABBED. Our bug, not
+DDNet's. Fixing it alone (runs N1/N2) changed nothing measurable; the agent had
+been inferring attachment from the velocity signature.
+
+What did work was giving it the information DDNet shows humans: the red/green
+aim line, as 16 per-sector hook reachability probes aligned with the aim head.
+Ported from CPlayers::RenderHookCollLine, sharing IntersectLineTeleHook with the
+real hook so it cannot disagree with the physics -- including the diagonal
+block-gap case where a hook aimed "into" no-hook tiles still reaches a hookable.
+An observation, not a penalty on aiming at TILE_NOHOOK: no reward-hacking
+surface, and a tile-type heuristic would get the gap case wrong.
+
+| run | obs | edge | p50_from_start | peak | finish_from_start |
+|---|---|---|---|---|---|
+| I1 / I2 | hook-blind | 0.4694 / 0.4700 | 0.4518 / 0.4568 | 0.4740 / 0.4740 | 0% / 0% |
+| N1 / N2 | hook fixed | 0.4550 / 0.4550 | 0.4519 / 0.3818 | 0.4729 / 0.4557 | 0% / 0% |
+| **P1** | **+ aim line** | **0.4763** | **0.4586** | **0.5050** | **21.27%** |
+
+Four consecutive 3000-cap runs capped at 0.4729-0.4740, which looked like a
+second wall. P1 broke it at 36.4M and the trace shows the transition directly:
+0.4731 x4, then 0.5003, 0.5031 x4, 0.5050. Overall finish rate 89.95%.
+
+**`episodes/finish_rate_from_start` had been 0.0000 in every run of the project.**
+Confirmed in-game by the user: the agent visibly clears the obstacle now.
+
+Cost: FPS 10.8k -> 7.9k for 16 marches per bot per decision.
+
 ## 6. Where this leaves the wall
 
 Exploration pressure does not solve it. Crossings happen occasionally and never
