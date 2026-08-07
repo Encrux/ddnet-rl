@@ -101,6 +101,22 @@ AIM_RADIUS = 200.0  # arbitrary; only the direction of (aim_x, aim_y) is used
 
 NUM_LOOKAHEAD = 8
 
+# DDNet hook states (game/gamecore.h). The enum is SPARSE -- there is no value 2
+# -- and m_HookState is transmitted as uint8, so RETRACTED (-1) arrives as 255.
+#
+# This cost the project dearly. The observation used to one-hot over {0, 1, 2},
+# which assumed a contiguous three-value range DDNet never had: one slot encoded
+# a state that cannot occur, while FLYING, GRABBED and RETRACTED all collapsed to
+# the all-zeros vector. Measured in play, the agent could not distinguish its
+# hook state 60.0% of the time, including the 41.1% it spent GRABBED -- the exact
+# bit every hook maneuver depends on. The bug is ours; the upstream enum is fine.
+HOOK_IDLE = 0
+HOOK_RETRACT_START = 1
+HOOK_RETRACT_END = 3
+HOOK_FLYING = 4
+HOOK_GRABBED = 5
+HOOK_RETRACTED = 255  # -1 as uint8
+
 # Diagnostics tuning. STUCK_DIST is displacement summed over STUCK_WINDOW steps;
 # below it the tee is genuinely not moving, as opposed to moving without gaining
 # arc-length progress.
@@ -662,9 +678,13 @@ def _parse_flat_obs_numba(raw_arr: np.ndarray, n: int,
         features[i, 4] = float(can_hook)
         features[i, 5] = float(direction)
         features[i, 6] = float(is_frozen)
-        features[i, 7] = 1.0 if hook_state == 0 else 0.0
-        features[i, 8] = 1.0 if hook_state == 1 else 0.0
-        features[i, 9] = 1.0 if hook_state == 2 else 0.0
+        # 3-way partition: every hook state maps to exactly one slot.
+
+        features[i, 7] = 0.0 if (hook_state == 4 or hook_state == 5) else 1.0
+
+        features[i, 8] = 1.0 if hook_state == 4 else 0.0
+
+        features[i, 9] = 1.0 if hook_state == 5 else 0.0
         features[i, 10] = 0.0  # aim placeholder
         features[i, 11] = 0.0  # aim placeholder
         features[i, 12] = float(health) / 10.0
@@ -743,9 +763,13 @@ def _parse_cnn_obs_numba(raw_arr: np.ndarray, n: int,
         player_state[i, 4] = float(can_hook)
         player_state[i, 5] = float(direction)
         player_state[i, 6] = float(is_frozen)
-        player_state[i, 7] = 1.0 if hook_state == 0 else 0.0
-        player_state[i, 8] = 1.0 if hook_state == 1 else 0.0
-        player_state[i, 9] = 1.0 if hook_state == 2 else 0.0
+        # 3-way partition: every hook state maps to exactly one slot.
+
+        player_state[i, 7] = 0.0 if (hook_state == 4 or hook_state == 5) else 1.0
+
+        player_state[i, 8] = 1.0 if hook_state == 4 else 0.0
+
+        player_state[i, 9] = 1.0 if hook_state == 5 else 0.0
         player_state[i, 10] = 0.0  # aim placeholder
         player_state[i, 11] = 0.0  # aim placeholder
         player_state[i, 12] = float(health) / 10.0
@@ -812,9 +836,13 @@ def _parse_flat_obs_contiguous_numba(obs_arr: np.ndarray, n: int,
         features[i, 4] = float(can_hook)
         features[i, 5] = float(direction)
         features[i, 6] = float(is_frozen)
-        features[i, 7] = 1.0 if hook_state == 0 else 0.0
-        features[i, 8] = 1.0 if hook_state == 1 else 0.0
-        features[i, 9] = 1.0 if hook_state == 2 else 0.0
+        # 3-way partition: every hook state maps to exactly one slot.
+
+        features[i, 7] = 0.0 if (hook_state == 4 or hook_state == 5) else 1.0
+
+        features[i, 8] = 1.0 if hook_state == 4 else 0.0
+
+        features[i, 9] = 1.0 if hook_state == 5 else 0.0
         features[i, 10] = 0.0  # aim placeholder
         features[i, 11] = 0.0  # aim placeholder
         features[i, 12] = float(health) / 10.0
@@ -1175,9 +1203,17 @@ class ServerShmClient:
         player_state[:, 4] = can_hook
         player_state[:, 5] = direction
         player_state[:, 6] = is_frozen
-        player_state[:, 7] = (hook_state == 0).astype(np.float32)
-        player_state[:, 8] = (hook_state == 1).astype(np.float32)
-        player_state[:, 9] = (hook_state == 2).astype(np.float32)
+        # 3-way partition: every hook state maps to exactly one slot.
+
+        _hooked = (hook_state == HOOK_GRABBED)
+
+        _flying = (hook_state == HOOK_FLYING)
+
+        player_state[:, 7] = (~(_hooked | _flying)).astype(np.float32)
+
+        player_state[:, 8] = _flying.astype(np.float32)
+
+        player_state[:, 9] = _hooked.astype(np.float32)
         player_state[:, 10] = 0.0
         player_state[:, 11] = 0.0
         player_state[:, 12] = health / 10.0
@@ -1272,9 +1308,17 @@ class ServerShmClient:
         player_state[:, 4] = can_hook
         player_state[:, 5] = direction
         player_state[:, 6] = is_frozen
-        player_state[:, 7] = (hook_state == 0).astype(np.float32)
-        player_state[:, 8] = (hook_state == 1).astype(np.float32)
-        player_state[:, 9] = (hook_state == 2).astype(np.float32)
+        # 3-way partition: every hook state maps to exactly one slot.
+
+        _hooked = (hook_state == HOOK_GRABBED)
+
+        _flying = (hook_state == HOOK_FLYING)
+
+        player_state[:, 7] = (~(_hooked | _flying)).astype(np.float32)
+
+        player_state[:, 8] = _flying.astype(np.float32)
+
+        player_state[:, 9] = _hooked.astype(np.float32)
         player_state[:, 10] = 0.0
         player_state[:, 11] = 0.0
         player_state[:, 12] = health / 10.0
@@ -1361,9 +1405,17 @@ class ServerShmClient:
         player_state[:, 4] = can_hook
         player_state[:, 5] = direction
         player_state[:, 6] = is_frozen
-        player_state[:, 7] = (hook_state == 0).astype(np.float32)
-        player_state[:, 8] = (hook_state == 1).astype(np.float32)
-        player_state[:, 9] = (hook_state == 2).astype(np.float32)
+        # 3-way partition: every hook state maps to exactly one slot.
+
+        _hooked = (hook_state == HOOK_GRABBED)
+
+        _flying = (hook_state == HOOK_FLYING)
+
+        player_state[:, 7] = (~(_hooked | _flying)).astype(np.float32)
+
+        player_state[:, 8] = _flying.astype(np.float32)
+
+        player_state[:, 9] = _hooked.astype(np.float32)
         player_state[:, 10] = 0.0  # aim placeholder
         player_state[:, 11] = 0.0  # aim placeholder
         player_state[:, 12] = health / 10.0
@@ -1437,9 +1489,17 @@ class ServerShmClient:
         features[:, 4] = can_hook
         features[:, 5] = direction
         features[:, 6] = is_frozen
-        features[:, 7] = (hook_state == 0).astype(np.float32)
-        features[:, 8] = (hook_state == 1).astype(np.float32)
-        features[:, 9] = (hook_state == 2).astype(np.float32)
+        # 3-way partition: every hook state maps to exactly one slot.
+
+        _hooked = (hook_state == HOOK_GRABBED)
+
+        _flying = (hook_state == HOOK_FLYING)
+
+        features[:, 7] = (~(_hooked | _flying)).astype(np.float32)
+
+        features[:, 8] = _flying.astype(np.float32)
+
+        features[:, 9] = _hooked.astype(np.float32)
         features[:, 10] = 0.0
         features[:, 11] = 0.0
         features[:, 12] = health / 10.0
@@ -1505,9 +1565,17 @@ class ServerShmClient:
         features[:, 4] = can_hook
         features[:, 5] = direction
         features[:, 6] = is_frozen
-        features[:, 7] = (hook_state == 0).astype(np.float32)
-        features[:, 8] = (hook_state == 1).astype(np.float32)
-        features[:, 9] = (hook_state == 2).astype(np.float32)
+        # 3-way partition: every hook state maps to exactly one slot.
+
+        _hooked = (hook_state == HOOK_GRABBED)
+
+        _flying = (hook_state == HOOK_FLYING)
+
+        features[:, 7] = (~(_hooked | _flying)).astype(np.float32)
+
+        features[:, 8] = _flying.astype(np.float32)
+
+        features[:, 9] = _hooked.astype(np.float32)
         features[:, 10] = 0.0
         features[:, 11] = 0.0
         features[:, 12] = health / 10.0
