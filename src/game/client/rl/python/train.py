@@ -531,7 +531,32 @@ def main():
             tracker = EpisodeTracker(base_env.path_progress.bounds)
             print(f"Metrics: {tracker}")
 
-        for update in range(1, num_updates + 1):
+        # Run only the updates REMAINING against the cumulative target.
+        #
+        # This used to be `range(1, num_updates + 1)` regardless of where the run
+        # resumed, while the LR anneal treats `starting_update + update` as a
+        # position within that same span. The two are inconsistent, and resuming
+        # made it bite: a resume at update 2472 with num_updates 4921 ran the
+        # full 4921 updates and hit frac = 0 at update 2449 -- HALF the run at
+        # zero learning rate. Resuming a second time made starting_update exceed
+        # num_updates, so frac clamped to 0 immediately and the entire run
+        # trained at zero LR while looking completely healthy in the logs.
+        #
+        # --total-timesteps is therefore the CUMULATIVE target, not the number of
+        # new steps to add.
+        remaining_updates = num_updates - starting_update
+        if remaining_updates <= 0:
+            print(f"\nERROR: --total-timesteps {args.total_timesteps:,} is already "
+                  f"reached by this checkpoint ({global_step:,} steps).")
+            print("It is CUMULATIVE, not additional. Nothing to train; exiting.")
+            return
+        if args.resume:
+            print(f"Resuming at update {starting_update:,} of {num_updates:,}; "
+                  f"{remaining_updates:,} to go "
+                  f"({remaining_updates * batch_size / 1e6:.1f}M steps), "
+                  f"LR starts at {(1.0 - starting_update / num_updates) * args.learning_rate:.2e}")
+
+        for update in range(1, remaining_updates + 1):
             rollout_start = time.time()
 
             # Anneal learning rate (linear decay) - use global update count for resuming
