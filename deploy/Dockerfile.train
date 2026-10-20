@@ -32,7 +32,9 @@ RUN mkdir build && cd build \
     && ninja DDNet-Server
 
 # Stage 2: Runtime image with CUDA + Python
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+# devel image needed: Triton JIT-compiles CUDA kernels at runtime, requiring
+# gcc, libc headers, and libcuda stubs (none of which are in the runtime image)
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -69,7 +71,7 @@ COPY src/game/client/rl/python/ src/game/client/rl/python/
 
 # Copy deploy scripts
 COPY deploy/train.sh deploy/train.sh
-RUN chmod +x deploy/train.sh
+RUN sed -i 's/\r$//' deploy/train.sh && chmod +x deploy/train.sh
 
 # Ensure server binary is executable
 RUN chmod +x build/DDNet-Server
