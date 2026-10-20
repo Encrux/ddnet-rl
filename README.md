@@ -172,7 +172,9 @@ Other things you will want:
 # Add --window for an interactive OpenCV view you can drive with a/d/space.
 uv run python visualize_obs.py --num-bots 1
 
-# Evaluate a checkpoint from the map start, which is the number that matters
+# Evaluate a checkpoint from the map start, which is the number that matters.
+# It builds the network with --semantic-tiles and --action-hold on and has no
+# way to turn them off, so it only loads checkpoints trained with both.
 uv run python eval_from_start.py runs/<run>/checkpoint_final.pt
 
 # Generate waypoints for a new map, from a human replay or from the map itself
@@ -181,7 +183,9 @@ uv sync --extra maps   # map_pathfinder.py needs twmap to read .map files
 uv run python map_pathfinder.py path/to/MyMap.map --output ghosts/MyMap.waypoints.json
 ```
 
-Training writes TensorBoard logs and checkpoints to `runs/<name>/`.
+Training writes TensorBoard logs and checkpoints to `runs/<name>/`, resolved against the
+directory you launched from — so `./deploy/train.sh` at the repo root and `train.py` from the
+Python directory write to two different `runs/`.
 
 The RL-specific server settings are console variables, and **order matters** — `sv_rl_bots` must
 be issued before the others, which silently no-op without an active bot manager:
