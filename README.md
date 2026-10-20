@@ -28,8 +28,9 @@ single run and the replicate is still pending. Notably, fixing the hook-state en
 changed nothing measurable — the agent had been inferring hook attachment from its velocity
 signature. What it lacked was line-of-sight along a direction.
 
-Generalising across maps is **not** solved. See [`roadmap.md`](roadmap.md) for what is currently
-believed to be wrong, and [`ABLATION.md`](ABLATION.md) for the measurements — including three
+Generalising across maps is **not** solved. See [`docs/research/roadmap.md`](docs/research/roadmap.md)
+for what is currently believed to be wrong, and
+[`docs/research/ABLATION.md`](docs/research/ABLATION.md) for the measurements — including three
 claims that were later retracted.
 
 ## How it works
@@ -192,7 +193,7 @@ src/game/client/rl/python/   training, environment and tooling (Python)
   ghost_parser.py            .gho ghost replay decoder
   map_pathfinder.py          tile-level BFS pathfinder
 deploy/train.sh              hardware-aware launcher
-roadmap.md  ABLATION.md      current diagnosis, and the measurements behind it
+docs/research/               the research journal: roadmap, plan, ablations, run notes
 ```
 
 `observation.py` and `rl_protocol.h` describe the same bytes. If they disagree, observations are

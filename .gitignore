@@ -153,3 +153,10 @@ deps/
 *.pt
 *.pth
 waypoints_vis.png
+
+# Keep the research journal tracked. Upstream ignores docs/ wholesale, and git
+# never descends into an excluded directory, so docs/ has to be re-included
+# before anything inside it can be.
+!docs/
+docs/*
+!docs/research/
