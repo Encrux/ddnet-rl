@@ -56,7 +56,8 @@ Why this shape:
 - **Shared memory, not sockets.** No serialisation, no syscall per step.
 - **Inference in Python, not C++.** An earlier attempt ran ONNX Runtime inside the server. The
   policy collapsed to a constant action and debugging it in C++ was painful, so inference moved
-  out. That branch is kept as history, not as a build target.
+  out. It is kept as history under the `archive/cpp-inference-integration` tag, not as a build
+  target.
 - **Frame skip.** The agent acts every 3rd tick at `sv_tickrate 50`, i.e. ~17 decisions/second,
   with reward accumulating in between.
 

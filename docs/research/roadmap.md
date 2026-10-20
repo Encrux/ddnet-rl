@@ -1,6 +1,6 @@
 # DDNet RL — Holistic Review and Roadmap
 
-*Written 2026-08-03, after reviewing the `checkpoint-respawn` branch.*
+*Written 2026-08-03, after reviewing the `checkpoint-respawn` branch (since renamed `main`).*
 
 *Part 1 is a snapshot of that date, kept for its reasoning. Where an item has since been built,
 the section carries a dated **Status** note rather than being rewritten — so the diagnosis and
