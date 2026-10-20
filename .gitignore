@@ -143,3 +143,13 @@ tags
 *.user
 *.vcxproj
 *.zip
+
+# RL training artifacts
+runs/
+models/
+backups/
+deps/
+*.onnx
+*.pt
+*.pth
+waypoints_vis.png
