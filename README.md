@@ -175,8 +175,9 @@ uv run python visualize_obs.py --num-bots 1
 # Evaluate a checkpoint from the map start, which is the number that matters
 uv run python eval_from_start.py runs/<run>/checkpoint_final.pt
 
-# Generate waypoints for a new map
+# Generate waypoints for a new map, from a human replay or from the map itself
 uv run python ghost_parser.py path/to/replay.gho --output ghosts/MyMap.waypoints.json
+uv sync --extra maps   # map_pathfinder.py needs twmap to read .map files
 uv run python map_pathfinder.py path/to/MyMap.map --output ghosts/MyMap.waypoints.json
 ```
 

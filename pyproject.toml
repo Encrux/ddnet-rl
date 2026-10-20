@@ -11,6 +11,12 @@ dependencies = [
     "Pillow>=10.0.0",
 ]
 
+[project.optional-dependencies]
+# Only map_pathfinder.py needs this: it parses a .map file directly. Everything
+# else, training included, works without it, so it stays out of the default
+# install. Enable with `uv sync --extra maps`.
+maps = ["twmap>=0.6"]
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu124" }
 
