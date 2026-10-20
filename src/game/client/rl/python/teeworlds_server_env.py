@@ -1062,20 +1062,23 @@ class ServerShmClient:
         self.shm_mmap.write(self._action_buffer[:n].tobytes())
 
     def read_observation(self, bot_index: int) -> Tuple[Optional[StructuredObservation], float, bool]:
-        """Read observation, reward, and done flag for a specific bot."""
+        """One bot's observation as an object, for tooling rather than training.
+
+        The training path never comes through here -- it uses the batch readers
+        below, which parse the same bytes straight into numpy. This exists so
+        visualize_obs.py and anything else inspecting a single observation goes
+        through the one definition of the layout, observation.py.
+        """
         if not self._connected or bot_index >= self.num_bots:
             return None, 0.0, True
 
-        offset = self._get_bot_data_offset(bot_index)
-
-        # Skip action (32 bytes) to get to observation
-        obs_offset = offset + ACTION_SIZE
-        self.shm_mmap.seek(obs_offset)
+        self.shm_mmap.seek(CONTIGUOUS_OBS_OFFSET + bot_index * OBS_SIZE)
         obs_data = self.shm_mmap.read(OBS_SIZE)
 
-        # Read reward, done, truncated after observation
-        self.shm_mmap.seek(obs_offset + OBS_SIZE)
-        reward, done, truncated, bot_client_id = struct.unpack('<fiii', self.shm_mmap.read(16))
+        self.shm_mmap.seek(CONTIGUOUS_REWARDS_OFFSET + bot_index * 4)
+        reward, = struct.unpack('<f', self.shm_mmap.read(4))
+        self.shm_mmap.seek(CONTIGUOUS_DONES_OFFSET + bot_index * 4)
+        done, = struct.unpack('<i', self.shm_mmap.read(4))
 
         try:
             obs = StructuredObservation.from_bytes(obs_data)
@@ -2112,30 +2115,6 @@ class TeeWorldsServerEnv:
                 all_observations.append(observations)
             return np.vstack(all_observations), {}  # (total_bots, FLAT_OBS_DIM)
 
-    def _observations_to_dict(self, observations: List[Optional[StructuredObservation]]) -> Dict[str, np.ndarray]:
-        """Convert list of observations to batched dict format for CNN."""
-        tiles_list = []
-        player_state_list = []
-        checkpoint_list = []
-
-        for obs in observations:
-            if obs is not None:
-                d = obs.to_dict_observation()
-                tiles_list.append(d['tiles'])
-                player_state_list.append(d['player_state'])
-                checkpoint_list.append(d['checkpoint'])
-            else:
-                # Zero observations for missing
-                tiles_list.append(np.zeros((1, TILE_GRID_HEIGHT, TILE_GRID_WIDTH), dtype=np.float32))
-                player_state_list.append(np.zeros(15, dtype=np.float32))
-                checkpoint_list.append(np.zeros(NAV_DIM, dtype=np.float32))
-
-        return {
-            'tiles': np.array(tiles_list, dtype=np.float32),
-            'player_state': np.array(player_state_list, dtype=np.float32),
-            'checkpoint': np.array(checkpoint_list, dtype=np.float32),
-        }
-
     def _write_server_actions(self, server_idx: int, actions: Dict[str, np.ndarray]):
         """Write actions to one server (runs in thread)."""
         shm_client = self.shm_clients[server_idx]
@@ -2547,47 +2526,6 @@ class TeeWorldsServerEnv:
                     for local_i in np.where(server_mask)[0]:
                         global_i = start_idx + local_i
                         observations[global_i] = fresh_obs[local_i]
-
-        # Reset counters for masked environments
-        for i in np.where(mask)[0]:
-            self.episode_steps[i] = 0
-            self.episode_rewards[i] = 0.0
-
-    def _reset_envs_observations(self, mask: np.ndarray, observations: List[Optional[StructuredObservation]]):
-        """Reset specific environments and update observations in place (legacy version)."""
-        # Split mask across servers and send reset for masked environments
-        for server_idx, shm_client in enumerate(self.shm_clients):
-            start_idx = server_idx * self.num_bots_per_server
-            end_idx = start_idx + self.num_bots_per_server
-            server_mask = mask[start_idx:end_idx]
-
-            if not np.any(server_mask):
-                continue
-
-            reset_actions = {
-                'discrete': np.zeros((self.num_bots_per_server, 4), dtype=np.int32),
-                'continuous': np.zeros((self.num_bots_per_server, 1), dtype=np.float32),
-                'reset': server_mask.astype(np.int32),
-            }
-            shm_client.write_actions_batch(reset_actions)
-            shm_client.signal_actions_ready()
-
-        # Wait for servers to process reset and return fresh observations
-        for server_idx, shm_client in enumerate(self.shm_clients):
-            start_idx = server_idx * self.num_bots_per_server
-            end_idx = start_idx + self.num_bots_per_server
-            server_mask = mask[start_idx:end_idx]
-
-            if not np.any(server_mask):
-                continue
-
-            if shm_client.wait_for_observations(timeout=0.1):
-                # Update observations for reset environments with fresh post-reset state
-                for local_i in np.where(server_mask)[0]:
-                    global_i = start_idx + local_i
-                    obs, reward, done = shm_client.read_observation(local_i)
-                    if obs:
-                        observations[global_i] = obs
 
         # Reset counters for masked environments
         for i in np.where(mask)[0]:

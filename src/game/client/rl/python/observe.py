@@ -1,85 +1,38 @@
 #!/usr/bin/env python3
-"""
-Observation Space Observer
+"""Attach to a running RL server and print one bot's observation.
 
-Connects to a running DDNet-Server with RL bots and displays the observation
-space for a specified bot index. Useful for debugging and understanding what
-the agent sees.
+Read-only and passive: it writes no actions and takes part in no handshake, so
+it is safe to point at a live training server. Use visualize_obs.py instead when
+you want it to start its own server, or want the interactive window.
+
+Both tools parse the shared memory through observation.py, which is the only
+Python definition of the layout -- an observation viewer that decodes the bytes
+its own way is worse than none, because it agrees with nothing.
 
 Usage:
-    python observe.py --bot-index 0
-    python observe.py --bot-index 0 --server-index 1
-    python observe.py --bot-index 0 --continuous  # Live updates
-    python observe.py --bot-index 0 --use-embeddings  # Show raw tile IDs
+    python observe.py                        # one snapshot of bot 0, server 0
+    python observe.py -b 3 -s 1              # bot 3 on the second server
+    python observe.py --continuous           # refresh in place
 """
 
 import argparse
 import mmap
-import struct
-import time
-import numpy as np
 import os
+import struct
 import sys
+import time
 
-# Constants from teeworlds_server_env.py
-TILE_GRID_WIDTH = 43
-TILE_GRID_HEIGHT = 31
-TILE_GRID_SIZE = TILE_GRID_WIDTH * TILE_GRID_HEIGHT
-HEADER_SIZE = 32
-ACTION_SIZE = 32
-OBS_SIZE = 1400
-BOT_DATA_SIZE = 1448
-MAX_RL_BOTS = 128
-SHM_PATH_BASE = "/dev/shm/ddnet_rl_server"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Contiguous memory layout offsets (new layout used by server)
-CONTIGUOUS_ACTIONS_OFFSET = HEADER_SIZE  # 32
-CONTIGUOUS_OBS_OFFSET = CONTIGUOUS_ACTIONS_OFFSET + MAX_RL_BOTS * ACTION_SIZE  # 4128
-CONTIGUOUS_REWARDS_OFFSET = CONTIGUOUS_OBS_OFFSET + MAX_RL_BOTS * OBS_SIZE  # 183328
-CONTIGUOUS_DONES_OFFSET = CONTIGUOUS_REWARDS_OFFSET + MAX_RL_BOTS * 4  # 183840
-CONTIGUOUS_TOTAL_SIZE = CONTIGUOUS_DONES_OFFSET + MAX_RL_BOTS * 4  # 184352
-
-# Tile type names (for raw IDs - common DDNet tiles)
-TILE_NAMES = {
-    0: "AIR",
-    1: "SOLID",
-    2: "DEATH",
-    3: "NOHOOK",
-    9: "FREEZE",
-    10: "UNFREEZE",
-    16: "WALLJUMP",
-    17: "EHOOK_START",
-    18: "EHOOK_END",
-    32: "REFILL_JUMPS",
-    33: "START",
-    34: "FINISH",
-    35: "TIME_CP_1",  # Time checkpoints 35-59
-    60: "STOP",
-    61: "STOP_L",
-    62: "STOP_R",
-    63: "STOP_U",
-    64: "STOP_D",
-    # Add more as needed
-}
-
-
-def get_shm_path(server_index: int = 0) -> str:
-    if server_index == 0:
-        return SHM_PATH_BASE
-    return f"{SHM_PATH_BASE}_{server_index}"
-
-
-def get_tile_name(tile_id: int) -> str:
-    """Get human-readable name for a tile ID."""
-    if tile_id in TILE_NAMES:
-        return TILE_NAMES[tile_id]
-    if 35 <= tile_id <= 59:
-        return f"CP_{tile_id - 34}"
-    return f"T{tile_id}"
+from observation import StructuredObservation
+from teeworlds_server_env import (CONTIGUOUS_DONES_OFFSET, CONTIGUOUS_OBS_OFFSET,
+                                  CONTIGUOUS_REWARDS_OFFSET, CONTIGUOUS_SHM_SIZE,
+                                  HEADER_SIZE, OBS_SIZE, get_shm_path)
+from visualize_obs import render_terminal
 
 
 class ObservationReader:
-    """Reads observations from shared memory without controlling the server."""
+    """Reads observations out of a server's shared memory without driving it."""
 
     def __init__(self, server_index: int = 0):
         self.server_index = server_index
@@ -88,19 +41,14 @@ class ObservationReader:
         self.shm_mmap = None
 
     def connect(self) -> bool:
-        """Connect to server shared memory (read-only)."""
         if not os.path.exists(self.shm_path):
             print(f"Shared memory not found: {self.shm_path}")
-            print("Make sure the DDNet-Server is running with sv_rl_bots enabled.")
+            print("Is DDNet-Server running with sv_rl_bots enabled?")
             return False
-
-        try:
-            self.shm_file = open(self.shm_path, 'rb')
-            self.shm_mmap = mmap.mmap(self.shm_file.fileno(), CONTIGUOUS_TOTAL_SIZE, access=mmap.ACCESS_READ)
-            return True
-        except Exception as e:
-            print(f"Failed to connect: {e}")
-            return False
+        self.shm_file = open(self.shm_path, 'rb')
+        self.shm_mmap = mmap.mmap(self.shm_file.fileno(), CONTIGUOUS_SHM_SIZE,
+                                  access=mmap.ACCESS_READ)
+        return True
 
     def close(self):
         if self.shm_mmap:
@@ -109,301 +57,64 @@ class ObservationReader:
             self.shm_file.close()
 
     def read_header(self) -> dict:
-        """Read server header."""
         self.shm_mmap.seek(0)
-        data = self.shm_mmap.read(HEADER_SIZE)
-        server_ready, python_ready, shutdown, _pad1, num_bots, server_tick, _pad2a, _pad2b = struct.unpack('<iiii iiii', data)
-        return {
-            'server_ready': server_ready,
-            'python_ready': python_ready,
-            'shutdown': shutdown,
-            'num_bots': num_bots,
-            'server_tick': server_tick,
-        }
+        (server_ready, python_ready, shutdown, _paused,
+         num_bots, server_tick, _p0, _p1) = struct.unpack(
+            '<8i', self.shm_mmap.read(HEADER_SIZE))
+        return {'server_ready': server_ready, 'python_ready': python_ready,
+                'shutdown': shutdown, 'num_bots': num_bots,
+                'server_tick': server_tick}
 
-    def read_observation(self, bot_index: int, use_embeddings: bool = False) -> dict:
-        """Read observation for a specific bot using contiguous memory layout."""
-        # Contiguous layout offsets for this bot
-        action_offset = CONTIGUOUS_ACTIONS_OFFSET + bot_index * ACTION_SIZE
-        obs_offset = CONTIGUOUS_OBS_OFFSET + bot_index * OBS_SIZE
-        reward_offset = CONTIGUOUS_REWARDS_OFFSET + bot_index * 4
-        done_offset = CONTIGUOUS_DONES_OFFSET + bot_index * 4
-
-        # Offsets within observation data (SObservation struct)
-        LOCAL_PLAYER = 8  # After 2 padding ints
-        TILES = LOCAL_PLAYER + 36
-        EXTRA_STATE = TILES + 1333
-        CHECKPOINT = EXTRA_STATE + 4
-
-        # Read action data
-        self.shm_mmap.seek(action_offset)
-        action_raw = self.shm_mmap.read(ACTION_SIZE)
-        action = struct.unpack_from('<iiiiiiii', action_raw, 0)
-
-        # Read observation data
-        self.shm_mmap.seek(obs_offset)
-        obs_raw = self.shm_mmap.read(OBS_SIZE)
-
-        # Parse player floats
-        pos_x, pos_y, vel_x, vel_y = struct.unpack_from('<ffff', obs_raw, LOCAL_PLAYER)
-
-        # Parse player bytes
-        direction = struct.unpack_from('<b', obs_raw, LOCAL_PLAYER + 16)[0]
-        jumped = obs_raw[LOCAL_PLAYER + 17]
-        hook_state = obs_raw[LOCAL_PLAYER + 18]
-        is_frozen = obs_raw[LOCAL_PLAYER + 30]
-        health = obs_raw[LOCAL_PLAYER + 32]
-        armor = obs_raw[LOCAL_PLAYER + 33]
-
-        # Parse extra state
-        is_grounded = obs_raw[EXTRA_STATE]
-        jumps_remaining = obs_raw[EXTRA_STATE + 1]
-        can_hook = obs_raw[EXTRA_STATE + 2]
-
-        # Parse checkpoint
-        cp_x, cp_y = struct.unpack_from('<ff', obs_raw, CHECKPOINT)
-        cp_idx, total_cp = struct.unpack_from('<ii', obs_raw, CHECKPOINT + 8)
-
-        # Parse tiles
-        tile_raw = obs_raw[TILES:TILES + TILE_GRID_SIZE]
-        if use_embeddings:
-            tiles = np.frombuffer(tile_raw, dtype=np.uint8).reshape(TILE_GRID_HEIGHT, TILE_GRID_WIDTH).astype(np.int64)
-        else:
-            tiles = np.frombuffer(tile_raw, dtype=np.uint8).reshape(TILE_GRID_HEIGHT, TILE_GRID_WIDTH).astype(np.float32) / 15.0
-
-        # Read reward
-        self.shm_mmap.seek(reward_offset)
-        reward = struct.unpack('<f', self.shm_mmap.read(4))[0]
-
-        # Read done
-        self.shm_mmap.seek(done_offset)
-        done = struct.unpack('<i', self.shm_mmap.read(4))[0]
-
-        return {
-            'action': {
-                'direction': action[0],
-                'jump': action[1],
-                'hook': action[2],
-                'fire': action[3],
-                'aim_x': action[4],
-                'aim_y': action[5],
-                'weapon': action[6],
-                'reset': action[7],
-            },
-            'position': (pos_x, pos_y),
-            'velocity': (vel_x, vel_y),
-            'direction': direction,
-            'jumped': jumped,
-            'hook_state': hook_state,
-            'is_frozen': bool(is_frozen),
-            'health': health,
-            'armor': armor,
-            'is_grounded': bool(is_grounded),
-            'jumps_remaining': jumps_remaining,
-            'can_hook': bool(can_hook),
-            'checkpoint': {
-                'x': cp_x,
-                'y': cp_y,
-                'index': cp_idx,
-                'total': total_cp,
-                'rel_x': (cp_x - pos_x) / 2000.0 if total_cp > 0 else 0,
-                'rel_y': (cp_y - pos_y) / 2000.0 if total_cp > 0 else 0,
-            },
-            'tiles': tiles,
-            'reward': reward,
-            'done': bool(done),
-            'use_embeddings': use_embeddings,
-        }
+    def read_observation(self, bot_index: int):
+        self.shm_mmap.seek(CONTIGUOUS_OBS_OFFSET + bot_index * OBS_SIZE)
+        obs = StructuredObservation.from_bytes(self.shm_mmap.read(OBS_SIZE))
+        self.shm_mmap.seek(CONTIGUOUS_REWARDS_OFFSET + bot_index * 4)
+        reward, = struct.unpack('<f', self.shm_mmap.read(4))
+        self.shm_mmap.seek(CONTIGUOUS_DONES_OFFSET + bot_index * 4)
+        done, = struct.unpack('<i', self.shm_mmap.read(4))
+        return obs, reward, bool(done)
 
 
-def render_tiles_ascii(tiles: np.ndarray, use_embeddings: bool = False, center_crop: int = 0, show_player: bool = True):
-    """Render tile grid as ASCII art."""
-    h, w = tiles.shape
-    orig_cy, orig_cx = h // 2, w // 2
-
-    # Optionally crop to center
-    if center_crop > 0:
-        half = center_crop // 2
-        tiles = tiles[orig_cy - half:orig_cy + half + 1, orig_cx - half:orig_cx + half + 1]
-        h, w = tiles.shape
-
-    # Player is at center of the (possibly cropped) grid
-    player_y, player_x = h // 2, w // 2
-
-    # Tile ID to character mapping (works for both raw IDs and old categories)
-    char_map = {
-        0: ' ',   # AIR
-        1: '█',   # SOLID
-        2: 'X',   # DEATH
-        3: '░',   # NOHOOK
-        9: '*',   # FREEZE
-        10: '+',  # UNFREEZE
-        16: 'W',  # WALLJUMP
-        17: 'E',  # EHOOK_START
-        18: 'e',  # EHOOK_END
-        26: '⊙',  # TELEIN
-        27: '⊚',  # TELEOUT
-        29: '⊛',  # TELECHECK
-        32: 'J',  # REFILL_JUMPS
-        33: 'S',  # START
-        34: 'F',  # FINISH
-        60: '!',  # STOP
-        61: '<',  # STOP_L
-        62: '>',  # STOP_R
-        63: '^',  # STOP_U
-        64: 'v',  # STOP_D
-        103: '⊕', # TELEINHOOK
-        104: '⊗', # TELEINWEAPON
-    }
-
-    # Old 16-category ETileType mapping (for servers not yet rebuilt)
-    old_category_map = {
-        0: ' ',   # EMPTY
-        1: '█',   # SOLID
-        2: 'X',   # DEATH
-        3: '░',   # NOHOOK
-        4: '*',   # FREEZE
-        5: '+',   # UNFREEZE
-        6: 'S',   # SPAWN
-        7: 'F',   # FINISH
-        8: 'C',   # CHECKPOINT
-        9: '?',   # OTHER
-    }
-
-    lines = []
-    for y in range(h):
-        row = ""
-        for x in range(w):
-            # Show player at center
-            if show_player and y == player_y and x == player_x:
-                row += 'O'
-                continue
-
-            if use_embeddings:
-                tid = int(tiles[y, x])
-            else:
-                # Convert normalized float back to category
-                tid = int(round(tiles[y, x] * 15))
-
-            # Try raw tile map first, then old category map
-            if tid in char_map:
-                row += char_map[tid]
-            elif tid in old_category_map:
-                row += old_category_map[tid]
-            elif 35 <= tid <= 59:
-                row += str((tid - 34) % 10)  # Time checkpoint number
-            elif tid == 0:
-                row += ' '
-            else:
-                row += '?'
-        lines.append(row)
-
-    return lines
-
-
-def print_observation(obs: dict, show_tiles: bool = True, tile_crop: int = 0):
-    """Pretty print an observation."""
-    print("\n" + "=" * 60)
-    print("OBSERVATION")
-    print("=" * 60)
-
-    print(f"\n[Position]  x={obs['position'][0]:.1f}, y={obs['position'][1]:.1f}")
-    print(f"[Velocity]  vx={obs['velocity'][0]:.2f}, vy={obs['velocity'][1]:.2f}")
-    print(f"[State]     grounded={obs['is_grounded']}, jumps={obs['jumps_remaining']}, "
-          f"can_hook={obs['can_hook']}, frozen={obs['is_frozen']}")
-    print(f"[Movement]  direction={obs['direction']}, jumped={obs['jumped']}, hook={obs['hook_state']}")
-    print(f"[Stats]     health={obs['health']}, armor={obs['armor']}")
-
-    cp = obs['checkpoint']
-    if cp['total'] > 0:
-        print(f"\n[Checkpoint] {cp['index']}/{cp['total']} at ({cp['x']:.1f}, {cp['y']:.1f})")
-        print(f"             relative: ({cp['rel_x']:.3f}, {cp['rel_y']:.3f})")
-    else:
-        print(f"\n[Checkpoint] None")
-
-    print(f"\n[Reward] {obs['reward']:.4f}  [Done] {obs['done']}")
-
-    act = obs['action']
-    print(f"\n[Last Action] dir={act['direction']}, jump={act['jump']}, hook={act['hook']}, "
-          f"aim=({act['aim_x']}, {act['aim_y']})")
-
-    if show_tiles:
-        tiles = obs['tiles']
-        use_emb = obs['use_embeddings']
-
-        print(f"\n[Tiles] shape={tiles.shape}, dtype={tiles.dtype}")
-        if use_emb:
-            unique = np.unique(tiles)
-            print(f"        unique IDs: {len(unique)} - {sorted(unique)[:20]}{'...' if len(unique) > 20 else ''}")
-            print("        Legend: .=air #=solid X=death ~=nohook *=freeze W=walljump J=refill S=start F=finish")
-
-        lines = render_tiles_ascii(tiles, use_emb, tile_crop)
-
-        print(f"\n        Legend: █=solid ░=nohook X=death *=freeze ⊙=tele O=player")
-        print("        " + "-" * (len(lines[0]) + 2) if lines else "")
-        for line in lines:
-            print(f"        |{line}|")
-        print("        " + "-" * (len(lines[0]) + 2) if lines else "")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Observe bot observation space")
-    parser.add_argument("--bot-index", "-b", type=int, default=0, help="Bot index to observe")
-    parser.add_argument("--server-index", "-s", type=int, default=0, help="Server index")
-    parser.add_argument("--continuous", "-c", action="store_true", help="Continuous updates (refresh in place)")
-    parser.add_argument("--interval", "-i", type=float, default=0.5, help="Update interval (seconds)")
-    parser.add_argument("--use-embeddings", "-e", action="store_true", help="Show raw tile IDs")
-    parser.add_argument("--no-tiles", action="store_true", help="Don't show tile grid")
-    parser.add_argument("--tile-crop", type=int, default=0, help="Crop tiles to NxN around player (0=full)")
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Print a bot's observation from a running server")
+    parser.add_argument('--bot-index', '-b', type=int, default=0)
+    parser.add_argument('--server-index', '-s', type=int, default=0)
+    parser.add_argument('--continuous', '-c', action='store_true',
+                        help='Refresh in place until interrupted')
+    parser.add_argument('--interval', '-i', type=float, default=0.5)
+    parser.add_argument('--no-color', action='store_true')
     args = parser.parse_args()
 
     reader = ObservationReader(args.server_index)
     if not reader.connect():
-        sys.exit(1)
+        return 1
 
     try:
         header = reader.read_header()
-
         if args.bot_index >= header['num_bots']:
-            print(f"Error: Bot index {args.bot_index} out of range (0-{header['num_bots']-1})")
-            sys.exit(1)
+            print(f"Bot index {args.bot_index} out of range "
+                  f"(server reports {header['num_bots']} bots)")
+            return 2
 
-        if args.continuous:
-            # Hide cursor for cleaner display
-            print("\033[?25l", end="")
-
-        first_run = True
         while True:
-            obs = reader.read_observation(args.bot_index, args.use_embeddings)
+            obs, reward, done = reader.read_observation(args.bot_index)
             header = reader.read_header()
-
             if args.continuous:
-                # Move cursor to top-left and clear screen
-                print("\033[H\033[J", end="")
-
-            if first_run and not args.continuous:
-                print(f"Connected to server {args.server_index}")
-                print(f"  Bots: {header['num_bots']}, Tick: {header['server_tick']}")
-                first_run = False
-            elif args.continuous:
-                print(f"Server {args.server_index} | Tick: {header['server_tick']} | Bot {args.bot_index} | Ctrl+C to exit")
-
-            print_observation(obs, show_tiles=not args.no_tiles, tile_crop=args.tile_crop)
-
+                print('\033[H\033[J', end='')
+            print(f"server {args.server_index}  bot {args.bot_index}/"
+                  f"{header['num_bots']}  server tick {header['server_tick']}")
+            print(render_terminal(obs, reward, done, use_color=not args.no_color),
+                  flush=True)
             if not args.continuous:
                 break
-
             time.sleep(args.interval)
-
     except KeyboardInterrupt:
-        pass
+        print("\nstopped")
     finally:
-        if args.continuous:
-            # Show cursor again
-            print("\033[?25h", end="")
-            print("\nStopped.")
         reader.close()
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())

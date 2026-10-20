@@ -16,6 +16,8 @@ import numpy as np
 from typing import Dict, Tuple, Optional, List, Union
 from dataclasses import dataclass, field
 
+from observation import SEMANTIC_CHANNELS, semantic_lookup
+
 
 @dataclass
 class PPOConfig:
@@ -236,31 +238,17 @@ class CNNFeatureExtractor(nn.Module):
 # This table makes them orthogonal channels. It is FIXED, not learned: no
 # parameters, no gradient, no exploration cost - only a reindexing of
 # information the observation already carries.
-SEMANTIC_CHANNELS = 12
-(SEM_AIR, SEM_SOLID, SEM_NOHOOK, SEM_THROUGH, SEM_DEATH, SEM_FREEZE,
- SEM_UNFREEZE, SEM_TELE, SEM_BOOST, SEM_JUMP, SEM_STOPPER, SEM_OTHER) = range(12)
-
-_TILE_SEMANTICS = {
-    0: SEM_AIR,
-    1: SEM_SOLID,                                   # hookable wall
-    3: SEM_NOHOOK,                                  # wall the hook slides off
-    5: SEM_THROUGH, 6: SEM_THROUGH,                 # THROUGH_CUT, THROUGH
-    66: SEM_THROUGH, 67: SEM_THROUGH,               # THROUGH_ALL, THROUGH_DIR
-    2: SEM_DEATH,
-    9: SEM_FREEZE, 12: SEM_FREEZE, 144: SEM_FREEZE, # FREEZE, DFREEZE, LFREEZE
-    11: SEM_UNFREEZE, 13: SEM_UNFREEZE, 145: SEM_UNFREEZE,
-    10: SEM_TELE, 26: SEM_TELE, 27: SEM_TELE, 30: SEM_TELE, 31: SEM_TELE, 63: SEM_TELE,
-    28: SEM_BOOST, 29: SEM_BOOST,
-    7: SEM_JUMP, 16: SEM_JUMP,                      # JUMP, WALLJUMP
-    60: SEM_STOPPER, 61: SEM_STOPPER, 62: SEM_STOPPER,
-}
+#
+# The id -> class mapping itself lives in observation.py, next to the wire format
+# that produces the raw ids, so the policy and the observation viewer cannot
+# drift apart about what a tile means.
 
 
 def build_semantic_table(device=None) -> torch.Tensor:
     """(256, SEMANTIC_CHANNELS) one-hot lookup. Unmapped ids fall into OTHER."""
+    classes = torch.from_numpy(semantic_lookup().astype(np.int64))
     t = torch.zeros(256, SEMANTIC_CHANNELS, dtype=torch.float32)
-    for tid in range(256):
-        t[tid, _TILE_SEMANTICS.get(tid, SEM_OTHER)] = 1.0
+    t[torch.arange(256), classes] = 1.0
     return t.to(device) if device is not None else t
 
 

@@ -62,15 +62,27 @@ Why this shape:
 
 ### Observations
 
-Per bot, assembled on the C++ side and parsed by `observation.py`:
+Per bot, laid out by `rl_protocol.h` and parsed by `observation.py`:
 
-- a **31×43 semantic tile grid** centred on the tee (tile *classes*, not raw map IDs)
+- a **31×43 tile grid** centred on the tee, carrying raw DDNet tile ids
 - **player state** — position, velocity, hook state and phase, freeze, jumps, grounded — stacked
   over the last 4 decisions
-- **16 raycasts** each for solid / death / hookable surfaces, plus the **hook aim-line** probes
-- **path progress**, including a high-water mark, and the next checkpoint
+- **navigation** — normalised progress along the waypoint path, that episode's high-water
+  progress, and **8 lookahead points** on the path (1, 2, 4 … 128 waypoints ahead) as egocentric
+  offsets
+- **16 hook-reach probes**, one per aim sector: DDNet's own red/green aim line, marched
+  server-side by the same routine the real hook uses, so the two cannot disagree
 
-That is 1427 floats in the default configuration.
+That is 1427 floats in the default configuration — 1333 tiles, 4 × 15 player state, 34 navigation.
+
+Raw tile ids make a poor network input: `SOLID = 1`, `NOHOOK = 3` and `THROUGH = 6` are
+neighbouring integers with opposite meanings, and a hook climb turns on exactly that distinction.
+`--semantic-tiles` reindexes them through a fixed 12-channel lookup — no learned parameters, just
+orthogonal channels — before the encoder. It is not the default, and it has not been ablated.
+
+There is no checkpoint in the observation and there are no raycasts. Both existed and were
+removed: DDNet time checkpoints are mapper convention, and the raycasts were subsumed by the tile
+grid plus the hook probes.
 
 ### Actions
 
@@ -156,7 +168,8 @@ uv run python train.py --config configs/default.yaml --num-servers 4 --num-envs 
 Other things you will want:
 
 ```sh
-# Watch what the agent actually sees (semantic tiles, raycasts, hook)
+# Watch what the agent actually sees (tiles, hook probes, path lookahead).
+# Add --window for an interactive OpenCV view you can drive with a/d/space.
 uv run python visualize_obs.py --num-bots 1
 
 # Evaluate a checkpoint from the map start, which is the number that matters
@@ -192,12 +205,16 @@ src/game/client/rl/python/   training, environment and tooling (Python)
   curriculum.py              frontier curriculum and archive sampling
   ghost_parser.py            .gho ghost replay decoder
   map_pathfinder.py          tile-level BFS pathfinder
+  visualize_obs.py           render a bot's observation (terminal, or --window)
+  observe.py                 the same, read-only, against an already-running server
 deploy/train.sh              hardware-aware launcher
 docs/research/               the research journal: roadmap, plan, ablations, run notes
 ```
 
 `observation.py` and `rl_protocol.h` describe the same bytes. If they disagree, observations are
-silently misparsed rather than rejected — an encoding bug here cost this project four runs.
+silently misparsed rather than rejected — an encoding bug here cost this project four runs — so
+`test_obs_layout.py` pins the Python offsets against the C++ header itself rather than against a
+copy of them.
 
 ## Lessons
 
