@@ -1,435 +1,222 @@
-[![DDraceNetwork](https://ddnet.org/ddnet-small.png)](https://ddnet.org)
+# DDNet RL
 
-[![Build status](https://github.com/ddnet/ddnet/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/ddnet/ddnet/actions/workflows/build.yml?branch=master)
-[![Code coverage](https://codecov.io/gh/ddnet/ddnet/branch/master/graph/badge.svg)](https://codecov.io/gh/ddnet/ddnet/branch/master)
-[![Translation status](https://hosted.weblate.org/widget/ddnet/ddnet/svg-badge.svg)](https://hosted.weblate.org/engage/ddnet/)
+Reinforcement learning agents that learn to race [DDNet](https://ddnet.org) maps — a 2D
+platformer whose movement is built around a grappling hook, momentum and freeze tiles. The
+reward is the obvious one: get to the finish, fast.
 
-Our own flavor of DDRace, a Teeworlds mod. See the [website](https://ddnet.org) for more information.
+This is a fork of the DDNet game. The agents are not scripted bots: they run inside a modified
+DDNet server, see a local view of the map, and are trained from scratch with PPO.
 
-Development discussions happen on #ddnet on Quakenet ([Webchat](http://webchat.quakenet.org/?channels=ddnet&uio=d4)) or on [Discord in the developer channel](https://discord.gg/xsEd9xu).
+There is a write-up of the project here: **https://boesch.dev/posts/ddnet-rl/**
 
-You can get binary releases on the [DDNet website](https://ddnet.org/downloads/), find it on [Steam](https://store.steampowered.com/app/412220/DDraceNetwork/) or [install from repository](#installation-from-repository).
+## Status
 
-- [Code Browser](https://ddnet.org/codebrowser/DDNet/)
-- [Source Code Documentation](https://codedoc.ddnet.org/) (very incomplete, only a few items are documented)
-- [Contributing Guide](CONTRIBUTING.md)
+Honest version: it works on one map, and the headline number has an *n* of 1.
 
-If you want to learn about the source code, you can check the [Development](https://wiki.ddnet.org/wiki/Development) article on the wiki.
+On `Tutorial`, giving the agent DDNet's own hook aim-line as 16 per-sector reachability probes
+broke a path-progress ceiling of ~0.474 that had held across four consecutive runs, and produced
+the first non-zero from-start finish rate in the project's history:
 
-## Cloning
+| run | observation | path progress (edge) | finish rate, from start |
+| --- | --- | --- | --- |
+| I1 / I2 | hook-blind | 0.4694 / 0.4700 | 0% / 0% |
+| N1 / N2 | hook state fixed | 0.4550 / 0.4550 | 0% / 0% |
+| **P1** | **+ hook aim-line** | **0.4763** | **21.27%** |
 
-To clone this repository with external libraries and no history (~700 MiB):
+Overall finish rate including runs restored mid-map was 89.95%. Confirmed in-game, but it is a
+single run and the replicate is still pending. Notably, fixing the hook-state encoding *alone*
+changed nothing measurable — the agent had been inferring hook attachment from its velocity
+signature. What it lacked was line-of-sight along a direction.
+
+Generalising across maps is **not** solved. See [`roadmap.md`](roadmap.md) for what is currently
+believed to be wrong, and [`ABLATION.md`](ABLATION.md) for the measurements — including three
+claims that were later retracted.
+
+## How it works
+
+The bots live in the server process. Python only does inference and learning.
+
+```
+┌──────────────────────────────┐    POSIX shared memory    ┌──────────────────────┐
+│  DDNet-Server (modified C++) │ /dev/shm/ddnet_rl_server* │  Python (PyTorch)    │
+│                              │ ◄───────────────────────► │                      │
+│  up to 127 headless bots     │    obs, reward, done  →   │  PPO, TensorBoard    │
+│  physics, reward, snapshots  │         ←  actions        │  curriculum, archive │
+└──────────────────────────────┘                           └──────────────────────┘
+          × 8-12 server processes in parallel  →  ~1000-1500 bots training at once
+```
+
+Why this shape:
+
+- **Bots in the server, not clients.** An earlier design ran one DDNet *client* per bot over
+  shared memory; it cost a process and a render loop per agent. Moving the bots into the server
+  removed both. One client slot is deliberately left free (`sv_max_clients 128`) so you can join
+  a training server and watch.
+- **Shared memory, not sockets.** No serialisation, no syscall per step.
+- **Inference in Python, not C++.** An earlier attempt ran ONNX Runtime inside the server. The
+  policy collapsed to a constant action and debugging it in C++ was painful, so inference moved
+  out. That branch is kept as history, not as a build target.
+- **Frame skip.** The agent acts every 3rd tick at `sv_tickrate 50`, i.e. ~17 decisions/second,
+  with reward accumulating in between.
+
+### Observations
+
+Per bot, assembled on the C++ side and parsed by `observation.py`:
+
+- a **31×43 semantic tile grid** centred on the tee (tile *classes*, not raw map IDs)
+- **player state** — position, velocity, hook state and phase, freeze, jumps, grounded — stacked
+  over the last 4 decisions
+- **16 raycasts** each for solid / death / hookable surfaces, plus the **hook aim-line** probes
+- **path progress**, including a high-water mark, and the next checkpoint
+
+That is 1427 floats in the default configuration.
+
+### Actions
+
+A hybrid space: multi-discrete for direction, jump and hook, plus a **factored continuous aim**
+(aim is not bucketed — some maps need it precise). A learned **duration head** lets the policy
+hold an action for several decisions, which is what makes long hook swings discoverable at all.
+
+### Reward
+
+Three terms, deliberately no more:
+
+```
+R = −0.001 per tick                 time cost — the actual race objective
+  + 100.0 · (γ·Φ′ − Φ) per decision progress along the waypoint path
+  + 100.0 on finish
+```
+
+Φ is normalised progress along an explicit **waypoint path**. The shaping is a *potential
+difference*, which by [Ng, Harada & Russell (1999)](https://people.eecs.berkeley.edu/~pabbeel/cs287-fa09/readings/NgHaradaRussell-shaping-ICML1999.pdf)
+leaves the optimal policy unchanged for any Φ — so a mediocre ghost line or a bad pathfinder
+segment can cost learning speed but can never teach the wrong behaviour. It is applied once per
+*decision*, not per tick: reward accumulates across the frame skip, and a sum of per-tick
+potential differences does not telescope.
+
+Everything else was deliberately removed — freeze penalty, stuck ramp, off-path penalty,
+checkpoint bonus, velocity-toward-checkpoint. Each was a hand-tuned scale with no reason to hold
+on the next map. The freeze penalty was the worst: −5.0/s against a maximum progress rate of
++5.0/s, in a game where passing through freeze is routine and sometimes mandatory.
+
+`sv_rl_ratchet` (off by default) makes Φ the episode's **high-water** progress, so giving ground
+back costs only time. Plain shaping charges for the run-up that hard obstacles need: at the 0.455
+wall the correct play starts by backing up ~3 tiles — an immediate −0.086, about 29 decisions of
+time penalty, against a payoff that during exploration almost never arrives. A high-water
+potential is monotone, so it still telescopes and still preserves the optimum.
+
+An earlier checkpoint-based reward broke on real maps: it assumed checkpoints were sequential and
+reachable, and agents sprinted at an unreachable teleporter instead. Waypoints now come from
+either a human **ghost replay** (`ghost_parser.py` decodes `.gho`) or a tile-level **BFS
+pathfinder** that respects teleporters and avoids death tiles (`map_pathfinder.py`).
+
+### Resets
+
+Starting every episode at the spawn wastes nearly all compute re-walking solved ground, so resets
+are drawn from an archive, in the spirit of [Go-Explore](https://arxiv.org/abs/1901.10995):
+
+- episodes are snapshotted with DDNet's own `CSaveTee`, so a restore is exact — position,
+  velocity and hook included
+- archive cells are keyed by `(progress, hook state, velocity)`, not progress alone, so the
+  agent can be restored *mid-swing* and not just mid-corridor
+- sampling is capped at a **frontier**: the furthest point proven reachable from the start, so
+  the agent is never dropped past its own demonstrated ability
+- 20% of resets still start from the beginning, to keep whole-map skill
+
+## Quick start
+
+Requires a CUDA GPU for anything but a smoke test. Reference hardware is an RTX 3080 with a
+Ryzen 5800X3D.
 
 ```sh
-git clone --depth 1 --recursive --shallow-submodules https://github.com/ddnet/ddnet
+git clone --recursive https://github.com/Encrux/ddnet-rl
+cd ddnet-rl
+
+# 1. Build the server. Training needs only DDNet-Server; the client is optional (to watch).
+cmake -B build -GNinja
+ninja -C build DDNet-Server
+
+# 2. Python environment
+uv sync
+
+# 3. Train — this sizes the server count to your CPU and clears stale
+#    processes and shared memory first
+./deploy/train.sh
 ```
 
-To clone this repository when you have the necessary libraries on your system already with no history (~150 MiB):
+To drive `train.py` yourself, note that `configs/default.yaml` is sized for the reference rig
+above — 12 servers × 127 bots — so scale it down unless you have the cores for it:
 
 ```sh
-git clone --depth 1 https://github.com/ddnet/ddnet
+cd src/game/client/rl/python
+uv run python train.py --config configs/default.yaml --num-servers 4 --num-envs 32
 ```
 
-To clone this repository with external libraries and full history (~1 GiB):
+Other things you will want:
 
 ```sh
-git clone --recursive https://github.com/ddnet/ddnet
+# Watch what the agent actually sees (semantic tiles, raycasts, hook)
+uv run python visualize_obs.py --num-bots 1
+
+# Evaluate a checkpoint from the map start, which is the number that matters
+uv run python eval_from_start.py runs/<run>/checkpoint_final.pt
+
+# Generate waypoints for a new map
+uv run python ghost_parser.py path/to/replay.gho --output ghosts/MyMap.waypoints.json
+uv run python map_pathfinder.py path/to/MyMap.map --output ghosts/MyMap.waypoints.json
 ```
 
-To clone this repository when you have the necessary libraries on your system already with full history (~450 MiB):
+Training writes TensorBoard logs and checkpoints to `runs/<name>/`.
 
-```sh
-git clone https://github.com/ddnet/ddnet
+The RL-specific server settings are console variables, and **order matters** — `sv_rl_bots` must
+be issued before the others, which silently no-op without an active bot manager:
+
+| variable | meaning |
+| --- | --- |
+| `sv_rl_bots <n> <server_idx>` | spawn `n` headless bots; creates the bot manager |
+| `sv_rl_frame_skip <n>` | act every `n`th tick |
+| `sv_rl_ratchet <0\|1>` | high-water progress shaping |
+| `sv_rl_archive_variants <0\|1>` | key archive cells by hook/velocity, not progress alone |
+
+## Layout
+
+```
+src/game/server/rl/          bots, reward and snapshots inside the server (C++)
+src/game/rl/rl_protocol.h    the shared-memory structs -- the contract between the two sides
+src/game/client/rl/python/   training, environment and tooling (Python)
+  train.py                   entry point
+  ppo_hybrid.py              PPO, hybrid action space, duration head
+  teeworlds_server_env.py    vectorised env over the shared-memory servers
+  observation.py             observation structs; must match rl_protocol.h
+  curriculum.py              frontier curriculum and archive sampling
+  ghost_parser.py            .gho ghost replay decoder
+  map_pathfinder.py          tile-level BFS pathfinder
+deploy/train.sh              hardware-aware launcher
+roadmap.md  ABLATION.md      current diagnosis, and the measurements behind it
 ```
 
-To clone this repository since we moved the libraries to https://github.com/ddnet/ddnet-libs with history (~250 MiB):
-
-```sh
-git clone --shallow-exclude=included-libs https://github.com/ddnet/ddnet
-```
-
-To clone the libraries if you have previously cloned DDNet without them, or if you require the ddnet-libs history instead of a shallow clone:
-
-```sh
-git submodule update --init --recursive
-```
-
-## Dependencies on Linux / macOS
-
-You can install the required libraries on your system, `touch CMakeLists.txt` and CMake will use the system-wide libraries by default. You can install all required dependencies and CMake on Debian or Ubuntu like this:
-
-```sh
-sudo apt install build-essential cargo cmake git glslang-tools google-mock libavcodec-extra libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev libcurl4-openssl-dev libfreetype6-dev libglew-dev libnotify-dev libogg-dev libopus-dev libopusfile-dev libpng-dev libsdl2-dev libsqlite3-dev libssl-dev libvulkan-dev libwavpack-dev libx264-dev ninja-build python3 rustc spirv-tools
-```
-
-On older distributions like Ubuntu 18.04 don't install `google-mock`, but instead set `-DDOWNLOAD_GTEST=ON` when building to get a more recent gtest/gmock version.
-
-On older distributions `rustc` version might be too old, to get an up-to-date Rust compiler you can use [rustup](https://rustup.rs/) with stable channel instead or try the `rustc-mozilla` package.
-
-Or on CentOS, RedHat and AlmaLinux like this:
-
-```sh
-sudo yum install cargo cmake ffmpeg-devel freetype-devel gcc gcc-c++ git glew-devel glslang gmock-devel gtest-devel libcurl-devel libnotify-devel libogg-devel libpng-devel libx264-devel ninja-build openssl-devel opus-devel opusfile-devel python3 rust SDL2-devel spirv-tools sqlite-devel vulkan-devel wavpack-devel
-```
-
-Or on Fedora like this:
-
-```sh
-sudo dnf install cargo cmake ffmpeg-devel freetype-devel gcc gcc-c++ git glew-devel glslang gmock-devel gtest-devel libcurl-devel libnotify-devel libogg-devel libpng-devel make ninja-build openssl-devel opus-devel opusfile-devel python SDL2-devel spirv-tools sqlite-devel vulkan-devel wavpack-devel x264-devel
-```
-
-Or on Arch Linux like this:
-
-```sh
-sudo pacman -S --needed base-devel cmake curl ffmpeg freetype2 git glew glslang gmock libnotify libpng ninja opusfile python rust sdl2 spirv-tools sqlite vulkan-headers vulkan-icd-loader wavpack x264
-```
-
-Or on Gentoo like this:
-
-```sh
-emerge --ask dev-build/ninja dev-db/sqlite dev-lang/rust-bin dev-libs/glib dev-libs/openssl dev-util/glslang dev-util/spirv-headers dev-util/spirv-tools media-libs/freetype media-libs/glew media-libs/libglvnd media-libs/libogg media-libs/libpng media-libs/libsdl2 media-libs/libsdl2[vulkan] media-libs/opus media-libs/opusfile media-libs/pnglite media-libs/vulkan-loader[layers] media-sound/wavpack media-video/ffmpeg net-misc/curl x11-libs/gdk-pixbuf x11-libs/libnotify
-```
-
-On macOS you can use [homebrew](https://brew.sh/) to install build dependencies like this:
-
-```sh
-brew install cmake ffmpeg freetype glew glslang googletest libpng molten-vk ninja opusfile rust SDL2 spirv-tools vulkan-headers wavpack x264
-```
-
-If you don't want to use the system libraries, you can pass the `-DPREFER_BUNDLED_LIBS=ON` parameter to cmake.
-
-## Building on Linux and macOS
-
-To compile DDNet yourself, execute the following commands in the source root:
-
-```sh
-cmake -Bbuild -GNinja
-cmake --build build
-```
-
-DDNet requires additional libraries, some of which are bundled for the most common platforms (Windows, Mac, Linux, all x86 and x86\_64) for convenience and the official builds. The bundled libraries for official builds are now in the ddnet-libs submodule. Note that when you build and develop locally, you should ideally use your system's package manager to install the dependencies, instead of relying on ddnet-libs submodule, which does not contain all dependencies anyway (e.g. openssl, vulkan). See the previous section for how to get the dependencies. Alternatively see the following build arguments for how to disable some features and their dependencies (`-DVULKAN=OFF` won't require Vulkan for example).
-
-The following is a non-exhaustive list of build arguments that can be passed to the `cmake` command-line tool in order to enable or disable options in build time:
-
-* **-DCMAKE_BUILD_TYPE=[Release|Debug|RelWithDebInfo|MinSizeRel]** <br>
-	An optional CMake variable for setting the build type. If not set, defaults to "Release" if `-DDEV=ON` is **not** used, and "Debug" if `-DDEV=ON` is used. See `CMAKE_BUILD_TYPE` in CMake Documentation for more information.
-
-* **-DPREFER_BUNDLED_LIBS=[ON|OFF]** <br>
-	Whether to prefer bundled libraries over system libraries. Setting to ON will make DDNet use third party libraries available in the `ddnet-libs` folder, which is the git-submodule target of the [ddnet-libs](https://github.com/ddnet/ddnet-libs) repository mentioned above -- Useful if you do not have those libraries installed and want to avoid building them. If set to OFF, will only use bundled libraries when system libraries are not found. Default value is OFF.
-
-* **-DWEBSOCKETS=[ON|OFF]** <br>
-	Whether to enable WebSocket support for server. Setting to ON requires the `libwebsockets-dev` library installed. Default value is OFF.
-
-* **-DMYSQL=[ON|OFF]** <br>
-	Whether to enable MySQL/MariaDB support for server. Requires at least MySQL 8.0 or MariaDB 10.2. Setting to ON requires the `libmariadb-dev-compat` library installed, which are also provided as bundled libraries for the common platforms. Default value is OFF.
-
-	Note that the bundled MySQL libraries might not work properly on your system. If you run into connection problems with the MySQL server, for example that it connects as root while you chose another user, make sure to install your system libraries for the MySQL client. Make sure that the CMake configuration summary says that it found MySQL libs that were not bundled (no "using bundled libs").
-
-* **-DTEST_MYSQL=[ON|OFF]** <br>
-	Whether to test MySQL/MariaDB support in GTest based tests. Default value is OFF.
-
-	Note that this requires a running MySQL/MariaDB database on localhost with this setup:
-
-```sql
-CREATE DATABASE ddnet;
-CREATE USER 'ddnet'@'localhost' IDENTIFIED BY 'thebestpassword';
-GRANT ALL PRIVILEGES ON ddnet.* TO 'ddnet'@'localhost';
-FLUSH PRIVILEGES;
-```
-
-* **-DAUTOUPDATE=[ON|OFF]** <br>
-	Whether to enable the autoupdater. Packagers may want to disable this for their packages. Default value is ON for Windows and Linux.
-
-* **-DCLIENT=[ON|OFF]** <br>
-	Whether to enable client compilation. If set to OFF, DDNet will not depend on Curl, Freetype, Ogg, Opus, Opusfile, and SDL2. Default value is ON.
-
-* **-DVIDEORECORDER=[ON|OFF]** <br>
-	Whether to add video recording support using FFmpeg to the client. Default value is ON.
-
-* **-DDOWNLOAD_GTEST=[ON|OFF]** <br>
-	Whether to download and compile GTest. Useful if GTest is not installed and, for Linux users, there is no suitable package providing it. Default value is OFF.
-
-* **-DDEV=[ON|OFF]** <br>
-	Whether to optimize for development, speeding up the compilation process a little. If enabled, don't generate stuff necessary for packaging. Setting to ON will set CMAKE\_BUILD\_TYPE to Debug by default. Default value is OFF.
-
-* **-DUPNP=[ON|OFF]** <br>
-	Whether to enable UPnP support for the server.
-	You need to install `libminiupnpc-dev` on Debian, `miniupnpc` on Arch Linux.
-	Default value is OFF.
-
-* **-DVULKAN=[ON|OFF]** <br>
-	Whether to enable the Vulkan graphics backend.
-	You need to install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) and set the `VULKAN_SDK` environment flag accordingly.
-	Default value is ON for Linux, and OFF for Windows and macOS.
-
-* **-GNinja** <br>
-	Use the Ninja build system instead of Make. This automatically parallelizes the build and is generally faster. Compile with `ninja` instead of `make`. Install Ninja with `sudo apt install ninja-build` on Debian, `sudo pacman -S --needed ninja` on Arch Linux.
-
-* **-DCMAKE_CXX_LINK_FLAGS=[FLAGS]** <br>
-	Custom flags to set for compiler when linking.
-
-* **-DEXCEPTION_HANDLING=[ON|OFF]** <br>
-	Enable exception handling (only works with Windows as of now, uses DrMingw there). Default value is OFF.
-
-* **-DIPO=[ON|OFF]** <br>
-	Enable interprocedural optimizations, also known as Link Time Optimization (LTO). Default value is OFF.
-
-* **-DFUSE_LD=[OFF|LINKER]** <br>
-	Linker to use. Default value is OFF to try mold, lld, gold.
-
-* **-DSECURITY_COMPILER_FLAGS=[ON|OFF]** <br>
-	Whether to set security-relevant compiler flags like `-D_FORTIFY_SOURCE=2` and `-fstack-protector-all`. Default Value is ON.
-
-* **-DMACOS_CODESIGN=[ON|OFF]** <br>
-	Whether to sign code when building the DMG on macOS.
-
-## Running tests (Debian/Ubuntu)
-
-In order to run the tests, you need to install the following library `libgtest-dev`.
-
-This library isn't compiled, so you have to do it:
-```sh
-sudo apt install libgtest-dev
-cd /usr/src/gtest
-sudo cmake CMakeLists.txt
-sudo make
-
-# copy or symlink libgtest.a and libgtest_main.a to your /usr/lib folder
-sudo cp lib/*.a /usr/lib
-```
-
-To run the tests you can build the target `run_tests` using
-
-```sh
-cmake --build build --target run_tests`
-```
-
-## Code formatting
-
-We use clang-format 20 to format the C++ code of this project. Execute `scripts/fix_style.py` after changing the code to ensure code is formatted properly, a GitHub central style checker will do the same and prevent your change from being submitted.
-
-## Using AddressSanitizer + UndefinedBehaviourSanitizer or Valgrind's Memcheck
-
-ASan+UBSan and Memcheck are useful to find code problems more easily. Please use them to test your changes if you can.
-
-For ASan+UBSan compile with:
-
-```sh
-CC=clang CXX=clang++ CXXFLAGS="-fsanitize=address,undefined -fsanitize-recover=all -fno-omit-frame-pointer" CFLAGS="-fsanitize=address,undefined -fsanitize-recover=all -fno-omit-frame-pointer" cmake -DCMAKE_BUILD_TYPE=Debug -Bbuild -GNinja
-cmake --build build
-```
-
-and run with:
-
-```sh
-UBSAN_OPTIONS=suppressions=./ubsan.supp:log_path=./SAN:print_stacktrace=1:halt_on_errors=0 ASAN_OPTIONS=log_path=./SAN:print_stacktrace=1:check_initialization_order=1:detect_leaks=1:halt_on_errors=0:handle_abort=1 LSAN_OPTIONS=suppressions=./lsan.supp ./DDNet
-```
-
-Check the SAN.\* files afterwards. This finds more problems than memcheck, runs faster, but requires a modern GCC/Clang compiler.
-
-For valgrind's memcheck compile a normal Debug build and run with: `valgrind --tool=memcheck ./DDNet`
-Expect a large slow down.
-
-## Building on Windows with the Visual Studio IDE
-
-Download and install some version of [Microsoft Visual Studio](https://www.visualstudio.com/) (At the time of writing, MSVS Community 2022) with **C++ support**.
-
-You'll have to install both [Python 3](https://www.python.org/downloads/) and [Rust](https://rustup.rs/) as well.
-
-Make sure the MSVC build tools, C++ CMake-Tools and the latest Windows SDK version appropriate to your windows version are selected in the installer.
-
-Now open up your Project folder, Visual Studio should automatically detect and configure your project using CMake.
-
-On your tools hotbar next to the triangular "Run" Button, you can now select what you want to start (e.g game-client or game-server) and build it.
-
-## Building on Windows with standalone MSVC build tools
-
-First off you will need to install the following dependencies:
-
-- [MSVC Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/),
-- [Python 3](https://www.python.org/downloads/windows/),
-- [Rust](https://www.rust-lang.org/tools/install).
-
-To compile with the Vulkan graphics backend (disabled by default), you also need to install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home).
-
-To compile and build DDNet on Windows, use your IDE of choice either with a CMake integration (e.g Visual Studio Code), or by ~~**deprecated**~~ using the CMake GUI.
-
-Configure CMake to use the MSVC Build Tools appropriate to your System by your IDE's instructions.
-
-If you're using Visual Studio Code, you can use the [CMake Tools](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cmake-tools) extension to configure and build the project.
-
-You can then open the project folder in Visual Studio Code and press `Ctrl+Shift+P` to open the command palette, then search for `CMake: Configure`.
-
-This will open up a prompt for you to select a kit, select your `Visual Studio` version and save it. You can now use the GUI (bottom left) to compile and build your project.
-
-## Cross-compiling on Linux to Windows x86/x86\_64
-
-Install MinGW cross-compilers of the form `i686-w64-mingw32-gcc` (32 bit) or
-`x86_64-w64-mingw32-gcc` (64 bit). This is probably the hard part. ;)
-
-Then add `-DCMAKE_TOOLCHAIN_FILE=../cmake/toolchains/mingw64.toolchain` to the
-**initial** CMake command line.
-
-## Cross-compiling on Linux/Windows to Android
-
-Cross-compilation to Android is explained in a [separate guide](scripts/android/README.md).
-
-## Cross-compiling on Linux to WebAssembly via Emscripten
-
-Install Emscripten cross-compilers on a modern linux distro. Follow the [instructions to install the emsdk](https://emscripten.org/docs/getting_started/downloads.html). Installing Emscripten from the package manager (e.g. with `sudo apt install emscripten`) may not work, as building some libraries requires a more recent version of Emscripten than available via package manager.
-
-If you need to compile the ddnet-libs for WebAssembly, simply call
-
-```sh
-scripts/compile_libs/gen_libs.sh build-webasm-libs webasm
-```
-
-from the project's source directory. It will automatically create a directory called `ddnet-libs` in your build directory.
-You can then merge this directory with the one in the ddnet source directory:
-
-```sh
-find ddnet-libs -type d -name webasm -exec rm -r {} + -prune
-cp -r build-webasm-libs/ddnet-libs/. ddnet-libs/
-```
-
-Note that using Rust versions 1.90.0 - 1.93.0 does not work. Either use an older or newer version of Rust.
-Run `rustup target add wasm32-unknown-emscripten` to install the WASM target for compiling Rust.
-
-Create a new directory to build the client in.
-Then run `emcmake cmake .. -G "Unix Makefiles" -DVIDEORECORDER=OFF -DVULKAN=OFF -DSERVER=OFF -DTOOLS=OFF -DPREFER_BUNDLED_LIBS=ON` in your build directory to configure followed by `cmake --build . -j8` to build.
-For testing it is highly recommended to build in debug mode by also passing the argument `-DCMAKE_BUILD_TYPE=Debug` when invoking `emcmake cmake`, as this speeds up the build process and adds debug information as well as additional checks.
-Note that using the Ninja build system with Emscripten is not currently possible due to [CMake issue 16395](https://gitlab.kitware.com/cmake/cmake/-/issues/16395).
-
-To test the compiled code locally, just use `emrun --browser firefox DDNet.html`.
-
-To host the compiled .html file copy all `.data`, `.html`, `.js`, `.wasm` files to the web server.
-See `other/emscripten/minimal.html` for a minimal HTML example. You can also run `other/emscripten/server.py` to host a minimal server for testing using Python without needing to install Emscripten.
-
-Enable cross-origin policies when using a proper web server. Example for apache2 on Debian-based distros:
-
-```sh
-sudo a2enmod header
-
-# edit the apache2 config to allow .htaccess files
-sudo nano /etc/apache2/apache2.conf
-
-# set AllowOverride to All for your directory
-# then create a .htaccess file on the web server (where the .html is)
-# and add these lines
-Header add Cross-Origin-Embedder-Policy "require-corp"
-Header add Cross-Origin-Opener-Policy "same-origin"
-
-# now restart apache2
-sudo service apache2 restart
-```
-
-## Cross-compiling on Linux to macOS
-
-Install [osxcross](https://github.com/tpoechtrager/osxcross), then add
-`-DCMAKE_TOOLCHAIN_FILE=../cmake/toolchains/darwin.toolchain` and
-`-DCMAKE_OSX_SYSROOT=/path/to/osxcross/target/SDK/MacOSX10.11.sdk/` to the
-**initial** CMake command line.
-
-Install `dmg` and `hfsplus` from
-[libdmg-hfsplus](https://github.com/mozilla/libdmg-hfsplus) and `newfs_hfs`
-from
-[diskdev\_cmds](http://pkgs.fedoraproject.org/repo/pkgs/hfsplus-tools/diskdev_cmds-540.1.linux3.tar.gz/0435afc389b919027b69616ad1b05709/diskdev_cmds-540.1.linux3.tar.gz)
-to unlock the `package_dmg` target that outputs a macOS disk image.
-
-## Importing the official DDNet Database
-
-```sh
-$ wget https://ddnet.org/stats/ddnet-sql.zip # (~2.5 GiB)
-$ unzip ddnet-sql.zip
-$ yay -S mariadb mysql-connector-c++
-$ sudo mysql_install_db --user=mysql --basedir=/usr --datadir=/var/lib/mysql
-$ sudo systemctl start mariadb
-$ sudo mysqladmin -u root password 'PW'
-$ mysql -u root -p'PW'
-MariaDB [(none)]> create database teeworlds; create user 'teeworlds'@'localhost' identified by 'PW2'; grant all privileges on teeworlds.* to 'teeworlds'@'localhost'; flush privileges;
-# this takes a while, you can remove the KEYs in record_race.sql to trade performance in queries
-$ mysql -u teeworlds -p'PW2' teeworlds < ddnet-sql/record_*.sql
-
-$ cat mine.cfg
-sv_use_sql 1
-add_sqlserver r teeworlds record teeworlds "PW2" "localhost" "3306"
-add_sqlserver w teeworlds record teeworlds "PW2" "localhost" "3306"
-
-$ cmake -Bbuild -DMYSQL=ON -GNinja
-$ cmake --build build --target DDNet-Server
-$ build/DDNet-Server -f mine.cfg
-```
-
-<a href="https://repology.org/metapackage/ddnet/versions">
-	<img src="https://repology.org/badge/vertical-allrepos/ddnet.svg?header=" alt="Packaging status" align="right">
-</a>
-
-## Installation from Repository
-
-Debian/Ubuntu
-
-```sh
-sudo apt-get install ddnet
-```
-
-MacOS
-
-```sh
-brew install --cask ddnet
-```
-
-Fedora
-
-```sh
-sudo dnf install ddnet
-```
-
-Arch Linux
-
-```sh
-yay -S ddnet
-```
-
-FreeBSD
-
-```sh
-sudo pkg install DDNet
-```
-
-Windows (Scoop)
-```cmd
-scoop bucket add games
-scoop install games/ddnet
-```
-
-## Benchmarking
-
-DDNet is available in the [Phoronix Test Suite](https://openbenchmarking.org/test/pts/ddnet). If you have PTS installed you can easily benchmark DDNet on your own system like this:
-
-```sh
-phoronix-test-suite benchmark ddnet
-```
-
-## Better Git Blame
-
-First, use a better tool than `git blame` itself, e.g. [`tig`](https://jonas.github.io/tig/). There's probably a good UI for Windows, too. Alternatively, use the GitHub UI, click "Blame" in any file view.
-
-For `tig`, use `tig blame path/to/file.cpp` to open the blame view, you can navigate with arrow keys or kj, press comma to go to the previous revision of the current line, q to quit.
-
-Only then you could also set up git to ignore specific formatting revisions:
-
-```sh
-git config blame.ignoreRevsFile formatting-revs.txt
-```
-
-## (Neo)Vim Syntax Highlighting for config files
-
-Copy the file detection and syntax files to your vim config folder:
-
-```sh
-# vim
-cp -R other/vim/* ~/.vim/
-
-# neovim
-cp -R other/vim/* ~/.config/nvim/
-```
+`observation.py` and `rl_protocol.h` describe the same bytes. If they disagree, observations are
+silently misparsed rather than rejected — an encoding bug here cost this project four runs.
+
+## Lessons
+
+- Most of the work is infrastructure, logging and debugging. The learning is the short part.
+- Verify encodings against live runtime values. The agent was hook-blind for 60% of its state and
+  nothing crashed; the bug showed up only as a progress plateau.
+- Metrics can quietly answer a different question than the one you asked. Three results in
+  `ABLATION.md` were retracted for exactly that reason, and a whole benchmark sweep was
+  invalidated when `sv_rl_frame_skip` turned out to be a no-op.
+- A reward function that assumes the map is well-behaved will find the map that isn't.
+
+## Relationship to DDNet, and licence
+
+This is a modified fork of [DDNet](https://github.com/ddnet/ddnet), which is itself based on
+Teeworlds. All game code, assets and build tooling are theirs; the RL work is the addition.
+Upstream build instructions, dependencies and platform notes live in the
+[DDNet repository](https://github.com/ddnet/ddnet) and its
+[wiki](https://wiki.ddnet.org/wiki/Development) — this fork does not restate them.
+
+Licensed under the same terms as DDNet; see [`license.txt`](license.txt). Copyright for the
+original game remains with Magnus Auvinen, Shereef Marzouk, Dennis Felsing and the DDNet
+contributors. This is an unofficial fork and is not affiliated with or endorsed by the DDNet
+project.
