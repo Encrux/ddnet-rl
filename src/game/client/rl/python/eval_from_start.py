@@ -47,37 +47,48 @@ def main():
     ap.add_argument("--finish-progress", type=float, default=0.50)
     ap.add_argument("--deterministic", action="store_true",
                     help="Use the distribution mode instead of sampling")
-    # Architecture must match the checkpoint or the state dict will not load.
-    ap.add_argument("--semantic-tiles", action="store_true", default=True)
-    ap.add_argument("--action-hold", action="store_true", default=True)
-    ap.add_argument("--hold-durations", type=str, default="1,2,4,8,16")
-    ap.add_argument("--n-player-state-stack", type=int, default=4)
     args = ap.parse_args()
 
-    hold = tuple(int(x) for x in args.hold_durations.split(",")) if args.action_hold else ()
+    # The architecture is read from the checkpoint, never from flags. save()
+    # stores the PPOConfig the run was trained with, so eval cannot disagree
+    # with training about the encoding -- which it silently did: the old
+    # --semantic-tiles/--action-hold were declared store_true WITH default=True,
+    # so neither could be turned off, and every checkpoint produced by
+    # deploy/train.sh (which passes neither flag) died here on a state-dict
+    # shape mismatch instead.
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    ppo = ckpt.get("config")
+    del ckpt  # agent.load() re-reads the file; don't hold the state dicts twice
+    if not isinstance(ppo, PPOConfig):
+        sys.exit(f"{args.checkpoint}: no PPOConfig stored, cannot tell which "
+                 f"architecture to build")
+    if not ppo.use_cnn:
+        sys.exit(f"{args.checkpoint}: trained with the flat observation vector; "
+                 f"this tool only drives dict-observation (--use-cnn) policies")
+    ppo.use_compile = False  # one short eval: compiling costs more than it saves
+    hold = tuple(ppo.hold_durations)
 
     # begin_bias 1.0 and curriculum off: EVERY episode starts at the map start,
     # which is the whole point -- restored episodes would tell us nothing about
     # whether the policy can run the map.
     cfg = ServerEnvConfig(
-        frame_skip=args.frame_skip, use_dict_obs=True, use_embeddings=args.semantic_tiles,
+        frame_skip=args.frame_skip, use_dict_obs=True, use_embeddings=ppo.use_embeddings,
         map_name=args.map, max_episode_steps=args.max_episode_steps,
         finish_progress=args.finish_progress, curriculum=False, begin_bias=1.0,
     )
     bots_per_server = args.num_envs // args.num_servers
     total = bots_per_server * args.num_servers
     env = TeeWorldsServerEnv(num_bots=bots_per_server, num_servers=args.num_servers, config=cfg)
-    env = FrameStackWrapper(env, n_tile_stack=1, n_player_state_stack=args.n_player_state_stack)
+    env = FrameStackWrapper(env, n_tile_stack=1,
+                            n_player_state_stack=ppo.n_player_state_stack)
 
     obs, _ = env.reset()
-    ppo = PPOConfig(use_cnn=True, use_embeddings=args.semantic_tiles,
-                    semantic_tiles=args.semantic_tiles, tile_encoder='cnn',
-                    n_frame_stack=1, n_player_state_stack=args.n_player_state_stack,
-                    hold_durations=hold, use_compile=False)
     agent = PPOAgent(obs_dim=0, num_envs=total, config=ppo,
                      device="cuda" if torch.cuda.is_available() else "cpu")
     agent.load(args.checkpoint)
-    print(f"loaded {args.checkpoint}")
+    print(f"loaded {args.checkpoint}: semantic_tiles={ppo.semantic_tiles} "
+          f"embeddings={ppo.use_embeddings} stack={ppo.n_player_state_stack} "
+          f"holds={hold or 'off'}")
 
     holder = ActionHold(total, len(ppo.discrete_dims), ppo.continuous_dim, hold) if hold else None
 

@@ -173,8 +173,8 @@ Other things you will want:
 uv run python visualize_obs.py --num-bots 1
 
 # Evaluate a checkpoint from the map start, which is the number that matters.
-# It builds the network with --semantic-tiles and --action-hold on and has no
-# way to turn them off, so it only loads checkpoints trained with both.
+# The architecture is read from the checkpoint, so this works whatever encoding
+# the run was trained with.
 uv run python eval_from_start.py runs/<run>/checkpoint_final.pt
 
 # Generate waypoints for a new map, from a human replay or from the map itself
