@@ -9,7 +9,6 @@ dependencies = [
     "numba>=0.59.0",
     "opencv-python>=4.8.0",
     "Pillow>=10.0.0",
-    "pyzmq>=25.0.0",
 ]
 
 [tool.uv.sources]

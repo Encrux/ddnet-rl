@@ -21,8 +21,9 @@ REPORT_FILE = LOG_DIR / "report.txt"
 RUN_MINUTES = 35
 MAX_TOTAL_HOURS = 9.5
 
-# Python from the ddnet-rl conda env
-PYTHON = str(Path.home() / "miniconda3/envs/ddnet-rl/bin/python")
+# Python interpreter: prefer the project venv, else whatever runs this script
+_VENV_PYTHON = Path(__file__).parent / ".venv/bin/python"
+PYTHON = str(_VENV_PYTHON) if _VENV_PYTHON.exists() else sys.executable
 
 # Common flags for all experiments
 BASE_FLAGS = [
