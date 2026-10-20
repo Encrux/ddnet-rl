@@ -18,9 +18,9 @@ advance by as much as the tee could physically have moved since the last update.
 A merely spatial window is not enough. Real reference paths double back on
 themselves at close range — on Tutorial the ghost passes within ~100 units of a
 point ~1000 units later along its own path, only ~17 waypoints apart — so a wide
-window (the C++ side uses ±100) happily matches the wrong strand and the progress
-signal oscillates by ~1% of the map. Combined with a high-water-mark reward that
-corruption is permanent. See ``roadmap.md`` §1.6.
+window happily matches the wrong strand and the progress signal oscillates by ~1%
+of the map. Under a high-water-mark reward that corruption would be permanent.
+See ``roadmap.md`` §1.6, which records how the C++ side bounds its own search.
 
 A full-scan fallback handles the genuinely-lost cases (teleport, mid-map respawn)
 where temporal coherence is broken by design.

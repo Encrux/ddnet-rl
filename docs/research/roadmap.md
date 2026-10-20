@@ -2,6 +2,11 @@
 
 *Written 2026-08-03, after reviewing the `checkpoint-respawn` branch.*
 
+*Part 1 is a snapshot of that date, kept for its reasoning. Where an item has since been built,
+the section carries a dated **Status** note rather than being rewritten — so the diagnosis and
+what was done about it stay side by side. §1.1 and §1.6 (the reward function) are resolved; §1.8
+(unobserved map layers) and §1.10 (horizon) are not.*
+
 Goal: an autonomous agent that finishes a real DDNet race map, start to finish, unassisted —
 impressive enough to show a DDNet audience and an ML audience.
 
@@ -34,6 +39,9 @@ impressive enough to show a DDNet audience and an ML audience.
 ## Part 1 — What's actually wrong right now
 
 ### 1.1 The reward function punishes correct play (the big one)
+
+> **Resolved** — see the Status note at the end of this section. The reward below is the one that
+> was live on 2026-08-03; the unit analysis is why it is no longer.
 
 From `CBotManager::CalculateReward` (`src/game/server/rl/botmanager.cpp:699`), evaluated **every
 tick** and accumulated across the frame-skip:
@@ -78,6 +86,34 @@ quickly". That is exactly the reward-hacking pressure you observed.
 - Sanity-check the result the same way every time: **a trajectory that freezes for 2s and then
   clears an obstacle must score higher than one that never attempts it.** Write that as a unit test
   against `CalculateReward`.
+
+**Status (2026-10-20).** Rewritten to the three-term form in Part 1b and nothing else
+(`CalculateReward`, `botmanager.cpp:865`):
+
+| Term | Value | Cadence |
+|---|---|---|
+| Time | `−TIME_PENALTY` = `−0.001` (`−0.05`/s) | every tick |
+| Progress | `SHAPING_K · (γ·Φ′ − Φ)`, `SHAPING_K = 100`, `SHAPING_GAMMA = 1.0` | **once per decision** |
+| Finish | `+FINISH_BONUS` = `+100` within 48 units of `m_FinishPos` | on arrival |
+
+The per-tick freeze penalty, the freeze-entry penalty, the stuck ramp, the off-path penalty, the
+checkpoint bonus and the velocity-toward-checkpoint term are all deleted. Progress is now a
+potential difference rather than a high-water ratchet, so the strictly-negative
+post-frontier-failure regime described above no longer exists: ground given back can be re-earned.
+
+The cadence matters as much as the terms. Reward accumulates across the frame skip, and summing
+`γΦ_{t+1} − Φ_t` over N ticks is not `γ^N·Φ_{t+N} − Φ_t`, so applying the shaping per tick breaks
+the telescoping that makes it policy-invariant. It is applied on decision ticks only.
+
+`sv_rl_ratchet` brings the high-water behaviour back as an opt-in, and it is **off** by default.
+Max-progress is monotone and part of the augmented state, so that variant still telescopes and
+still leaves the optimum alone — unlike the original, which was non-Markovian. It exists because
+plain shaping charges for the run-up a hard obstacle needs: at the 0.455 wall the correct play
+starts by backing up ~3 tiles, an immediate `−0.086` against a payoff that during exploration
+almost never arrives.
+
+Not done: the regression test in the last bullet above. There is no unit test asserting that
+freeze-then-clear outscores never-attempting.
 
 ### 1.2 The reset distribution is the actual compute sink
 
@@ -182,6 +218,9 @@ Pair with a small sub-tile residual for grazing hooks.
 
 ### 1.6 The off-path penalty, precisely (and why it's a minor term)
 
+> **Resolved, both halves** — the penalty is gone and the matching bug is fixed. See the Status
+> note at the end. Line references below point at 2026-08-03 code that no longer exists.
+
 `botmanager.cpp:730-743`, evaluated every tick when waypoints are loaded:
 
 ```cpp
@@ -216,6 +255,29 @@ discontinuity, a 160-unit teleport at tick index 2953 (`(44063,1833) → (43920,
 else >60 units/tick is just fast free-fall. 160 units is well inside the ±100-index window, so
 Tutorial is fine today. But this will break on any map with long-range teleporters — worth a cheap
 guard (fall back to a full scan when the windowed best distance exceeds, say, 512 units).
+
+**Status (2026-10-20).** Three changes, which between them close this section:
+
+- **The off-path penalty was deleted** along with the rest of the hand-tuned terms (§1.1 Status).
+  Nothing in the reward now refers to distance from the path, so the two places it was said to
+  bite — ballistic hook arcs and the post-frontier-failure pile-on — are gone, and the route
+  pinning question in Part 6 is no longer a reward-side concern.
+- **`FindClosestWaypoint` (`botmanager.cpp:1288`) no longer trusts a fixed ±100 window.** The
+  forward reach is derived at load time from waypoint spacing, the frame skip and the maximum tee
+  speed (`m_MaxAdvance`); backward motion is capped hard at `MAX_RETREAT = 2` indices, because a
+  backward snap mid-episode is always wrong — it lets the match land on an earlier strand of a
+  path that doubles back. If the windowed best distance exceeds `LOST_DIST = 512` units the search
+  re-acquires exactly as suggested above, except **forward only**: a full scan would reintroduce
+  the wrong-strand match. The one unrestricted scan is at episode reset, where temporal continuity
+  is broken by design.
+- **The teleport case is handled upstream of the search**, as §1.7 proposed:
+  `SegmentPathAtDiscontinuities` splits the path wherever the straight segment between consecutive
+  waypoints passes through solid tiles — by collision, not by distance — and gives the portal edge
+  **zero** arc length, so a teleport earns no free progress.
+
+The knock-on worry also resolves: because progress is a potential rather than a high-water mark by
+default, a spurious forward match can no longer permanently zero out the progress reward for a
+region. Under `sv_rl_ratchet` it could, which is a reason to prefer the default.
 
 ### 1.7 Checkpoints are the wrong abstraction for a cross-map reward
 
@@ -674,7 +736,9 @@ finishes reliably from start.
   What you do want is a **fast smoke-test map** for P0 iteration: a ~20-second slice of Tutorial
   (truncate the waypoint file and set the finish early) so reward/action-space changes give signal
   in 15 minutes instead of overnight. Target map and iteration map are different jobs.
-- **Route pinning.** The off-path penalty (§1.6) forecloses route discovery. It's a small term, so
-  this is a cheap flag either way — but decide deliberately rather than by default.
+- **Route pinning.** ~~The off-path penalty (§1.6) forecloses route discovery.~~ *Decided: the
+  penalty was deleted (§1.1, §1.6 Status). Nothing in the reward now pins the agent to the
+  reference route; the shaping potential only rewards arc-length gained, which any route that
+  advances along the path earns.*
 - **Server count.** Your own benchmarks say 8 servers cycles faster than 12 on a 16-thread box
   despite lower raw FPS. The `default.yaml` still says 12.
