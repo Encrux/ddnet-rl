@@ -182,171 +182,157 @@ void CControls::OnMessage(int Msg, void *pRawMsg)
 
 int CControls::SnapInput(int *pData)
 {
-	       // RLBot injection: override input if RLBot is enabled
-		       if(GameClient()->m_RLBot.IsEnabled()) {
-			       m_aInputData[g_Config.m_ClDummy].m_Direction = GameClient()->m_RLBot.GetActionDirection();
-			       m_aInputData[g_Config.m_ClDummy].m_Jump = GameClient()->m_RLBot.GetActionJump();
-			       m_aInputData[g_Config.m_ClDummy].m_Hook = GameClient()->m_RLBot.GetActionHook();
-			       m_aInputData[g_Config.m_ClDummy].m_Fire = GameClient()->m_RLBot.GetActionFire();
-			       m_aInputData[g_Config.m_ClDummy].m_TargetX = GameClient()->m_RLBot.GetActionAimX();
-			       m_aInputData[g_Config.m_ClDummy].m_TargetY = GameClient()->m_RLBot.GetActionAimY();
-			       // Optionally set weapon if you add it to RLBot
-			       mem_copy(pData, &m_aInputData[g_Config.m_ClDummy], sizeof(m_aInputData[0]));
-			       return sizeof(m_aInputData[0]);
-		       } else {
-		       // ...existing code...
-		       if(GameClient()->m_Chat.IsActive())
-			       m_aInputData[g_Config.m_ClDummy].m_PlayerFlags = PLAYERFLAG_CHATTING;
-		       else if(GameClient()->m_Menus.IsActive())
-			       m_aInputData[g_Config.m_ClDummy].m_PlayerFlags = PLAYERFLAG_IN_MENU;
-		       else
-			       m_aInputData[g_Config.m_ClDummy].m_PlayerFlags = PLAYERFLAG_PLAYING;
+	// update player state
+	if(GameClient()->m_Chat.IsActive())
+		m_aInputData[g_Config.m_ClDummy].m_PlayerFlags = PLAYERFLAG_CHATTING;
+	else if(GameClient()->m_Menus.IsActive())
+		m_aInputData[g_Config.m_ClDummy].m_PlayerFlags = PLAYERFLAG_IN_MENU;
+	else
+		m_aInputData[g_Config.m_ClDummy].m_PlayerFlags = PLAYERFLAG_PLAYING;
 
-		       if(GameClient()->m_Scoreboard.IsActive())
-			       m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_SCOREBOARD;
+	if(GameClient()->m_Scoreboard.IsActive())
+		m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_SCOREBOARD;
 
-		       if(Client()->ServerCapAnyPlayerFlag() && GameClient()->m_Controls.m_aShowHookColl[g_Config.m_ClDummy])
-			       m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_AIM;
+	if(Client()->ServerCapAnyPlayerFlag() && GameClient()->m_Controls.m_aShowHookColl[g_Config.m_ClDummy])
+		m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_AIM;
 
-		       if(Client()->ServerCapAnyPlayerFlag() && GameClient()->m_Camera.CamType() == CCamera::CAMTYPE_SPEC)
-			       m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_SPEC_CAM;
+	if(Client()->ServerCapAnyPlayerFlag() && GameClient()->m_Camera.CamType() == CCamera::CAMTYPE_SPEC)
+		m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_SPEC_CAM;
 
-		       switch(m_aMouseInputType[g_Config.m_ClDummy])
-		       {
-		       case CControls::EMouseInputType::AUTOMATED:
-			       m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_INPUT_ABSOLUTE;
-			       break;
-		       case CControls::EMouseInputType::ABSOLUTE:
-			       m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_INPUT_ABSOLUTE | PLAYERFLAG_INPUT_MANUAL;
-			       break;
-		       case CControls::EMouseInputType::RELATIVE:
-			       m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_INPUT_MANUAL;
-			       break;
-		       }
+	switch(m_aMouseInputType[g_Config.m_ClDummy])
+	{
+	case CControls::EMouseInputType::AUTOMATED:
+		m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_INPUT_ABSOLUTE;
+		break;
+	case CControls::EMouseInputType::ABSOLUTE:
+		m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_INPUT_ABSOLUTE | PLAYERFLAG_INPUT_MANUAL;
+		break;
+	case CControls::EMouseInputType::RELATIVE:
+		m_aInputData[g_Config.m_ClDummy].m_PlayerFlags |= PLAYERFLAG_INPUT_MANUAL;
+		break;
+	}
 
-		       bool Send = m_aLastData[g_Config.m_ClDummy].m_PlayerFlags != m_aInputData[g_Config.m_ClDummy].m_PlayerFlags;
+	bool Send = m_aLastData[g_Config.m_ClDummy].m_PlayerFlags != m_aInputData[g_Config.m_ClDummy].m_PlayerFlags;
 
-		       m_aLastData[g_Config.m_ClDummy].m_PlayerFlags = m_aInputData[g_Config.m_ClDummy].m_PlayerFlags;
+	m_aLastData[g_Config.m_ClDummy].m_PlayerFlags = m_aInputData[g_Config.m_ClDummy].m_PlayerFlags;
 
-		       // ...existing code for normal input...
-		       // we freeze the input if chat or menu is activated
-		       if(!(m_aInputData[g_Config.m_ClDummy].m_PlayerFlags & PLAYERFLAG_PLAYING))
-		       {
-			       if(!GameClient()->m_GameInfo.m_BugDDRaceInput)
-				       ResetInput(g_Config.m_ClDummy);
+	// we freeze the input if chat or menu is activated
+	if(!(m_aInputData[g_Config.m_ClDummy].m_PlayerFlags & PLAYERFLAG_PLAYING))
+	{
+		if(!GameClient()->m_GameInfo.m_BugDDRaceInput)
+			ResetInput(g_Config.m_ClDummy);
 
-			       mem_copy(pData, &m_aInputData[g_Config.m_ClDummy], sizeof(m_aInputData[0]));
+		mem_copy(pData, &m_aInputData[g_Config.m_ClDummy], sizeof(m_aInputData[0]));
 
-			       // set the target anyway though so that we can keep seeing our surroundings,
-			       // even if chat or menu are activated
-			       m_aInputData[g_Config.m_ClDummy].m_TargetX = (int)m_aMousePos[g_Config.m_ClDummy].x;
-			       m_aInputData[g_Config.m_ClDummy].m_TargetY = (int)m_aMousePos[g_Config.m_ClDummy].y;
+		// set the target anyway though so that we can keep seeing our surroundings,
+		// even if chat or menu are activated
+		m_aInputData[g_Config.m_ClDummy].m_TargetX = (int)m_aMousePos[g_Config.m_ClDummy].x;
+		m_aInputData[g_Config.m_ClDummy].m_TargetY = (int)m_aMousePos[g_Config.m_ClDummy].y;
 
-			       // send once a second just to be sure
-			       Send = Send || time_get() > m_LastSendTime + time_freq();
-		       }
-		       else
-		       {
-			       m_aInputData[g_Config.m_ClDummy].m_TargetX = (int)m_aMousePos[g_Config.m_ClDummy].x;
-			       m_aInputData[g_Config.m_ClDummy].m_TargetY = (int)m_aMousePos[g_Config.m_ClDummy].y;
+		// send once a second just to be sure
+		Send = Send || time_get() > m_LastSendTime + time_freq();
+	}
+	else
+	{
+		m_aInputData[g_Config.m_ClDummy].m_TargetX = (int)m_aMousePos[g_Config.m_ClDummy].x;
+		m_aInputData[g_Config.m_ClDummy].m_TargetY = (int)m_aMousePos[g_Config.m_ClDummy].y;
 
-			       if(g_Config.m_ClSubTickAiming && m_aMousePosOnAction[g_Config.m_ClDummy] != vec2(0.0f, 0.0f))
-			       {
-				       m_aInputData[g_Config.m_ClDummy].m_TargetX = (int)m_aMousePosOnAction[g_Config.m_ClDummy].x;
-				       m_aInputData[g_Config.m_ClDummy].m_TargetY = (int)m_aMousePosOnAction[g_Config.m_ClDummy].y;
-				       m_aMousePosOnAction[g_Config.m_ClDummy] = vec2(0.0f, 0.0f);
-			       }
+		if(g_Config.m_ClSubTickAiming && m_aMousePosOnAction[g_Config.m_ClDummy] != vec2(0.0f, 0.0f))
+		{
+			m_aInputData[g_Config.m_ClDummy].m_TargetX = (int)m_aMousePosOnAction[g_Config.m_ClDummy].x;
+			m_aInputData[g_Config.m_ClDummy].m_TargetY = (int)m_aMousePosOnAction[g_Config.m_ClDummy].y;
+			m_aMousePosOnAction[g_Config.m_ClDummy] = vec2(0.0f, 0.0f);
+		}
 
-			       if(!m_aInputData[g_Config.m_ClDummy].m_TargetX && !m_aInputData[g_Config.m_ClDummy].m_TargetY)
-			       {
-				       m_aInputData[g_Config.m_ClDummy].m_TargetX = 1;
-				       m_aMousePos[g_Config.m_ClDummy].x = 1;
-			       }
+		if(!m_aInputData[g_Config.m_ClDummy].m_TargetX && !m_aInputData[g_Config.m_ClDummy].m_TargetY)
+		{
+			m_aInputData[g_Config.m_ClDummy].m_TargetX = 1;
+			m_aMousePos[g_Config.m_ClDummy].x = 1;
+		}
 
-			       // set direction
-			       m_aInputData[g_Config.m_ClDummy].m_Direction = 0;
-			       if(m_aInputDirectionLeft[g_Config.m_ClDummy] && !m_aInputDirectionRight[g_Config.m_ClDummy])
-				       m_aInputData[g_Config.m_ClDummy].m_Direction = -1;
-			       if(!m_aInputDirectionLeft[g_Config.m_ClDummy] && m_aInputDirectionRight[g_Config.m_ClDummy])
-				       m_aInputData[g_Config.m_ClDummy].m_Direction = 1;
+		// set direction
+		m_aInputData[g_Config.m_ClDummy].m_Direction = 0;
+		if(m_aInputDirectionLeft[g_Config.m_ClDummy] && !m_aInputDirectionRight[g_Config.m_ClDummy])
+			m_aInputData[g_Config.m_ClDummy].m_Direction = -1;
+		if(!m_aInputDirectionLeft[g_Config.m_ClDummy] && m_aInputDirectionRight[g_Config.m_ClDummy])
+			m_aInputData[g_Config.m_ClDummy].m_Direction = 1;
 
-			       // dummy copy moves
-			       if(g_Config.m_ClDummyCopyMoves)
-			       {
-				       CNetObj_PlayerInput *pDummyInput = &GameClient()->m_DummyInput;
+		// dummy copy moves
+		if(g_Config.m_ClDummyCopyMoves)
+		{
+			CNetObj_PlayerInput *pDummyInput = &GameClient()->m_DummyInput;
 
-				       // Don't copy any input to dummy when spectating others
-				       if(!GameClient()->m_Snap.m_SpecInfo.m_Active || GameClient()->m_Snap.m_SpecInfo.m_SpectatorId < 0)
-				       {
-					       pDummyInput->m_Direction = m_aInputData[g_Config.m_ClDummy].m_Direction;
-					       pDummyInput->m_Hook = m_aInputData[g_Config.m_ClDummy].m_Hook;
-					       pDummyInput->m_Jump = m_aInputData[g_Config.m_ClDummy].m_Jump;
-					       pDummyInput->m_PlayerFlags = m_aInputData[g_Config.m_ClDummy].m_PlayerFlags;
-					       pDummyInput->m_TargetX = m_aInputData[g_Config.m_ClDummy].m_TargetX;
-					       pDummyInput->m_TargetY = m_aInputData[g_Config.m_ClDummy].m_TargetY;
-					       pDummyInput->m_WantedWeapon = m_aInputData[g_Config.m_ClDummy].m_WantedWeapon;
+			// Don't copy any input to dummy when spectating others
+			if(!GameClient()->m_Snap.m_SpecInfo.m_Active || GameClient()->m_Snap.m_SpecInfo.m_SpectatorId < 0)
+			{
+				pDummyInput->m_Direction = m_aInputData[g_Config.m_ClDummy].m_Direction;
+				pDummyInput->m_Hook = m_aInputData[g_Config.m_ClDummy].m_Hook;
+				pDummyInput->m_Jump = m_aInputData[g_Config.m_ClDummy].m_Jump;
+				pDummyInput->m_PlayerFlags = m_aInputData[g_Config.m_ClDummy].m_PlayerFlags;
+				pDummyInput->m_TargetX = m_aInputData[g_Config.m_ClDummy].m_TargetX;
+				pDummyInput->m_TargetY = m_aInputData[g_Config.m_ClDummy].m_TargetY;
+				pDummyInput->m_WantedWeapon = m_aInputData[g_Config.m_ClDummy].m_WantedWeapon;
 
-					       if(!g_Config.m_ClDummyControl)
-						       pDummyInput->m_Fire += m_aInputData[g_Config.m_ClDummy].m_Fire - m_aLastData[g_Config.m_ClDummy].m_Fire;
+				if(!g_Config.m_ClDummyControl)
+					pDummyInput->m_Fire += m_aInputData[g_Config.m_ClDummy].m_Fire - m_aLastData[g_Config.m_ClDummy].m_Fire;
 
-					       pDummyInput->m_NextWeapon += m_aInputData[g_Config.m_ClDummy].m_NextWeapon - m_aLastData[g_Config.m_ClDummy].m_NextWeapon;
-					       pDummyInput->m_PrevWeapon += m_aInputData[g_Config.m_ClDummy].m_PrevWeapon - m_aLastData[g_Config.m_ClDummy].m_PrevWeapon;
-				       }
+				pDummyInput->m_NextWeapon += m_aInputData[g_Config.m_ClDummy].m_NextWeapon - m_aLastData[g_Config.m_ClDummy].m_NextWeapon;
+				pDummyInput->m_PrevWeapon += m_aInputData[g_Config.m_ClDummy].m_PrevWeapon - m_aLastData[g_Config.m_ClDummy].m_PrevWeapon;
+			}
 
-				       m_aInputData[!g_Config.m_ClDummy] = *pDummyInput;
-			       }
+			m_aInputData[!g_Config.m_ClDummy] = *pDummyInput;
+		}
 
-			       if(g_Config.m_ClDummyControl)
-			       {
-				       CNetObj_PlayerInput *pDummyInput = &GameClient()->m_DummyInput;
-				       pDummyInput->m_Jump = g_Config.m_ClDummyJump;
+		if(g_Config.m_ClDummyControl)
+		{
+			CNetObj_PlayerInput *pDummyInput = &GameClient()->m_DummyInput;
+			pDummyInput->m_Jump = g_Config.m_ClDummyJump;
 
-				       if(g_Config.m_ClDummyFire)
-					       pDummyInput->m_Fire = g_Config.m_ClDummyFire;
-				       else if((pDummyInput->m_Fire & 1) != 0)
-					       pDummyInput->m_Fire++;
+			if(g_Config.m_ClDummyFire)
+				pDummyInput->m_Fire = g_Config.m_ClDummyFire;
+			else if((pDummyInput->m_Fire & 1) != 0)
+				pDummyInput->m_Fire++;
 
-				       pDummyInput->m_Hook = g_Config.m_ClDummyHook;
-			       }
+			pDummyInput->m_Hook = g_Config.m_ClDummyHook;
+		}
 
-			       // stress testing
-	#ifdef CONF_DEBUG
-			       if(g_Config.m_DbgStress)
-			       {
-				       float t = Client()->LocalTime();
-				       mem_zero(&m_aInputData[g_Config.m_ClDummy], sizeof(m_aInputData[0]));
+		// stress testing
+#ifdef CONF_DEBUG
+		if(g_Config.m_DbgStress)
+		{
+			float t = Client()->LocalTime();
+			mem_zero(&m_aInputData[g_Config.m_ClDummy], sizeof(m_aInputData[0]));
 
-				       m_aInputData[g_Config.m_ClDummy].m_Direction = ((int)t / 2) & 1;
-				       m_aInputData[g_Config.m_ClDummy].m_Jump = ((int)t);
-				       m_aInputData[g_Config.m_ClDummy].m_Fire = ((int)(t * 10));
-				       m_aInputData[g_Config.m_ClDummy].m_Hook = ((int)(t * 2)) & 1;
-				       m_aInputData[g_Config.m_ClDummy].m_WantedWeapon = ((int)t) % NUM_WEAPONS;
-				       m_aInputData[g_Config.m_ClDummy].m_TargetX = (int)(std::sin(t * 3) * 100.0f);
-				       m_aInputData[g_Config.m_ClDummy].m_TargetY = (int)(std::cos(t * 3) * 100.0f);
-			       }
-	#endif
-			       // check if we need to send input
-			       Send = Send || m_aInputData[g_Config.m_ClDummy].m_Direction != m_aLastData[g_Config.m_ClDummy].m_Direction;
-			       Send = Send || m_aInputData[g_Config.m_ClDummy].m_Jump != m_aLastData[g_Config.m_ClDummy].m_Jump;
-			       Send = Send || m_aInputData[g_Config.m_ClDummy].m_Fire != m_aLastData[g_Config.m_ClDummy].m_Fire;
-			       Send = Send || m_aInputData[g_Config.m_ClDummy].m_Hook != m_aLastData[g_Config.m_ClDummy].m_Hook;
-			       Send = Send || m_aInputData[g_Config.m_ClDummy].m_WantedWeapon != m_aLastData[g_Config.m_ClDummy].m_WantedWeapon;
-			       Send = Send || m_aInputData[g_Config.m_ClDummy].m_NextWeapon != m_aLastData[g_Config.m_ClDummy].m_NextWeapon;
-			       Send = Send || m_aInputData[g_Config.m_ClDummy].m_PrevWeapon != m_aLastData[g_Config.m_ClDummy].m_PrevWeapon;
-			       Send = Send || time_get() > m_LastSendTime + time_freq() / 25; // send at least 25 Hz
-			       Send = Send || (GameClient()->m_Snap.m_pLocalCharacter && GameClient()->m_Snap.m_pLocalCharacter->m_Weapon == WEAPON_NINJA && (m_aInputData[g_Config.m_ClDummy].m_Direction || m_aInputData[g_Config.m_ClDummy].m_Jump || m_aInputData[g_Config.m_ClDummy].m_Hook));
-		       }
+			m_aInputData[g_Config.m_ClDummy].m_Direction = ((int)t / 2) & 1;
+			m_aInputData[g_Config.m_ClDummy].m_Jump = ((int)t);
+			m_aInputData[g_Config.m_ClDummy].m_Fire = ((int)(t * 10));
+			m_aInputData[g_Config.m_ClDummy].m_Hook = ((int)(t * 2)) & 1;
+			m_aInputData[g_Config.m_ClDummy].m_WantedWeapon = ((int)t) % NUM_WEAPONS;
+			m_aInputData[g_Config.m_ClDummy].m_TargetX = (int)(std::sin(t * 3) * 100.0f);
+			m_aInputData[g_Config.m_ClDummy].m_TargetY = (int)(std::cos(t * 3) * 100.0f);
+		}
+#endif
+		// check if we need to send input
+		Send = Send || m_aInputData[g_Config.m_ClDummy].m_Direction != m_aLastData[g_Config.m_ClDummy].m_Direction;
+		Send = Send || m_aInputData[g_Config.m_ClDummy].m_Jump != m_aLastData[g_Config.m_ClDummy].m_Jump;
+		Send = Send || m_aInputData[g_Config.m_ClDummy].m_Fire != m_aLastData[g_Config.m_ClDummy].m_Fire;
+		Send = Send || m_aInputData[g_Config.m_ClDummy].m_Hook != m_aLastData[g_Config.m_ClDummy].m_Hook;
+		Send = Send || m_aInputData[g_Config.m_ClDummy].m_WantedWeapon != m_aLastData[g_Config.m_ClDummy].m_WantedWeapon;
+		Send = Send || m_aInputData[g_Config.m_ClDummy].m_NextWeapon != m_aLastData[g_Config.m_ClDummy].m_NextWeapon;
+		Send = Send || m_aInputData[g_Config.m_ClDummy].m_PrevWeapon != m_aLastData[g_Config.m_ClDummy].m_PrevWeapon;
+		Send = Send || time_get() > m_LastSendTime + time_freq() / 25; // send at least 25 Hz
+		Send = Send || (GameClient()->m_Snap.m_pLocalCharacter && GameClient()->m_Snap.m_pLocalCharacter->m_Weapon == WEAPON_NINJA && (m_aInputData[g_Config.m_ClDummy].m_Direction || m_aInputData[g_Config.m_ClDummy].m_Jump || m_aInputData[g_Config.m_ClDummy].m_Hook));
+	}
 
-		       // copy and return size
-		       m_aLastData[g_Config.m_ClDummy] = m_aInputData[g_Config.m_ClDummy];
+	// copy and return size
+	m_aLastData[g_Config.m_ClDummy] = m_aInputData[g_Config.m_ClDummy];
 
-		       if(!Send)
-			       return 0;
+	if(!Send)
+		return 0;
 
-		       m_LastSendTime = time_get();
-		       mem_copy(pData, &m_aInputData[g_Config.m_ClDummy], sizeof(m_aInputData[0]));
-		       return sizeof(m_aInputData[0]);
-	       }
+	m_LastSendTime = time_get();
+	mem_copy(pData, &m_aInputData[g_Config.m_ClDummy], sizeof(m_aInputData[0]));
+	return sizeof(m_aInputData[0]);
 }
 
 void CControls::OnRender()

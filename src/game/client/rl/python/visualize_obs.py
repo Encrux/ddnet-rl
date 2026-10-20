@@ -2,21 +2,16 @@
 """
 Visualize Teeworlds RL Observations
 
-Renders the structured observation (tile grid, player state, etc.)
-in the terminal or as an image for debugging.
+Launches a server with bots and renders what the agent actually sees -- the
+semantic tile grid, raycasts, hook state and the next checkpoint -- so you can
+check an encoding against reality instead of trusting the struct layout.
 
 Usage:
-    # Server-side bots (recommended - starts its own server)
-    python visualize_obs.py --server-side
-    python visualize_obs.py --server-side --num-bots 4 --bot-id 0
+    python visualize_obs.py
+    python visualize_obs.py --num-bots 4 --bot-id 2
+    python visualize_obs.py --map Tutorial --scale 12
 
-    # Client-side bots (requires running DDNet with rl_enable)
-    python visualize_obs.py --cv2         # OpenCV visualization
-    python visualize_obs.py              # Terminal visualization
-    python visualize_obs.py --once       # Single frame
-    python visualize_obs.py --image      # Save as PNG image
-
-Controls (server-side):
+Controls:
     a/d or arrows: Move left/right
     space: Jump
     n/p: Next/previous bot
@@ -33,8 +28,8 @@ import os
 # Add parent to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from teeworlds_env import (
-    TeeWorldsShmClient, StructuredObservation, TileType,
+from observation import (
+    StructuredObservation, TileType,
     TILE_GRID_WIDTH, TILE_GRID_HEIGHT, NUM_RAYCASTS
 )
 
@@ -444,64 +439,6 @@ def render_cv2_visualization(obs: StructuredObservation, scale: int = 8,
     return padded
 
 
-def run_cv2_visualization(env_id: int = 0, scale: int = 8, fps_limit: float = 30.0):
-    """Run live OpenCV visualization for client-side bots."""
-    if not HAS_CV2:
-        print("OpenCV not available. Install with: pip install opencv-python")
-        return
-
-    client = TeeWorldsShmClient(env_id=env_id, timeout=10.0)
-    if not client.connect():
-        print("Failed to connect. Is the game running with rl_enable?")
-        return
-
-    print("Connected! Press 'q' to quit, 'r' to toggle raycasts, 'c' to toggle checkpoint.")
-
-    show_raycasts = True
-    show_checkpoint = True
-    frame_time = 1.0 / fps_limit
-
-    try:
-        while True:
-            start = time.time()
-
-            obs, info = client.wait_for_observation(timeout=1.0)
-            if obs is None:
-                print("Timeout or shutdown")
-                break
-
-            if not isinstance(obs, StructuredObservation):
-                print("Expected structured observation")
-                break
-
-            img = render_cv2_visualization(obs, scale, show_raycasts, show_checkpoint)
-            if img is not None:
-                cv2.imshow('DDNet RL Observation', img)
-
-            client.send_action()
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('r'):
-                show_raycasts = not show_raycasts
-                print(f"Raycasts: {'ON' if show_raycasts else 'OFF'}")
-            elif key == ord('c'):
-                show_checkpoint = not show_checkpoint
-                print(f"Checkpoint: {'ON' if show_checkpoint else 'OFF'}")
-
-            elapsed = time.time() - start
-            if elapsed < frame_time:
-                time.sleep(frame_time - elapsed)
-
-    except KeyboardInterrupt:
-        print("\nInterrupted")
-    finally:
-        client.disconnect()
-        if HAS_CV2:
-            cv2.destroyAllWindows()
-
-
 def run_server_side_visualization(num_bots: int = 1, bot_id: int = 0, scale: int = 10,
                                    fps_limit: float = 30.0, map_name: str = "Tutorial"):
     """Run live OpenCV visualization for server-side bots."""
@@ -595,95 +532,25 @@ def run_server_side_visualization(num_bots: int = 1, bot_id: int = 0, scale: int
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize Teeworlds RL observations")
-    parser.add_argument('--env-id', type=int, default=0, help='Environment ID (client-side)')
-    parser.add_argument('--once', action='store_true', help='Show single frame and exit')
-    parser.add_argument('--image', action='store_true', help='Save as PNG image')
-    parser.add_argument('--no-color', action='store_true', help='Disable terminal colors')
-    parser.add_argument('--ascii', action='store_true', help='Use ASCII instead of Unicode')
-    parser.add_argument('--fps', type=float, default=30, help='Refresh rate for continuous mode')
-    parser.add_argument('--cv2', action='store_true', help='Use OpenCV visualization (shows raycasts and checkpoint)')
-    parser.add_argument('--scale', type=int, default=10, help='Pixels per tile for CV2 mode')
-    parser.add_argument('--server-side', action='store_true', help='Use server-side bots (starts its own server)')
-    parser.add_argument('--num-bots', type=int, default=1, help='Number of bots for server-side mode')
-    parser.add_argument('--bot-id', type=int, default=0, help='Which bot to visualize (server-side)')
-    parser.add_argument('--map', type=str, default='Tutorial', help='Map to load (server-side)')
+    parser.add_argument('--scale', type=int, default=10, help='Pixels per tile')
+    parser.add_argument('--fps', type=float, default=30, help='Refresh rate')
+    parser.add_argument('--num-bots', type=int, default=1, help='Number of bots to launch')
+    parser.add_argument('--bot-id', type=int, default=0, help='Which bot to visualize')
+    parser.add_argument('--map', type=str, default='Tutorial', help='Map to load')
+    # Accepted so existing commands keep working; server-side is the only mode now.
+    parser.add_argument('--server-side', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    # Server-side visualization (always uses CV2)
-    if args.server_side:
-        run_server_side_visualization(
-            num_bots=args.num_bots,
-            bot_id=args.bot_id,
-            scale=args.scale,
-            fps_limit=args.fps,
-            map_name=args.map
-        )
-        return 0
-
-    # OpenCV visualization mode (client-side)
-    if args.cv2:
-        run_cv2_visualization(env_id=args.env_id, scale=args.scale, fps_limit=args.fps)
-        return 0
-
-    print(f"Connecting to shared memory (env_id={args.env_id})...")
-
-    client = TeeWorldsShmClient(env_id=args.env_id, timeout=10.0)
-    
-    if not client.connect():
-        print("Failed to connect to shared memory. Is the game running with rl_enable?")
-        return 1
-    
-    print("Connected! Waiting for observations...")
-    
-    try:
-        frame_count = 0
-        while True:
-            obs, info = client.wait_for_observation(timeout=5.0)
-            
-            if obs is None:
-                print("Timeout waiting for observation")
-                if args.once:
-                    return 1
-                continue
-            
-            if not isinstance(obs, StructuredObservation):
-                print("Error: Expected structured observation, got pixel frame")
-                print("Make sure the game is running with: rl_enable state")
-                return 1
-            
-            frame_count += 1
-            
-            if args.image:
-                render_to_image(obs, f"observation_{frame_count:04d}.png")
-                if args.once:
-                    break
-            else:
-                if not args.once:
-                    clear_screen()
-                
-                output = render_tile_grid_terminal(
-                    obs, 
-                    use_color=not args.no_color,
-                    use_unicode=not args.ascii
-                )
-                print(output)
-                
-                if args.once:
-                    break
-            
-            # Send dummy action to keep the game running
-            client.send_action(direction=0, jump=0, hook=0, fire=0)
-            
-            if not args.once:
-                time.sleep(1.0 / args.fps)
-                
-    except KeyboardInterrupt:
-        print("\nStopped by user")
-    finally:
-        client.disconnect()
-    
+    run_server_side_visualization(
+        num_bots=args.num_bots,
+        bot_id=args.bot_id,
+        scale=args.scale,
+        fps_limit=args.fps,
+        map_name=args.map
+    )
     return 0
 
 
 if __name__ == '__main__':
     sys.exit(main())
+

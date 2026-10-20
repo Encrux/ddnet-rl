@@ -159,8 +159,7 @@ void CGameClient::OnConsoleInit()
 					      &m_Tooltips,
 					      &m_KeyBinder,
 					      &m_GameConsole,
-					      &m_MenuBackground,
-					      &m_RLBot}); // RL bot - last to render (captures frame after everything)
+					      &m_MenuBackground});
 
 	// build the input stack
 	m_vpInput.insert(m_vpInput.end(), {&m_KeyBinder, // this will take over all input when we want to bind a key

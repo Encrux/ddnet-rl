@@ -121,7 +121,6 @@ for sig in [signal.SIGTERM, signal.SIGINT, signal.SIGHUP]:
 # Enable TF32 for faster matmul on Ampere+ GPUs (RTX 30xx/40xx)
 torch.set_float32_matmul_precision('high')
 
-from teeworlds_vec_env import TeeWorldsVecEnv, EnvConfig
 from teeworlds_server_env import TeeWorldsServerEnv, ServerEnvConfig, FrameStackWrapper
 from ppo_hybrid import PPOAgent, PPOConfig
 from episode_tracker import EpisodeTracker
@@ -145,7 +144,7 @@ def parse_args():
     parser.add_argument("--frame-skip", type=int, default=1,
                         help="Frame skip (1=no skip, 4=act every 4th tick)")
     parser.add_argument("--server-side", action="store_true",
-                        help="Use server-side bots (much more efficient)")
+                        help="Deprecated: server-side bots are always used")
     parser.add_argument("--num-servers", type=int, default=1,
                         help="Number of servers (each with --num-envs bots)")
     parser.add_argument("--sync-inference", action="store_true",
@@ -359,71 +358,48 @@ def main():
         args.use_cnn = True
 
     # Create environment
-    if args.server_side:
-        # Server-side bots (more efficient, single process per server)
-        total_bots = args.num_envs * args.num_servers
-        if args.num_servers > 1:
-            print(f"\nCreating SERVER-SIDE environment with {total_bots} bots ({args.num_servers} servers, {args.num_envs} bots each) on map '{args.map}'...")
-        else:
-            print(f"\nCreating SERVER-SIDE environment with {args.num_envs} bots on map '{args.map}'...")
-        server_config = ServerEnvConfig(
-            sv_tickrate=args.sv_tickrate,
-            frame_skip=args.frame_skip,
-            max_episode_steps=args.max_episode_steps,
-            max_episode_steps_restored=args.max_episode_steps_restored,
-            stall_patience=args.stall_patience,
-            use_dict_obs=args.use_cnn,  # Enable dict observations for CNN
-            use_embeddings=args.use_embeddings or args.semantic_tiles,  # int64 tile ids
-            map_name=args.map,
-            debug_timing=args.debug_timing,
-            checkpoint_respawn=args.checkpoint_respawn,
-            begin_bias=args.begin_bias,
-            top_fraction=args.top_fraction,
-            finish_progress=args.finish_progress,
-            waypoints_path=args.waypoints_path,
-            curriculum=args.frontier_curriculum,
-            frontier_window=args.frontier_window,
-            ratchet_shaping=args.ratchet,
-            archive_variants=not args.legacy_archive,
-            restore_beta=args.restore_beta,
-            max_variant_share=args.max_variant_share,
-            frontier_share=args.frontier_share,
-        )
-        # Use default server_path (resolved relative to teeworlds_server_env.py)
-        env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)
-        _global_env = env  # Register for global cleanup
-        # Update num_envs to reflect total bots for training loop
-        args.num_envs = total_bots
-
-        # Wrap with frame stacking for temporal context
-        if args.n_frame_stack > 1 or args.n_player_state_stack > 1:
-            env = FrameStackWrapper(env, n_tile_stack=args.n_frame_stack, n_player_state_stack=args.n_player_state_stack)
-            _global_env = env  # Update global reference to wrapper
-            tile_coverage_ms = args.n_frame_stack * args.frame_skip * 20
-            player_coverage_ms = args.n_player_state_stack * args.frame_skip * 20
-            print(f"Frame stacking: tiles={args.n_frame_stack} (~{tile_coverage_ms}ms), player_state={args.n_player_state_stack} (~{player_coverage_ms}ms)")
+    # Server-side bots (more efficient, single process per server)
+    total_bots = args.num_envs * args.num_servers
+    if args.num_servers > 1:
+        print(f"\nCreating SERVER-SIDE environment with {total_bots} bots ({args.num_servers} servers, {args.num_envs} bots each) on map '{args.map}'...")
     else:
-        # Client-side environments (original approach)
-        print(f"\nCreating CLIENT-SIDE environment with {args.num_envs} parallel instances...")
+        print(f"\nCreating SERVER-SIDE environment with {args.num_envs} bots on map '{args.map}'...")
+    server_config = ServerEnvConfig(
+        sv_tickrate=args.sv_tickrate,
+        frame_skip=args.frame_skip,
+        max_episode_steps=args.max_episode_steps,
+        max_episode_steps_restored=args.max_episode_steps_restored,
+        stall_patience=args.stall_patience,
+        use_dict_obs=args.use_cnn,  # Enable dict observations for CNN
+        use_embeddings=args.use_embeddings or args.semantic_tiles,  # int64 tile ids
+        map_name=args.map,
+        debug_timing=args.debug_timing,
+        checkpoint_respawn=args.checkpoint_respawn,
+        begin_bias=args.begin_bias,
+        top_fraction=args.top_fraction,
+        finish_progress=args.finish_progress,
+        waypoints_path=args.waypoints_path,
+        curriculum=args.frontier_curriculum,
+        frontier_window=args.frontier_window,
+        ratchet_shaping=args.ratchet,
+        archive_variants=not args.legacy_archive,
+        restore_beta=args.restore_beta,
+        max_variant_share=args.max_variant_share,
+        frontier_share=args.frontier_share,
+    )
+    # Use default server_path (resolved relative to teeworlds_server_env.py)
+    env = TeeWorldsServerEnv(num_bots=args.num_envs, num_servers=args.num_servers, config=server_config)
+    _global_env = env  # Register for global cleanup
+    # Update num_envs to reflect total bots for training loop
+    args.num_envs = total_bots
 
-        # Stacking not supported for client-side, disable if requested
-        if args.n_frame_stack > 1 or args.n_player_state_stack > 1:
-            print("Warning: Frame stacking not supported for client-side. Use --server-side for stacking.")
-            print("         Disabling stacking for this run.")
-            args.n_frame_stack = 1
-            args.n_player_state_stack = 1
-
-        env_config = EnvConfig(
-            ddnet_path=args.ddnet_path,
-            server_path=args.server_path,
-            sv_tickrate=args.sv_tickrate,
-            frame_skip=args.frame_skip,
-            max_episode_steps=args.max_episode_steps,
-            # Per-type caps and stall patience are server-side-env only; the
-            # legacy client-side EnvConfig has no such fields.
-        )
-        env = TeeWorldsVecEnv(num_envs=args.num_envs, config=env_config)
-        _global_env = env  # Register for global cleanup
+    # Wrap with frame stacking for temporal context
+    if args.n_frame_stack > 1 or args.n_player_state_stack > 1:
+        env = FrameStackWrapper(env, n_tile_stack=args.n_frame_stack, n_player_state_stack=args.n_player_state_stack)
+        _global_env = env  # Update global reference to wrapper
+        tile_coverage_ms = args.n_frame_stack * args.frame_skip * 20
+        player_coverage_ms = args.n_player_state_stack * args.frame_skip * 20
+        print(f"Frame stacking: tiles={args.n_frame_stack} (~{tile_coverage_ms}ms), player_state={args.n_player_state_stack} (~{player_coverage_ms}ms)")
 
     try:
         # Get observation dimension
@@ -503,10 +479,9 @@ def main():
         if args.frame_skip > 1:
             effective_rate = args.sv_tickrate / args.frame_skip
             print(f"Effective decision rate: {effective_rate:.0f} Hz")
-        if args.server_side:
-            inference_mode = "sync (pause)" if args.sync_inference else "async (no pause)"
-            update_mode = "sync (pause)" if args.sync_update else "async (no pause)"
-            print(f"Inference: {inference_mode}, PPO update: {update_mode}")
+        inference_mode = "sync (pause)" if args.sync_inference else "async (no pause)"
+        update_mode = "sync (pause)" if args.sync_update else "async (no pause)"
+        print(f"Inference: {inference_mode}, PPO update: {update_mode}")
         if args.checkpoint_respawn:
             print(f"Checkpoint respawn: ON (begin_bias={args.begin_bias}, top_fraction={args.top_fraction})")
         print("-" * 60)
@@ -574,14 +549,14 @@ def main():
                 global_step += args.num_envs
 
                 # Get action (optionally pause during inference to prevent stale actions)
-                if args.server_side and args.sync_inference:
+                if args.sync_inference:
                     env.pause()
                 t_inf_start = time.time()
                 action, log_prob, value = agent.get_action(obs)
                 t_inf = time.time() - t_inf_start
                 if t_inf > 0.5:  # Log slow inference (>500ms)
                     print(f"  [SLOW] Inference took {t_inf*1000:.0f}ms at step {step}")
-                if args.server_side and args.sync_inference:
+                if args.sync_inference:
                     env.unpause()
 
                 # Latch the action for as long as the policy asked. `executed`
@@ -671,10 +646,10 @@ def main():
             # PPO update (optionally pause to prevent bots from acting with stale policy)
             rollout_time = time.time() - rollout_start
             update_start = time.time()
-            if args.server_side and args.sync_update:
+            if args.sync_update:
                 env.pause()
             stats = agent.update(obs, done | truncated)
-            if args.server_side and args.sync_update:
+            if args.sync_update:
                 env.unpause()
             update_time = time.time() - update_start
             agent.global_step = global_step
