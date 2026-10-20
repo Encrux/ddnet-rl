@@ -1439,7 +1439,7 @@ void CGraphics_Threaded::RenderQuadLayer(int BufferContainerIndex, SQuadRenderIn
 		});
 
 		mem_copy(Cmd.m_pQuadInfo, pQuadInfo, sizeof(SQuadRenderInfo) * QuadNum);
-		m_pCommandBuffer->AddRenderCalls(((QuadNum - 1) / gs_GraphicsMaxQuadsRenderCount) + 1);
+		m_pCommandBuffer->AddRenderCalls(((QuadNum - 1) / GRAPHICS_MAX_QUADS_RENDER_COUNT) + 1);
 	}
 	else
 	{
@@ -1906,7 +1906,7 @@ void CGraphics_Threaded::RenderQuadContainerAsSpriteMultiple(int ContainerIndex,
 
 		mem_copy(Cmd.m_pRenderInfo, pRenderInfo, sizeof(IGraphics::SRenderSpriteInfo) * DrawCount);
 
-		m_pCommandBuffer->AddRenderCalls(((DrawCount - 1) / gs_GraphicsMaxParticlesRenderCount) + 1);
+		m_pCommandBuffer->AddRenderCalls(((DrawCount - 1) / GRAPHICS_MAX_QUADS_RENDER_COUNT) + 1);
 
 		WrapNormal();
 	}
