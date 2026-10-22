@@ -1,3 +1,8 @@
+# AI-Disclaimer
+
+This project is heavily AI-assisted, which is why I originally did not intend on making it public.
+Use at your own risk.
+
 # DDNet RL
 
 Reinforcement learning agents that learn to race [DDNet](https://ddnet.org) maps — a 2D
